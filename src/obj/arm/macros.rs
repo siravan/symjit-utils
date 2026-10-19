@@ -1,0 +1,768 @@
+macro_rules! rd {
+    ($x:expr) => {{
+        let x = $x;
+        assert!(x < 32);
+        x as u32
+    }};
+}
+
+macro_rules! rn {
+    ($x:expr) => {{
+        let x = $x;
+        assert!(x < 32);
+        (x as u32) << 5
+    }};
+}
+
+macro_rules! rd2 {
+    ($x:expr) => {{
+        let x = $x;
+        assert!(x < 32);
+        (x as u32) << 10
+    }};
+}
+
+macro_rules! ra {
+    ($x:expr) => {{
+        let x = $x;
+        assert!(x < 32);
+        (x as u32) << 10
+    }};
+}
+
+macro_rules! rm {
+    ($x:expr) => {{
+        let x = $x;
+        assert!(x < 32);
+        (x as u32) << 16
+    }};
+}
+
+macro_rules! imm {
+    ($x:expr) => {{
+        let x = $x;
+        assert!(x < 4096);
+        (x as u32) << 10
+    }};
+}
+
+macro_rules! imm16 {
+    ($x:expr) => {{
+        let x = $x;
+        assert!(x < 65536);
+        (x as u32) << 5
+    }};
+}
+
+macro_rules! imm14 {
+    ($x:expr) => {{
+        let x = $x as i32;
+        assert!((-32768..32768).contains(&x));
+        ((x as u32) & 0x0000fffc) << 3
+    }};
+}
+
+macro_rules! ofs_pc {
+    ($x:expr) => {{
+        let x = $x;
+        assert!(x.abs() < 1048576);
+        ((x << 3) & 0x00ffffe0) as u32
+    }};
+}
+
+macro_rules! ofs {
+    ($x:expr) => {{
+        let x = $x;
+        assert!((x & 7 == 0) && (x < 32768));
+        (x as u32) << 7
+    }};
+}
+
+macro_rules! ofs2d {
+    ($x:expr) => {{
+        let x = $x;
+        assert!((x & 15 == 0) && (x < 65536));
+        (x as u32) << 6
+    }};
+}
+
+#[allow(unused)]
+macro_rules! of7 {
+    ($x:expr) => {{
+        let x = $x;
+        assert!((x & 7 == 0) && (x < 512));
+        (x as u32) << 12
+    }};
+}
+
+macro_rules! of7_2q {
+    ($x:expr) => {{
+        let x = $x;
+        assert!((x & 15 == 0) && (x < 1024));
+        (x as u32) << 11
+    }};
+}
+
+#[macro_export]
+macro_rules! arm {
+    // lr/sp substitution rules
+    ($op:ident lr, [sp, #$imm:expr]) => {
+        arm! { $op x(30), [x(31), #$imm] }
+    };
+    ($op:ident $($a:ident($x:expr),)+ [sp, #$imm:expr]) => {
+        arm! { $op $($a($x),)* [x(31), #$imm] }
+    };
+    ($op:ident $($a:ident($x:expr),)+ [sp, $b:ident($y:expr), lsl #3]) => {
+        arm! { $op $($a($x),)* [x(31), $b($y), lsl #3] }
+    };
+    ($op:ident lr, [$b:ident($y:expr), #$imm:expr]) => {
+        arm! { $op x(30), [$b($y), #$imm] }
+    };
+    ($op:ident sp, sp, #$imm:expr, lsl #12) => {
+        arm! { $op x(31), x(31), #$imm, lsl #12 }
+    };
+    ($op:ident sp, sp, #$imm:expr) => {
+        arm! { $op x(31), x(31), #$imm }
+    };
+    (mov x($rd:expr), sp) => {
+        arm! { add x($rd), x(31), #0 }
+    };
+    (mov sp, x($rd:expr)) => {
+        arm! { add x(31), x($rd), #0 }
+    };
+    (ldp lr, x($x:expr), [sp, #$imm:expr]) => {
+        arm! { ldp x(30), x($x), [x(31), #$imm] }
+    };
+    (stp lr, x($x:expr), [sp, #$imm:expr]) => {
+        arm! { stp x(30), x($x), [x(31), #$imm] }
+    };
+    (ldp x($x1:expr), x($x2:expr), [sp, #$imm:expr]) => {
+        arm! { ldp x($x1), x($x2), [x(31), #$imm] }
+    };
+    (stp x($x1:expr), x($x2:expr), [sp, #$imm:expr]) => {
+        arm! { stp x($x1), x($x2), [x(31), #$imm] }
+    };
+
+    // main rules
+    (fmov d($rd:expr), d($rn:expr)) => {
+        0x1e604000 | rd!($rd) | rn!($rn)
+    };
+    (fmov d($rd:expr), x($rn:expr)) => {
+        0x9e670000 | rd!($rd) | rn!($rn)
+    };
+    (fmov x($rd:expr), d($rn:expr)) => {
+        0x9e660000 | rd!($rd) | rn!($rn)
+    };
+    (mov x($rd:expr), x($rm:expr)) => {{
+        let rd = $rd;
+        let rm = $rm;
+
+        if rd == 31 || rm == 31 {
+            arm! {add x(rd), x(rm), #0}
+        } else {
+            arm! {orr x(rd), x(31), x(rm)}
+        }
+    }};
+    (movz x($rd:expr), #$imm16:expr) => {
+        0xd2800000 | rd!($rd) | imm16!($imm16)
+    };
+    // movk x(rd), #imm16, lsl #16
+    (movk_lsl16 x($rd:expr), #$imm16:expr) => {
+        0xf2a00000 | rd!($rd) | imm16!($imm16)
+    };
+    // movk x(rd), #imm16, lsl #32
+    (movk_lsl32 x($rd:expr), #$imm16:expr) => {
+        0xf2c00000 | rd!($rd) | imm16!($imm16)
+    };
+    // movk x(rd), #imm16, lsl #48
+    (movk_lsl48 x($rd:expr), #$imm16:expr) => {
+        0xf2e00000 | rd!($rd) | imm16!($imm16)
+    };
+
+    (adrp x($rd:expr), label($offset:expr)) => {
+        {
+            let imm = $offset >> 12;
+            0x90000000 | rd!($rd) | ((imm & 3) << 29) | ((imm & 0x001ffffc) << 3)
+        }
+    };
+
+    // single register load/store instructions
+    (ldr d($rd:expr), [x($rn:expr), #$ofs:expr]) => {
+        0xfd400000 | rd!($rd) | rn!($rn) | ofs!($ofs)
+    };
+    (ldr d($rd:expr), [x($rn:expr), x($rm:expr), lsl #3]) => {
+        0xfc607800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (ldr x($rd:expr), [x($rn:expr), #$ofs:expr]) => {
+        0xf9400000 | rd!($rd) | rn!($rn) | ofs!($ofs)
+    };
+    (ldr x($rd:expr), [x($rn:expr), x($rm:expr), lsl #3]) => {
+        0xf8607800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (ldr d($rd:expr), label($ofs:expr)) => {
+        0x5c000000 | rd!($rd) | ofs_pc!($ofs)
+    };
+
+    (ldr x($rd:expr), label($ofs:expr)) => {
+        0x58000000 | rd!($rd) | ofs_pc!($ofs)
+    };
+
+    (str d($rd:expr), [x($rn:expr), #$ofs:expr]) => {
+        0xfd000000 | rd!($rd) | rn!($rn) | ofs!($ofs)
+    };
+    (str d($rd:expr), [x($rn:expr), x($rm:expr), lsl #3]) => {
+        0xfc207800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (str x($rd:expr), [x($rn:expr), #$ofs:expr]) => {
+        0xf9000000 | rd!($rd) | rn!($rn) | ofs!($ofs)
+    };
+
+    // paired-registers load/store instructions
+    (ldp d($rd:expr), d($rd2:expr), [x($rn:expr), #$of7:expr]) => {
+        0x6d400000 | rd!($rd) | rd2!($rd2) | rn!($rn) | of7!($of7)
+    };
+    (ldp q($rd:expr), q($rd2:expr), [x($rn:expr), #$of7:expr]) => {
+        0xad400000 | rd!($rd) | rd2!($rd2) | rn!($rn) | of7_2q!($of7)
+    };
+    (ldp x($rd:expr), x($rd2:expr), [x($rn:expr), #$of7:expr]) => {
+        0xa9400000 | rd!($rd) | rd2!($rd2) | rn!($rn) | of7!($of7)
+    };
+    (stp d($rd:expr), d($rd2:expr), [x($rn:expr), #$of7:expr]) => {
+        0x6d000000 | rd!($rd) | rd2!($rd2) | rn!($rn) | of7!($of7)
+    };
+    (stp q($rd:expr), q($rd2:expr), [x($rn:expr), #$of7:expr]) => {
+        0xad000000 | rd!($rd) | rd2!($rd2) | rn!($rn) | of7_2q!($of7)
+    };
+    (stp x($rd:expr), x($rd2:expr), [x($rn:expr), #$of7:expr]) => {
+        0xa9000000 | rd!($rd) | rd2!($rd2) | rn!($rn) | of7!($of7)
+    };
+
+    // x-registers immediate ops
+    (add x($rd:expr), x($rn:expr), #$imm:expr, lsl #12) => {
+        0x91400000 | rd!($rd) | rn!($rn) | imm!($imm)
+    };
+    (add x($rd:expr), x($rn:expr), #$imm:expr) => {
+        0x91000000 | rd!($rd) | rn!($rn) | imm!($imm)
+    };
+    (sub x($rd:expr), x($rn:expr), #$imm:expr, lsl #12) => {
+        0xd1400000 | rd!($rd) | rn!($rn) | imm!($imm)
+    };
+    (sub x($rd:expr), x($rn:expr), #$imm:expr) => {
+        0xd1000000 | rd!($rd) | rn!($rn) | imm!($imm)
+    };
+    (subs x($rd:expr), x($rn:expr), #$imm:expr) => {
+        0xf1000000 | rd!($rd) | rn!($rn) | imm!($imm)
+    };
+
+
+    // logical shift right
+    (lsr x($rd:expr), x($rn:expr), #$imm:expr) => {{
+        let shift: u32 = $imm;
+        assert!(shift < 64);
+        0xd340fc00 | rd!($rd) | rn!($rn) | (shift << 16)
+    }};
+
+    // floating point ops
+    (fadd d($rd:expr), d($rn:expr), d($rm:expr)) => {
+        0x1e602800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fsub d($rd:expr), d($rn:expr), d($rm:expr)) => {
+        0x1e603800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fmul d($rd:expr), d($rn:expr), d($rm:expr)) => {
+        0x1e600800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fdiv d($rd:expr), d($rn:expr), d($rm:expr)) => {
+        0x1e601800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (faddp d($rd:expr), q($rn:expr)) => {
+        0x7e70d800 | rd!($rd) | rn!($rn)
+    };
+    (fsqrt d($rd:expr), d($rn:expr)) => {
+        0x1e61c000 | rd!($rd) | rn!($rn)
+    };
+    (fneg d($rd:expr), d($rn:expr)) => {
+        0x1e614000 | rd!($rd) | rn!($rn)
+    };
+    (fabs d($rd:expr), d($rn:expr)) => {
+        0x1e60c000 | rd!($rd) | rn!($rn)
+    };
+
+    // rd := rm * rn + ra
+    (fmadd d($rd:expr), d($rn:expr), d($rm:expr), d($ra:expr)) => {
+        0x1f400000 | rd!($rd) | rn!($rn) | rm!($rm) | ra!($ra)
+    };
+
+    // rd := -rm * rn + ra
+    (fmsub d($rd:expr), d($rn:expr), d($rm:expr), d($ra:expr)) => {
+        0x1f408000 | rd!($rd) | rn!($rn) | rm!($rm) | ra!($ra)
+    };
+
+    // rd := -(rm * rn + ra)
+    (fnmadd d($rd:expr), d($rn:expr), d($rm:expr), d($ra:expr)) => {
+        0x1f600000 | rd!($rd) | rn!($rn) | rm!($rm) | ra!($ra)
+    };
+
+    // rd := -(rm * rn - ra)
+    (fnmsub d($rd:expr), d($rn:expr), d($rm:expr), d($ra:expr)) => {
+        0x1f608000 | rd!($rd) | rn!($rn) | rm!($rm) | ra!($ra)
+    };
+
+    // rd += rn * rm (vector)
+    (fmla q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x4e60cc00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fmla q($rd:expr), q($rn:expr), d($rm:expr)[0]) => {
+        0x4fc01000 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fmla q($rd:expr), q($rn:expr), d($rm:expr)[1]) => {
+        0x4fc01800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    // rd -= rn * rm (vector)
+    (fmls q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x4ee0cc00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fmls q($rd:expr), q($rn:expr), d($rm:expr)[0]) => {
+        0x4fc05000 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fmls q($rd:expr), q($rn:expr), d($rm:expr)[1]) => {
+        0x4fc05800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    // round double to integral (double-coded integer)
+    (frinti d($rd:expr), d($rn:expr)) => {
+        0x1e67c000 | rd!($rd) | rn!($rn)
+    };
+
+    // floor (round toward minus inf) double to integral (double-coded integer)
+    (frintm d($rd:expr), d($rn:expr)) => {
+        0x1e654000 | rd!($rd) | rn!($rn)
+    };
+
+    // ceiling (round toward positive inf) double to integral (double-coded integer)
+    (frintp d($rd:expr), d($rn:expr)) => {
+        0x1e64c000 | rd!($rd) | rn!($rn)
+    };
+
+    // trunc (round toward zero) double to integral (double-coded integer)
+    (frintz d($rd:expr), d($rn:expr)) => {
+        0x1e65c000 | rd!($rd) | rn!($rn)
+    };
+
+
+    // logical ops
+    (and v($rd:expr).8b, v($rn:expr).8b, v($rm:expr).8b) => {
+        0x0e201c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (orr v($rd:expr).8b, v($rn:expr).8b, v($rm:expr).8b) => {
+        0x0ea01c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (eor v($rd:expr).8b, v($rn:expr).8b, v($rm:expr).8b) => {
+        0x2e201c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (bit v($rd:expr).8b, v($rn:expr).8b, v($rm:expr).8b) => {
+        0x2ea01c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (bif v($rd:expr).8b, v($rn:expr).8b, v($rm:expr).8b) => {
+        0x2ee01c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (bic v($rd:expr).8b, v($rn:expr).8b, v($rm:expr).8b) => {
+        0x0e601c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (bsl v($rd:expr).8b, v($rn:expr).8b, v($rm:expr).8b) => {
+        0x2e601c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (not v($rd:expr).8b, v($rn:expr).8b) => {
+        0x2e205800 | rd!($rd) | rn!($rn)
+    };
+
+    // comparison
+    (fcmeq d($rd:expr), d($rn:expr), d($rm:expr)) => {
+        0x5e60e400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    // note that rm and rn are exchanged for fcmlt and fcmle
+    (fcmlt d($rd:expr), d($rm:expr), d($rn:expr)) => {
+        0x7ee0e400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fcmle d($rd:expr), d($rm:expr), d($rn:expr)) => {
+        0x7e60e400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fcmgt d($rd:expr), d($rn:expr), d($rm:expr)) => {
+        0x7ee0e400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fcmge d($rd:expr), d($rn:expr), d($rm:expr)) => {
+        0x7e60e400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fcmeq d($rd:expr), d($rn:expr), #0.0) => {
+        0x5ee0d800 | rd!($rd) | rn!($rn)
+    };
+
+    (fcmge d($rd:expr), d($rn:expr), #0.0) => {
+        0x7ee0c800 | rd!($rd) | rn!($rn)
+    };
+
+    (fcmlt d($rd:expr), d($rn:expr), #0.0) => {
+        0x5ee0e800 | rd!($rd) | rn!($rn)
+    };
+
+    // compare d(..) with 0.0 and set the flags (NZCV)
+    (fcmp d($rn:expr), #0.0) => {
+        0x1e602008 | rn!($rn)
+    };
+
+    (fcsel d($rd:expr), d($rn:expr), d($rm:expr), eq) => {
+        0x1e600c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fcsel d($rd:expr), d($rn:expr), d($rm:expr), ne) => {
+        0x1e601c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fcsel d($rd:expr), d($rn:expr), d($rm:expr), lt) => {
+        0x1e60bc00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fcsel d($rd:expr), d($rn:expr), d($rm:expr), le) => {
+        0x1e60dc00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fcsel d($rd:expr), d($rn:expr), d($rm:expr), gt) => {
+        0x1e60cc00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fcsel d($rd:expr), d($rn:expr), d($rm:expr), ge) => {
+        0x1e60ac00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    // misc
+    (b label($ofs:expr)) => {{
+            let ofs = $ofs;
+            assert!(ofs.abs() < 1 << 27);
+            0x14000000 | (ofs as u32 >> 2) & 0x03ffffff
+    }};
+    (bl label($ofs:expr)) => {{
+            let ofs = $ofs;
+            assert!(ofs.abs() < 1 << 27);
+            0x94000000 | (ofs as u32 >> 2) & 0x03ffffff
+    }};
+    (b.eq label($ofs:expr)) => { 0x54000000 | ofs_pc!($ofs) };
+    (b.ne label($ofs:expr)) => { 0x54000001 | ofs_pc!($ofs) };
+    (b.lt label($ofs:expr)) => { 0x5400000B | ofs_pc!($ofs) };
+    (b.le label($ofs:expr)) => { 0x5400000D | ofs_pc!($ofs) };
+    (b.gt label($ofs:expr)) => { 0x5400000C | ofs_pc!($ofs) };
+    (b.ge label($ofs:expr)) => { 0x5400000A | ofs_pc!($ofs) };
+    (b.mi label($ofs:expr)) => { 0x54000004 | ofs_pc!($ofs) };  // minus
+
+    (tst x($rn:expr), x($rm:expr)) => {
+        0xea00001f | rn!($rn) | rm!($rm)
+    };
+
+    (tbnz x($rd:expr), #$bit:expr, label($imm:expr)) => {{
+        let bit = $bit as u32;
+        0x37000000 | imm14!($imm) | rd!($rd) | ((bit & 0x1f) << 19) | ((bit & 0x20) << 26)
+    }};
+
+    (tbz x($rd:expr), #$bit:expr, label($imm:expr)) => {{
+        let bit = $bit as u32;
+        0x36000000 | imm14!($imm) | rd!($rd) | ((bit & 0x1f) << 19) | ((bit & 0x20) << 26)
+    }};
+
+    (and x($rd:expr), x($rn:expr), x($rm:expr)) => {
+        0x8a000000 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (ands x($rd:expr), x($rn:expr), x($rm:expr)) => {
+        0xea000000 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (orr x($rd:expr), x($rn:expr), x($rm:expr)) => {
+        0xaa000000 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (orn x($rd:expr), x($rn:expr), x($rm:expr)) => {
+        0xaa200000 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (eor x($rd:expr), x($rn:expr), x($rm:expr)) => {
+        0xca000000 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (add x($rd:expr), x($rn:expr), x($rm:expr), lsl #$shift:expr) => {{
+        let shift = $shift;
+        assert!(shift < 64);
+        0x8b000000 | rd!($rd) | rn!($rn) | rm!($rm) | (shift << 10)
+    }};
+
+    (add x($rd:expr), x($rn:expr), x($rm:expr)) => {
+        0x8b000000 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (adds x($rd:expr), x($rn:expr), x($rm:expr)) => {
+        0xab000000 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (lsr x($rd:expr), x($rn:expr), #1) => {
+        0xd341fc00 | rd!($rd) | rn!($rn)
+    };
+
+    // immr is the right rotate amount
+    // imms is the left-most bit position of the source
+    (ubfm x($rd:expr), x($rn:expr), #$immr:expr, #$imms:expr) => {{
+        let immr: u32 = $immr;
+        let imms: u32 = $imms;
+        assert!(immr < 64 && imms < 64);
+        0xd3400000 | rd!($rd) | rn!($rn) | (immr << 16) | (imms << 10)
+    }};
+
+    (blr x($rn:expr)) => { 0xd63f0000 | rn!($rn) };
+    (ret) => { 0xd65f03c0 };
+    (nop) => { 0x91000000 };
+
+    (fmov d($rd:expr), #0.0) => { 0x4f00e400 | rd!($rd) };  // alias for movi v(..), #0
+    (fmov d($rd:expr), #0.5) => { 0x1e6c1000 | rd!($rd) };
+    (fmov d($rd:expr), #1.0) => { 0x1e6e1000 | rd!($rd) };
+    (fmov d($rd:expr), #2.0) => { 0x1e601000 | rd!($rd) };
+    (fmov d($rd:expr), #-1.0) => { 0x1e7e1000 | rd!($rd) };
+
+    (movi v($rd:expr).16b, #0) => { 0x4f00e400 | rd!($rd) };
+    (fmov q($rd:expr), #0.0) => { 0x4f00e400 | rd!($rd) };  // alias for movi v(..), #0
+    (fmov q($rd:expr), #0.5) => { 0x6f03f400 | rd!($rd) };
+    (fmov q($rd:expr), #1.0) => { 0x6f03f600 | rd!($rd) };
+    (fmov q($rd:expr), #2.0) => { 0x6f00f400 | rd!($rd) };
+
+    (movi d($rd:expr), #0) => { 0x2f00e400 | rd!($rd) };
+    (movi q($rd:expr), #0) => { 0x6f00e400 | rd!($rd) };
+
+    // *********************** SIMD (2D) *************************/
+
+    // We are using q to denote a 128-bit packed double register,
+    // instead of v.2d to simplift notation.
+
+    // fmov q0, q0 means mov v0.2d, v0.2d
+    (fmov q($rd:expr), q($rn:expr)) => {{
+        let r = $rn;
+        0x4ea01c00 | rd!($rd) | rn!(r) | rm!(r)
+    }};
+
+    (ldr q($rd:expr), [x($rn:expr), #$ofs:expr]) => {
+        0x3dc00000 | rd!($rd) | rn!($rn) | ofs2d!($ofs)
+    };
+    (ldr q($rd:expr), [x($rn:expr), x($rm:expr), lsl #4]) => {
+        0x3ce07800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (ldr q($rd:expr), label($ofs:expr)) => {
+        0x9c000000 | rd!($rd) | ofs_pc!($ofs)
+    };
+
+    // broadcast: ldr1 {q(0)}, [x(1)] means ld1r {v0.2d}, [x1]
+    (ld1r {q($rd:expr)}, [x($rn:expr)]) => {
+        0x4d40cc00 | rd!($rd) | rn!($rn)
+    };
+
+    // duplicate lane 0 to all lanes
+    // dup q(0), q(1)[0] means dup v0.2d, v1.d[0]
+    (dup q($rd:expr), q($rn:expr)[0]) => {
+        0x4e080400 | rd!($rd) | rn!($rn)
+    };
+
+    (dup q($rd:expr), q($rn:expr)[1]) => {
+        0x4e180400 | rd!($rd) | rn!($rn)
+    };
+
+    (umov x($rd:expr), v($rn:expr).d[0]) => {
+        0x4e083c00 | rd!($rd) | rn!($rn)
+    };
+
+    (umov x($rd:expr), v($rn:expr).d[1]) => {
+        0x4e183c00 | rd!($rd) | rn!($rn)
+    };
+
+    (str q($rd:expr), [x($rn:expr), #$ofs:expr]) => {
+        0x3d800000 | rd!($rd) | rn!($rn) | ofs2d!($ofs)
+    };
+    (str q($rd:expr), [x($rn:expr), x($rm:expr), lsl #4]) => {
+        0x3ca07800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fadd q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x4e60d400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fsub q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x4ee0d400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fmul q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x6e60dc00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fmul q($rd:expr), q($rn:expr), d($rm:expr)[0]) => {
+        0x4fc09000 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fmul q($rd:expr), q($rn:expr), d($rm:expr)[1]) => {
+        0x4fc09800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fdiv q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x6e60fc00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fsqrt q($rd:expr), q($rn:expr)) => {
+        0x6ee1f800 | rd!($rd) | rn!($rn)
+    };
+    (fneg q($rd:expr), q($rn:expr)) => {
+        0x6ee0f800 | rd!($rd) | rn!($rn)
+    };
+    (fabs q($rd:expr), q($rn:expr)) => {
+        0x4ee0f800 | rd!($rd) | rn!($rn)
+    };
+
+    // rd := rm * rn + ra
+    (fmadd q($rd:expr), q($rn:expr), q($rm:expr), q($ra:expr)) => {
+        0x1f400000 | rd!($rd) | rn!($rn) | rm!($rm) | ra!($ra)
+    };
+
+    // rd := -rm * rn + ra
+    (fmsub q($rd:expr), q($rn:expr), q($rm:expr), q($ra:expr)) => {
+        0x1f408000 | rd!($rd) | rn!($rn) | rm!($rm) | ra!($ra)
+    };
+
+    // rd := -(rm * rn + ra)
+    (fnmadd q($rd:expr), q($rn:expr), q($rm:expr), q($ra:expr)) => {
+        0x1f600000 | rd!($rd) | rn!($rn) | rm!($rm) | ra!($ra)
+    };
+
+    // rd := -(rm * rn - ra)
+    (fnmsub q($rd:expr), q($rn:expr), q($rm:expr), q($ra:expr)) => {
+        0x1f608000 | rd!($rd) | rn!($rn) | rm!($rm) | ra!($ra)
+    };
+
+    /*
+     * let q1 = y1:x1 and q2 = y2:x2,
+     *
+     * zip1 q0, q1, q2 => q0 = x2:x1
+     * zip2 q0, q1, q2 => q0 = y2:y1
+     * uzp1 q0, q1, q2 => q0 = x2:x1
+     * uzp2 q0, q1, q2 => q0 = y2:y1
+     *
+     * dup q0, q1[0] => q0 = x1:x1
+     * dup q0, q1[1] => q0 = x2:x2
+     *
+     * ext q0, q1, q2, #8 => x1:y2
+     * ext q0, q1, q1, #8 => x1:y1
+     *
+     */
+
+    (zip1 q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x4ec03800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (zip2 q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x4ec07800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (uzp1 q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x4ec01800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (uzp2 q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x4ec05800 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (ext q($rd:expr), q($rn:expr), q($rm:expr), #8) => {
+        0x6e004000 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (rev64 q($rd:expr), q($rn:expr)) => {
+        0x4e200800 | rd!($rd) | rn!($rn)
+    };
+
+    (fcmla q($rd:expr), q($rn:expr), q($rm:expr), #0) => {
+        0x6ec0c400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fcmla q($rd:expr), q($rn:expr), q($rm:expr), #90) => {
+        0x6ec0cc00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fcmla q($rd:expr), q($rn:expr), q($rm:expr), #180) => {
+        0x6ec0d400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fcmla q($rd:expr), q($rn:expr), q($rm:expr), #270) => {
+        0x6ec0dc00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fcadd q($rd:expr), q($rn:expr), q($rm:expr), #90) => {
+        0x6ec0e400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fcadd q($rd:expr), q($rn:expr), q($rm:expr), #270) => {
+        0x6ec0f400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    // FMA instructions are not defined for 2d packed-double
+
+    // round double to integral (double-coded integer)
+    (frinti q($rd:expr), q($rn:expr)) => {
+        0x6ee19800 | rd!($rd) | rn!($rn)
+    };
+
+    // floor (round toward minus inf) double to integral (double-coded integer)
+    (frintm q($rd:expr), q($rn:expr)) => {
+        0x4e619800 | rd!($rd) | rn!($rn)
+    };
+
+    // ceiling (round toward positive inf) double to integral (double-coded integer)
+    (frintp q($rd:expr), q($rn:expr)) => {
+        0x4ee18800 | rd!($rd) | rn!($rn)
+    };
+
+    // trunc (round toward zero) double to integral (double-coded integer)
+    (frintz q($rd:expr), q($rn:expr)) => {
+        0x4ee19800 | rd!($rd) | rn!($rn)
+    };
+
+    // comparison
+    (fcmeq q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x4e60e400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    // note that rm and rn are exchanged for fcmlt and fcmle
+    (fcmlt q($rd:expr), q($rm:expr), q($rn:expr)) => {
+        0x6ee0e400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fcmle q($rd:expr), q($rm:expr), q($rn:expr)) => {
+        0x6e60e400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fcmgt q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x6ee0e400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (fcmge q($rd:expr), q($rn:expr), q($rm:expr)) => {
+        0x6e60e400 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+
+    (fcmeq q($rd:expr), q($rn:expr), #0.0) => {
+        0x4ee0d800 | rd!($rd) | rn!($rn)
+    };
+
+    // logical ops
+    (and v($rd:expr).16b, v($rn:expr).16b, v($rm:expr).16b) => {
+        0x4e201c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (orr v($rd:expr).16b, v($rn:expr).16b, v($rm:expr).16b) => {
+        0x4ea01c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (eor v($rd:expr).16b, v($rn:expr).16b, v($rm:expr).16b) => {
+        0x6e201c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (bit v($rd:expr).16b, v($rn:expr).16b, v($rm:expr).16b) => {
+        0x6ea01c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (bif v($rd:expr).16b, v($rn:expr).16b, v($rm:expr).16b) => {
+        0x6ee01c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (bic v($rd:expr).16b, v($rn:expr).16b, v($rm:expr).16b) => {
+        0x4e601c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (bsl v($rd:expr).16b, v($rn:expr).16b, v($rm:expr).16b) => {
+        0x6e601c00 | rd!($rd) | rn!($rn) | rm!($rm)
+    };
+    (not v($rd:expr).16b, v($rn:expr).16b) => {
+        0x6e205800 | rd!($rd) | rn!($rn)
+    };
+}

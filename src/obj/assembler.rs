@@ -1,0 +1,99 @@
+use std::collections::HashMap;
+
+pub type Jumper = fn(x: i32, code: u32) -> u32;
+
+#[derive(Debug)]
+pub struct Assembler {
+    pub buf: Vec<u8>,
+    labels: HashMap<String, usize>,
+    jumps: Vec<(String, usize, u32, Jumper, bool)>,
+    /// (offset, symbol) of the calls of external functions (object files)
+    pub relocations: Vec<(usize, String)>,
+}
+
+impl Assembler {
+    pub fn new() -> Assembler {
+        Assembler {
+            buf: Vec::new(),
+            labels: HashMap::new(),
+            jumps: Vec::new(),
+            relocations: Vec::new(),
+        }
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        self.buf.clone()
+    }
+
+    pub fn append_byte(&mut self, b: u8) {
+        self.buf.push(b)
+    }
+
+    pub fn append_bytes(&mut self, bs: &[u8]) {
+        for b in bs {
+            self.append_byte(*b);
+        }
+    }
+
+    pub fn append_word(&mut self, mut u: u32) {
+        // appends u (uint32) as little-endian
+        for _ in 0..4 {
+            self.append_byte((u & 0xff) as u8);
+            u >>= 8;
+        }
+    }
+
+    pub fn append_quad(&mut self, mut u: u64) {
+        // appends u (uint32) as little-endian
+        for _ in 0..8 {
+            self.append_byte((u & 0xff) as u8);
+            u >>= 8;
+        }
+    }
+
+    pub fn ip(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn set_label(&mut self, label: &str) {
+        assert!(!self.labels.contains_key(label));
+        self.labels.insert(label.to_string(), self.ip());
+    }
+
+    pub fn has_label(&self, label: &str) -> bool {
+        self.labels.contains_key(label)
+    }
+
+    pub fn jump(&mut self, label: &str, code: u32, f: Jumper) {
+        self.jumps
+            .push((label.to_string(), self.ip(), code, f, true));
+        self.append_word(0);
+    }
+
+    pub fn jump_abs(&mut self, label: &str, code: u32, f: Jumper) {
+        self.jumps
+            .push((label.to_string(), self.ip(), code, f, false));
+        self.append_word(0);
+    }
+
+    pub fn apply_jumps(&mut self) {
+        for (label, ip, code, f, rel) in self.jumps.iter() {
+            let target = self
+                .labels
+                .get(label)
+                .unwrap_or_else(|| panic!("label {} not found", label));
+            let offset = (*target as i32) - if *rel { *ip as i32 } else { 0 };
+
+            let x = f(offset, *code);
+
+            self.buf[*ip] |= (x & 0xff) as u8;
+            self.buf[*ip + 1] |= ((x >> 8) & 0xff) as u8;
+            self.buf[*ip + 2] |= ((x >> 16) & 0xff) as u8;
+            self.buf[*ip + 3] |= ((x >> 24) & 0xff) as u8;
+        }
+    }
+
+    pub fn create_label(&self) -> String {
+        format!(".L{}", self.ip())
+    }
+}

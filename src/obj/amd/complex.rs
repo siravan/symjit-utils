@@ -1,0 +1,1022 @@
+use crate::obj::code::Func;
+use crate::obj::config::{row_first, Config, ABI_AREA};
+use crate::obj::generator::{
+    object_complex_error, object_external_error, Generator, GeneratorType, StackRegions,
+};
+use crate::obj::symbol::Loc;
+use crate::obj::utils::align_stack;
+use crate::obj::utils::{DataType, Reg};
+use anyhow::Result;
+
+use super::asm::{Amd, RoundingMode};
+use super::*;
+
+const REG_SIZE: u32 = 8;
+const T0: u8 = 1; // Reg::Temp
+const T1: u8 = 2;
+const T2: u8 = 3;
+
+macro_rules! binop {
+    ($self:ident, $avx:ident, $dst:expr, $s1: expr, $s2: expr) => {
+        $self.amd.$avx(ϕ($dst), ϕ($s1), ϕ($s2));
+    };
+}
+
+macro_rules! roundop {
+    ($self:ident, $dst:expr, $s1: expr, $mode: expr) => {
+        $self.amd.vrounddd(ϕ($dst), ϕ($s1), $mode);
+    };
+}
+
+/*
+ *  ϕ translates a logical register number (in Reg) to a physical
+ *  register number, according to the ABI.
+ */
+fn ϕ(r: Reg) -> u8 {
+    match r {
+        Reg::Ret => 0,
+        Reg::Temp => 1,
+        Reg::Left => 0,
+        Reg::Right => 1,
+        Reg::Gen(dst) => dst + 4,
+        Reg::Static(..) => panic!("passing static registers to codegen"),
+    }
+}
+
+pub struct AmdComplexGenerator {
+    amd: Amd,
+    config: Config,
+    last_load: usize,
+}
+
+impl AmdComplexGenerator {
+    pub fn new(config: Config) -> AmdComplexGenerator {
+        AmdComplexGenerator {
+            amd: Amd::new(DataType::F64),
+            config,
+            last_load: 0,
+        }
+    }
+
+    fn append_quad(&mut self, u: u64) {
+        self.amd.a.append_quad(u);
+    }
+
+    fn apply_jumps(&mut self) {
+        self.amd.a.apply_jumps();
+    }
+
+    /*
+    fn load_const_by_name(&mut self, dst: Reg, label: &str) {
+        // self.amd.vbroadcastsd_label(ϕ(dst), label);
+        self.amd.vmovsd_xmm_label(ϕ(dst), label);
+    }
+    */
+
+    fn vzeroupper(&mut self) {
+        self.amd.vzeroupper();
+    }
+
+    fn call_external(&mut self, op: &str, num_args: usize) -> Result<()> {
+        let cap = ABI_AREA as u32;
+
+        if self.config.is_kernel_func(op) {
+            self.amd.lea_mem(ARGS[0], STACK, 4 * REG_SIZE as i32);
+            self.amd.xor(ARGS[1], ARGS[1]);
+            self.amd.xor(ARGS[2], ARGS[2]);
+            self.amd.lea_mem(ARGS[3], STACK, (cap * REG_SIZE) as i32);
+        } else {
+            self.amd.mov_reg_label(ARGS[0], &format!("_env_{}_", op));
+            self.amd.lea_mem(ARGS[1], STACK, (cap * REG_SIZE) as i32);
+            self.amd.mov_imm(ARGS[2], num_args as u32);
+            self.amd.lea_mem(ARGS[3], STACK, 4 * REG_SIZE as i32);
+        }
+
+        if op == "@self" {
+            self.call_funclet("@self");
+        } else {
+            self.vzeroupper();
+            self.amd.call_indirect(&format!("_func_{}_", op));
+        }
+
+        self.load_stack(Reg::Ret, 4);
+
+        Ok(())
+    }
+
+    fn predefined_consts(&mut self) {
+        self.align();
+        predefined_consts(&mut self.amd, 2);
+        if self.config.stable_math() {
+            stable_consts(&mut self.amd, 2);
+        }
+    }
+
+    /*********************** stable_math ***********************/
+
+    /// T1 := (p, p) with `p = (|re s|/2 + |im s|/2 + floor) & mask`, a power of two (see
+    /// `Complexifier::stable_exponent`). `s` is a physical register; T2 is clobbered.
+    fn stable_exponent(&mut self, s: u8, mask: &str, floor: &str) {
+        self.amd.vanddd_label(T1, s, "_not_minus_zero_");
+        self.amd.vmuldd_label(T1, T1, "_half_");
+        self.amd.vhadddd(T1, T1, T1);
+        self.amd.vmovdd_xmm_label(T2, floor);
+        self.amd.vadddd(T1, T1, T2);
+        self.amd.vanddd_label(T1, T1, mask);
+    }
+
+    /// T2 := (k, k) with `k = 0.5 / p`, which scales `max(|re s|, |im s|)` into [0.5, 2)
+    /// (`p ^ inf` is `2 / p` for a power of two, see `Complexifier::stable_divisor_scale`).
+    fn stable_divisor_scale(&mut self, s: u8) {
+        self.stable_exponent(s, "_stable_inf_", "_stable_floor_");
+        self.amd.vxordd_label(T2, T1, "_stable_inf_");
+        self.amd.vmuldd_label(T2, T2, "_stable_quarter_");
+    }
+
+    /// `divide` with both operands scaled by `stable_divisor_scale(s2)` (exact: the
+    /// instructions after the scaling are those of `divide`).
+    fn stable_divide(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        self.stable_divisor_scale(ϕ(s2));
+        self.amd.vmuldd(T1, ϕ(s2), T2); // (c', d')
+        self.amd.vmuldd(T2, ϕ(s1), T2); // (a', b')
+
+        self.amd.vunpckhdd(T0, T2, T2); // duplicate imag
+        self.amd.vmuldd(T0, T0, T1);
+        self.amd.vunpckldd(T2, T2, T2); // duplicate real
+        self.amd.vmuldd(T2, T2, T1);
+
+        self.amd.vmuldd(T1, T1, T1);
+        self.amd.vhadddd(T1, T1, T1);
+
+        self.amd.vshufdd(T2, T2, T2, 1); // exchange real/imag
+        self.amd.vaddsubdd(ϕ(dst), T0, T2);
+
+        self.amd.vshufdd(ϕ(dst), ϕ(dst), ϕ(dst), 1);
+        self.amd.vdivdd(ϕ(dst), ϕ(dst), T1);
+    }
+
+    /// `recip` of `s1 * k`: `(c k^2, -d k^2) / |s1 k|^2` (the products with `k` are exact
+    /// unless they underflow, when the result is subnormal anyway).
+    fn stable_recip(&mut self, dst: Reg, s1: Reg) {
+        self.stable_divisor_scale(ϕ(s1));
+        self.amd.vmuldd(T1, ϕ(s1), T2); // z' = z * k
+
+        self.amd.vmuldd(T0, T1, T1);
+        self.amd.vhadddd(T0, T0, T0); // |z'|^2
+        self.amd.vmuldd(T1, T1, T2); // z' * k
+
+        self.amd.vshufdd(T2, T1, T1, 1);
+        self.amd.vxordd(T1, T1, T1);
+        self.amd.vaddsubdd(T2, T1, T2);
+        self.amd.vshufdd(T2, T2, T2, 1);
+        self.amd.vdivdd(ϕ(dst), T2, T0);
+    }
+
+    /// `abs` of `s1 / p`, times `p`.
+    fn stable_abs(&mut self, dst: Reg, s1: Reg) {
+        self.stable_exponent(ϕ(s1), "_stable_mask_finite_", "_stable_floor_finite_");
+        self.amd.vxordd_label(T2, T1, "_stable_inf_");
+        self.amd.vmuldd_label(T2, T2, "_half_"); // k = 1 / p
+        self.amd.vmuldd(T2, ϕ(s1), T2);
+
+        self.amd.vmuldd(T2, T2, T2);
+        self.amd.vhadddd(T2, T2, T2);
+        self.amd.vsqrtsd(T2, T2);
+        self.amd.vmulsd(T2, T2, T1);
+        self.amd.vxorpd(T1, T1, T1);
+        self.amd.vunpckldd(ϕ(dst), T2, T1);
+    }
+
+    /// The body of `@complex_root` (argument and result in `Ret`) on `z / r^2` with a power
+    /// of two `r ~ sqrt(max(|re z|, |im z|))`; the imaginary part of the result is computed
+    /// from the original `im z`. The instructions after the scaling are those of `root`.
+    fn stable_root_body(&mut self) {
+        let s1 = ϕ(Reg::Ret);
+        let dst = ϕ(Reg::Ret);
+
+        self.stable_exponent(s1, "_stable_mask_finite_", "_stable_floor_finite_");
+        self.amd.vsqrtdd(T1, T1);
+        self.amd.vanddd_label(T1, T1, "_stable_mask_finite_"); // (r, r)
+
+        self.amd.vmovsd_xmm_label(T0, "_minus_zero_");
+        self.amd.vucomisd(s1, T0); // the flags for the jump below (the AVX code keeps them)
+
+        self.amd.vmuldd(T2, T1, T1);
+        self.amd.vxordd_label(T2, T2, "_stable_inf_");
+        self.amd.vmuldd_label(T2, T2, "_half_"); // k = 1 / r^2
+        self.amd.vmuldd(T2, s1, T2); // z' = z * k
+        self.amd.vshufdd(T1, T1, s1, 2); // T1 = (r, im z); `Ret` is free
+
+        self.amd.vmuldd_label(T2, T2, "_half_");
+        self.amd.vmulsd(s1, T2, T2);
+        self.amd.vunpckhdd(T0, T2, T2);
+        self.amd.vfmadd231sd(s1, T0, T0);
+        self.amd.vsqrtsd(s1, s1); // |z'| / 2
+
+        self.amd.vanddd_label(T2, T2, "_not_minus_zero_");
+        self.amd.vaddsd(s1, s1, T2);
+        self.amd.vsqrtsd(s1, s1); // t'
+        self.amd.vmulsd(s1, s1, T1); // t = t' * r
+
+        // imag(z) / t / 2: dividing first keeps a subnormal imag(z) (halving the smallest
+        // subnormal gives 0); in the normal range both orders give the same bits
+        self.amd.vunpckhdd(T2, T1, T1);
+        self.amd.vdivsd(T2, T2, s1);
+        self.amd.vmulsd_label(T2, T2, "_half_");
+
+        self.amd.vcmpeqsd(T0, T2, T2);
+        self.amd.vandpd(T2, T2, T0); // set T2 to 0 if it is NaN (if imag(s1) is 0)
+
+        self.amd.vunpckldd(T1, s1, s1);
+        self.amd.vmovsd_xmm_label(T0, "_minus_zero_");
+
+        self.amd.jnb("@complex_root_l1");
+
+        // real(s1) < 0
+        self.amd.vandpd(T0, T0, T2); // T0 = sign(T2)
+        self.amd.vxorpd(T1, T1, T0); // T1 = copysign(T2, T1)
+        self.amd.vxorpd(T2, T2, T0); // T2 = |T2|
+        self.amd.vunpckldd(dst, T2, T1); // T1 <-> T2
+        self.ret();
+
+        // real(s1) >= 0
+        self.set_label("@complex_root_l1");
+        self.amd.vunpckldd(dst, T1, T2);
+        self.ret();
+    }
+}
+
+impl Generator for AmdComplexGenerator {
+    fn bytes(&mut self) -> Vec<u8> {
+        self.amd.a.bytes()
+    }
+
+    fn count_shadows(&self) -> u8 {
+        if cfg!(target_family = "windows") {
+            4 // xmm2-xmm5
+        } else {
+            14 // xmm2-xmm15
+        }
+    }
+
+    fn three_address(&self) -> bool {
+        true
+    }
+
+    fn what(&self) -> GeneratorType {
+        GeneratorType::AmdComplex
+    }
+
+    fn seal(&mut self) {
+        self.predefined_consts();
+        self.apply_jumps();
+    }
+
+    fn align(&mut self) {
+        let mut n = self.amd.a.ip();
+
+        while (n & 15) != 0 {
+            self.amd.nop();
+            n += 1
+        }
+    }
+
+    fn set_label(&mut self, label: &str) {
+        self.amd.a.set_label(label);
+    }
+
+    fn branch(&mut self, label: &str) {
+        self.amd.jmp(label);
+    }
+
+    /// jump to label if cond == is_else
+    /// note that `is_else` is not the correct name anymore and should be
+    /// changed to `expectation`
+    fn branch_if(&mut self, cond: Reg, label: &str, is_else: bool) {
+        self.amd.vucomisd(ϕ(cond), ϕ(cond));
+        /*
+         * if is_else (expectation) is true, jump if cond is true (all-1, NaN).
+         * In this situation, vucomisd returns an unordered result, setting
+         * PF = 1 (jpe)
+         */
+        if is_else {
+            self.amd.jpe(label);
+        } else {
+            self.amd.jpo(label);
+        }
+    }
+
+    fn fuse_load_math(&mut self) {
+        fuse_load_math(&mut self.amd, self.last_load);
+    }
+
+    //***********************************/
+    fn fmov(&mut self, dst: Reg, s1: Reg) {
+        if dst != s1 {
+            self.amd.vmovapd(ϕ(dst), ϕ(s1));
+        }
+    }
+
+    fn fxchg(&mut self, s1: Reg, s2: Reg) {
+        self.amd.vxordd(ϕ(s1), ϕ(s1), ϕ(s2));
+        self.amd.vxordd(ϕ(s2), ϕ(s1), ϕ(s2));
+        self.amd.vxordd(ϕ(s1), ϕ(s1), ϕ(s2));
+    }
+
+    fn load_const(&mut self, dst: Reg, idx: u32) {
+        self.last_load = self.amd.a.ip();
+        let label = format!("_const_{}_", idx);
+        // self.amd.vbroadcastsd_label(ϕ(dst), label.as_str());
+        self.amd.vmovsd_xmm_label(ϕ(dst), label.as_str());
+    }
+
+    fn load_mem(&mut self, dst: Reg, idx: u32) {
+        self.last_load = self.amd.a.ip();
+        self.amd
+            .vmovdd_xmm_mem(ϕ(dst), MEM, (idx * REG_SIZE) as i32);
+    }
+
+    fn save_mem(&mut self, dst: Reg, idx: u32) {
+        self.amd
+            .vmovdd_mem_xmm(MEM, (idx * REG_SIZE) as i32, ϕ(dst));
+    }
+
+    fn save_mem_result(&mut self, idx: u32) {
+        self.save_mem(Reg::Ret, idx);
+    }
+
+    fn load_param(&mut self, dst: Reg, idx: u32) {
+        self.last_load = self.amd.a.ip();
+        self.amd
+            .vmovdd_xmm_mem(ϕ(dst), PARAMS, (idx * REG_SIZE) as i32);
+    }
+
+    fn load_stack(&mut self, dst: Reg, idx: u32) {
+        self.last_load = self.amd.a.ip();
+        self.amd
+            .vmovdd_xmm_mem(ϕ(dst), STACK, (idx * REG_SIZE) as i32);
+    }
+
+    fn save_stack(&mut self, dst: Reg, idx: u32) {
+        self.amd
+            .vmovdd_mem_xmm(STACK, (idx * REG_SIZE) as i32, ϕ(dst));
+    }
+
+    fn load_mem_complex(&mut self, _xd: Reg, _yd: Reg, _idx: u32) {}
+
+    fn save_mem_complex(&mut self, _xs: Reg, _ys: Reg, _idx: u32) {}
+
+    fn load_param_complex(&mut self, _xd: Reg, _yd: Reg, _idx: u32) {}
+
+    fn load_stack_complex(&mut self, _xd: Reg, _yd: Reg, _idx: u32) {}
+
+    fn save_stack_complex(&mut self, _xs: Reg, _ys: Reg, _idx: u32) {}
+
+    fn save_stack_result(&mut self, idx: u32) {
+        self.save_stack(Reg::Ret, idx);
+    }
+
+    fn load_args(&mut self, locs: Vec<Loc>, ultra: bool) {
+        load_args_helper(
+            &mut self.amd,
+            &self.config,
+            &locs[..],
+            ultra,
+            16,
+            |amd, src, dst| {
+                load_f64x2_from_loc(amd, 0, src);
+                save_f64x2_to_loc(amd, 0, dst);
+            },
+            |amd, arg, src| {
+                load_f64x2_from_loc(amd, arg, src);
+            },
+        );
+    }
+
+    fn save_args(&mut self, num_args: u8, ultra: bool) {
+        save_args_helper(
+            &mut self.amd,
+            &self.config,
+            num_args,
+            ultra,
+            16,
+            |amd, arg| {
+                amd.vmovdd_xmm_indexed(arg, STACK, Amd::RAX, 8);
+            },
+            |amd, arg, dst| {
+                save_f64x2_to_loc(amd, arg, dst);
+            },
+        );
+    }
+
+    fn load_args_complex(&mut self, _locs: Vec<Loc>, _ultra: bool) {}
+    fn save_args_complex(&mut self, _num_args: u8, _ultra: bool) {}
+
+    fn neg(&mut self, dst: Reg, s1: Reg) {
+        self.amd.vxordd_label(ϕ(dst), ϕ(s1), "_minus_zero_");
+    }
+
+    fn sign(&mut self, dst: Reg, s1: Reg) {
+        self.amd.vanddd_label(ϕ(dst), ϕ(s1), "_minus_zero_");
+    }
+
+    fn abs(&mut self, dst: Reg, s1: Reg) {
+        if self.config.stable_math() {
+            return self.stable_abs(dst, s1);
+        }
+        self.amd.vmuldd(T1, ϕ(s1), ϕ(s1));
+        self.amd.vhadddd(T1, T1, T1);
+        self.amd.vsqrtsd(T2, T1);
+        self.amd.vxorpd(T1, T1, T1);
+        self.amd.vunpckldd(ϕ(dst), T2, T1);
+    }
+
+    fn abs2(&mut self, dst: Reg, s1: Reg) {
+        self.amd.vmuldd(T1, ϕ(s1), ϕ(s1));
+        self.amd.vhadddd(T2, T1, T1);
+        self.amd.vxorpd(T1, T1, T1);
+        self.amd.vunpckldd(ϕ(dst), T2, T1);
+    }
+
+    fn times_i(&mut self, dst: Reg, s1: Reg) {
+        self.amd.vxorpd(T1, T1, T1);
+        self.amd.vshufdd(ϕ(dst), ϕ(s1), ϕ(s1), 1);
+        self.amd.vaddsubdd(ϕ(dst), T1, ϕ(dst));
+    }
+
+    fn times_neg_i(&mut self, dst: Reg, s1: Reg) {
+        self.amd.vxorpd(T1, T1, T1);
+        self.amd.vaddsubdd(ϕ(dst), T1, ϕ(s1));
+        self.amd.vshufdd(ϕ(dst), ϕ(dst), ϕ(dst), 1);
+    }
+
+    fn root(&mut self, dst: Reg, s1: Reg) {
+        self.fmov(Reg::Ret, s1);
+        self.call_funclet("@complex_root");
+        self.fmov(dst, Reg::Ret);
+
+        if !self.amd.a.has_label("@complex_root") {
+            self.branch("@jump_over_complex_root");
+
+            let s1 = ϕ(Reg::Ret);
+            let dst = ϕ(Reg::Ret);
+
+            self.set_label("@complex_root");
+
+            if self.config.stable_math() {
+                self.stable_root_body();
+                self.set_label("@jump_over_complex_root");
+                return;
+            }
+
+            self.amd.vmuldd_label(s1, s1, "_half_");
+            self.amd.vmulsd(T1, s1, s1);
+            self.amd.vunpckhdd(T2, s1, s1);
+            self.amd.vfmadd231dd(T1, T2, T2);
+            self.amd.vsqrtsd(T1, T1); // T1 == sqrt(real(s1)^2 + imag(s1)^2) / 2
+
+            self.amd.vmovsd_xmm_label(T0, "_minus_zero_");
+            self.amd.vucomisd(s1, T0); // set the flags here for jmup lower down
+            self.amd.vandnpd(s1, T0, s1); // s1 = |real(s1)|
+            self.amd.vaddsd(T1, T1, s1); // T1 == (sqrt(real(s1)^2 + imag(s1)^2) + abs(real(s1))) / 2
+
+            self.amd.vsqrtsd(T1, T1); // T1 == sqrt(T1 == sqrt(real(s1)^2 + imag(s1)^2) + abs(real(s1)) / 2)
+            self.amd.vdivsd(T2, T2, T1); // T2 == imag(s1) / (2 * T1)
+
+            self.amd.vcmpeqsd(s1, T2, T2);
+            self.amd.vandpd(T2, T2, s1); // set T2 to 0 if it is NaN (if imag(s1) is 0)
+
+            /*
+             * At this stage, T0 = _minus_zero_, and T1 and T2 are the preliminary real/imag results.
+             */
+
+            self.amd.jnb("@complex_root_l1");
+
+            // real(s1) < 0
+            self.amd.vandpd(T0, T0, T2); // T0 = sign(T2)
+            self.amd.vxorpd(T1, T1, T0); // T1 = copysign(T2, T1)
+            self.amd.vxorpd(T2, T2, T0); // T2 = |T2|
+            self.amd.vunpckldd(dst, T2, T1); // T1 <-> T2
+            self.ret();
+
+            // real(s1) >= 0
+            self.set_label("@complex_root_l1");
+            self.amd.vunpckldd(dst, T1, T2);
+            self.ret();
+
+            self.set_label("@jump_over_complex_root");
+        }
+    }
+
+    fn real_root(&mut self, dst: Reg, s1: Reg) {
+        self.amd.vxorpd(T1, T1, T1);
+        self.amd.vsqrtsd(ϕ(dst), ϕ(s1));
+        self.amd.vunpckldd(ϕ(dst), ϕ(dst), T1);
+    }
+
+    fn recip(&mut self, dst: Reg, s1: Reg) {
+        if self.config.stable_math() {
+            return self.stable_recip(dst, s1);
+        }
+        self.amd.vshufdd(T1, ϕ(s1), ϕ(s1), 1);
+        self.amd.vxorpd(T2, T2, T2);
+        self.amd.vaddsubdd(T1, T2, T1);
+        self.amd.vshufdd(T2, T1, T1, 1);
+
+        self.amd.vmuldd(T1, ϕ(s1), ϕ(s1));
+        self.amd.vhadddd(T1, T1, T1);
+        self.amd.vdivdd(ϕ(dst), T2, T1);
+    }
+
+    fn half(&mut self, dst: Reg, s1: Reg) {
+        self.amd.vmuldd_label(ϕ(dst), ϕ(s1), "_half_");
+    }
+
+    fn round(&mut self, dst: Reg, s1: Reg) {
+        roundop!(self, dst, s1, RoundingMode::Round);
+    }
+
+    fn floor(&mut self, dst: Reg, s1: Reg) {
+        roundop!(self, dst, s1, RoundingMode::Floor);
+    }
+
+    fn ceiling(&mut self, dst: Reg, s1: Reg) {
+        roundop!(self, dst, s1, RoundingMode::Ceiling);
+    }
+
+    fn trunc(&mut self, dst: Reg, s1: Reg) {
+        roundop!(self, dst, s1, RoundingMode::Trunc);
+    }
+
+    fn frac(&mut self, dst: Reg, s1: Reg) {
+        self.floor(Reg::Temp, s1);
+        self.minus(dst, s1, Reg::Temp);
+    }
+
+    fn plus(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        binop!(self, vadddd, dst, s1, s2);
+    }
+
+    fn minus(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        binop!(self, vsubdd, dst, s1, s2);
+    }
+
+    fn times(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        self.amd.vunpckldd(T1, ϕ(s1), ϕ(s1)); // duplicate real
+        self.amd.vunpckhdd(T2, ϕ(s1), ϕ(s1)); // duplicate imag
+        self.amd.vmuldd(T1, T1, ϕ(s2));
+        self.amd.vmuldd(T2, T2, ϕ(s2));
+        self.amd.vshufdd(T2, T2, T2, 1); // exchange real/imag
+        self.amd.vaddsubdd(ϕ(dst), T1, T2);
+    }
+
+    fn divide(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        if self.config.stable_math() {
+            return self.stable_divide(dst, s1, s2);
+        }
+        // `s2` is `Reg::Temp` (T0) for a constant divisor (`LoadConstMath` in `Mir::rerun`),
+        // so both operands are read before T0 is written
+        self.amd.vunpckldd(T1, ϕ(s1), ϕ(s1)); // duplicate real
+        self.amd.vunpckhdd(T2, ϕ(s1), ϕ(s1)); // duplicate imag
+        self.amd.vmuldd(T1, T1, ϕ(s2));
+        self.amd.vmuldd(T2, T2, ϕ(s2));
+
+        self.amd.vmuldd(T0, ϕ(s2), ϕ(s2));
+        self.amd.vhadddd(T0, T0, T0);
+
+        self.amd.vshufdd(T1, T1, T1, 1); // exchange real/imag
+        self.amd.vaddsubdd(ϕ(dst), T2, T1);
+        self.amd.vshufdd(ϕ(dst), ϕ(dst), ϕ(dst), 1);
+        self.amd.vdivdd(ϕ(dst), ϕ(dst), T0);
+    }
+
+    fn times_complex(
+        &mut self,
+        _xd: Reg,
+        _yd: Reg,
+        _x1: Reg,
+        _y1: Reg,
+        _x2: Reg,
+        _y2: Reg,
+    ) -> bool {
+        false
+    }
+
+    fn divide_complex(
+        &mut self,
+        _xd: Reg,
+        _yd: Reg,
+        _x1: Reg,
+        _y1: Reg,
+        _x2: Reg,
+        _y2: Reg,
+    ) -> bool {
+        false
+    }
+
+    fn support_times2(&self) -> bool {
+        self.config.parallel_mul()
+    }
+
+    fn times2_loc(&mut self, d1: Reg, s1: Reg, l1: Loc, d2: Reg, s2: Reg, l2: Loc) {
+        if d1 == s2 {
+            match l1 {
+                Loc::Mem(idx) => self.load_mem(Reg::Temp, idx),
+                Loc::Param(idx) => self.load_param(Reg::Temp, idx),
+                Loc::Stack(idx) => self.load_stack(Reg::Temp, idx),
+            }
+            self.times(d1, s1, Reg::Temp);
+
+            match l2 {
+                Loc::Mem(idx) => self.load_mem(Reg::Temp, idx),
+                Loc::Param(idx) => self.load_param(Reg::Temp, idx),
+                Loc::Stack(idx) => self.load_stack(Reg::Temp, idx),
+            }
+            self.times(d2, s2, Reg::Temp);
+        } else {
+            match l1 {
+                Loc::Mem(idx) => self.amd.vmovdd_xmm_mem(T0, MEM, (idx * REG_SIZE) as i32),
+                Loc::Param(idx) => self.amd.vmovdd_xmm_mem(T0, PARAMS, (idx * REG_SIZE) as i32),
+                Loc::Stack(idx) => {
+                    // Important! STACK instead of SP here because SP changes in the compression subroutines.
+                    self.amd.vmovdd_xmm_mem(T0, STACK, (idx * REG_SIZE) as i32);
+                }
+            }
+
+            match l2 {
+                Loc::Mem(idx) => self
+                    .amd
+                    .vinsertf128_mem(T0, T0, MEM, (idx * REG_SIZE) as i32, 1),
+                Loc::Param(idx) => {
+                    self.amd
+                        .vinsertf128_mem(T0, T0, PARAMS, (idx * REG_SIZE) as i32, 1)
+                }
+                Loc::Stack(idx) => {
+                    self.amd
+                        .vinsertf128_mem(T0, T0, STACK, (idx * REG_SIZE) as i32, 1)
+                }
+            }
+
+            self.amd.vinsertf128(ϕ(s1), ϕ(s1), ϕ(s2), 1);
+
+            self.amd.vunpcklpd(T1, ϕ(s1), ϕ(s1)); // duplicate real
+            self.amd.vunpckhpd(T2, ϕ(s1), ϕ(s1)); // duplicate imag
+            self.amd.vmulpd(T1, T1, T0);
+            self.amd.vmulpd(T2, T2, T0);
+            self.amd.vshufpd(T2, T2, T2, 5); // exchange real/imag
+            self.amd.vaddsubpd(ϕ(d1), T1, T2);
+
+            self.amd.vextractf128(ϕ(d2), ϕ(d1), 1);
+        }
+    }
+
+    fn real(&mut self, dst: Reg, s1: Reg) {
+        self.amd.vxorpd(T1, T1, T1);
+        self.amd.vunpckldd(ϕ(dst), ϕ(s1), T1);
+    }
+
+    fn imaginary(&mut self, dst: Reg, s1: Reg) {
+        self.amd.vxorpd(T1, T1, T1);
+        self.amd.vunpckhdd(ϕ(dst), ϕ(s1), T1);
+    }
+
+    fn conjugate(&mut self, dst: Reg, s1: Reg) {
+        self.amd.vxorpd(T1, T1, T1);
+        self.amd.vshufdd(ϕ(dst), ϕ(s1), ϕ(s1), 1);
+        self.amd.vaddsubdd(ϕ(dst), T1, ϕ(dst));
+        self.amd.vshufdd(ϕ(dst), ϕ(dst), ϕ(dst), 1);
+    }
+
+    fn complex(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        self.amd.vunpckldd(ϕ(dst), ϕ(s1), ϕ(s2));
+    }
+
+    fn gt(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        binop!(self, vcmpnlesd, dst, s1, s2);
+        binop!(self, vunpckldd, dst, dst, dst);
+    }
+
+    fn geq(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        binop!(self, vcmpnltsd, dst, s1, s2);
+        binop!(self, vunpckldd, dst, dst, dst);
+    }
+
+    fn lt(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        binop!(self, vcmpltsd, dst, s1, s2);
+        binop!(self, vunpckldd, dst, dst, dst);
+    }
+
+    fn leq(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        binop!(self, vcmplesd, dst, s1, s2);
+        binop!(self, vunpckldd, dst, dst, dst);
+    }
+
+    fn eq(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        binop!(self, vcmpeqdd, dst, s1, s2);
+        self.amd.vshufdd(T1, ϕ(dst), ϕ(dst), 1);
+        self.amd.vandpd(ϕ(dst), ϕ(dst), T1);
+    }
+
+    fn neq(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        binop!(self, vcmpneqdd, dst, s1, s2);
+        self.amd.vshufdd(T1, ϕ(dst), ϕ(dst), 1);
+        self.amd.vorpd(ϕ(dst), ϕ(dst), T1);
+    }
+
+    fn and(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        binop!(self, vandpd, dst, s1, s2);
+    }
+
+    fn andnot(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        binop!(self, vandnpd, dst, s1, s2);
+    }
+
+    fn or(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        binop!(self, vorpd, dst, s1, s2);
+    }
+
+    fn xor(&mut self, dst: Reg, s1: Reg, s2: Reg) {
+        binop!(self, vxorpd, dst, s1, s2);
+    }
+
+    fn not(&mut self, dst: Reg, s1: Reg) {
+        self.amd.vxordd_label(ϕ(dst), ϕ(s1), "_all_ones_");
+    }
+
+    fn fused_mul_add(&mut self, dst: Reg, s1: Reg, s2: Reg, s3: Reg) {
+        self.amd.vunpckldd(T1, ϕ(s1), ϕ(s1)); // duplicate real
+        self.amd.vunpckhdd(T2, ϕ(s1), ϕ(s1)); // duplicate imag
+        self.amd.vfmadd132dd(T1, ϕ(s3), ϕ(s2));
+        self.amd.vmuldd(T2, T2, ϕ(s2));
+        self.amd.vshufdd(T2, T2, T2, 1); // exchange real/imag
+        self.amd.vaddsubdd(ϕ(dst), T1, T2);
+    }
+
+    fn fused_mul_sub(&mut self, dst: Reg, s1: Reg, s2: Reg, s3: Reg) {
+        self.amd.vunpckldd(T1, ϕ(s1), ϕ(s1)); // duplicate real
+        self.amd.vunpckhdd(T2, ϕ(s1), ϕ(s1)); // duplicate imag
+        self.amd.vfmsub132dd(T1, ϕ(s3), ϕ(s2));
+        self.amd.vmuldd(T2, T2, ϕ(s2));
+        self.amd.vshufdd(T2, T2, T2, 1); // exchange real/imag
+        self.amd.vaddsubdd(ϕ(dst), T1, T2);
+    }
+
+    fn fused_neg_mul_add(&mut self, dst: Reg, s1: Reg, s2: Reg, s3: Reg) {
+        self.amd.vunpckldd(T1, ϕ(s1), ϕ(s1)); // duplicate real
+        self.amd.vunpckhdd(T2, ϕ(s1), ϕ(s1)); // duplicate imag
+        self.amd.vfnmadd132dd(T1, ϕ(s3), ϕ(s2));
+        self.amd.vmuldd(T2, T2, ϕ(s2));
+        self.amd.vshufdd(T1, T1, T1, 1);
+        self.amd.vaddsubdd(T1, T1, T2);
+        self.amd.vshufdd(ϕ(dst), T1, T1, 1); // exchange real/imag
+    }
+
+    fn fused_neg_mul_sub(&mut self, dst: Reg, s1: Reg, s2: Reg, s3: Reg) {
+        self.amd.vunpckldd(T1, ϕ(s1), ϕ(s1)); // duplicate real
+        self.amd.vunpckhdd(T2, ϕ(s1), ϕ(s1)); // duplicate imag
+        self.amd.vfnmsub132dd(T1, ϕ(s3), ϕ(s2));
+        self.amd.vmuldd(T2, T2, ϕ(s2));
+        self.amd.vshufdd(T1, T1, T1, 1);
+        self.amd.vaddsubdd(T1, T1, T2);
+        self.amd.vshufdd(ϕ(dst), T1, T1, 1); // exchange real/imag
+    }
+
+    fn add_consts(&mut self, consts: &[f64]) {
+        for (idx, val) in consts.iter().enumerate() {
+            let label = format!("_const_{}_", idx);
+            self.set_label(label.as_str());
+            self.append_quad((*val).to_bits());
+        }
+    }
+
+    // object mode: there is no table of function addresses
+    fn add_func(&mut self, _op: &str, _f: Func) {}
+
+    fn call(&mut self, op: &str, num_args: usize) -> Result<()> {
+        if self.config.is_external_func(op) {
+            if op != "@self" {
+                return Err(object_external_error(op));
+            }
+            return self.call_external(op, num_args);
+        }
+
+        self.vzeroupper();
+        object_call(&mut self.amd, op)
+    }
+
+    fn call_complex(&mut self, op: &str, _num_args: usize) -> Result<()> {
+        // object mode: models calling complex functions are compiled through `complexify`
+        Err(object_complex_error(op))
+    }
+
+    fn call_funclet(&mut self, label: &str) {
+        self.amd.call_relative(label);
+    }
+
+    fn ret(&mut self) {
+        self.amd.ret();
+    }
+
+    fn ifelse(&mut self, dst: Reg, true_val: Reg, false_val: Reg, idx: u32) {
+        if true_val == false_val {
+            self.fmov(dst, true_val);
+        } else if dst != false_val {
+            self.load_stack(Reg::Temp, idx);
+            self.and(dst, Reg::Temp, true_val);
+            self.andnot(Reg::Temp, Reg::Temp, false_val);
+            self.or(dst, dst, Reg::Temp);
+        } else {
+            // dst == false_val && dst != true_val
+            self.load_stack(Reg::Temp, idx);
+            self.andnot(dst, Reg::Temp, false_val);
+            self.and(Reg::Temp, Reg::Temp, true_val);
+            self.or(dst, dst, Reg::Temp);
+        }
+    }
+
+    /****************** Prologues/Epilogues ********************/
+
+    #[cfg(target_family = "unix")]
+    fn prologue_fast(&mut self, cap: usize, count_states: usize, count_obs: usize) {
+        self.amd.push(Amd::RBP);
+        self.amd.push(STACK);
+        self.amd.push(MEM);
+        self.amd.mov(Amd::RBP, SP);
+
+        let frame_size = align_stack((count_states + count_obs) as u32 * REG_SIZE);
+        sub_rsp(&mut self.amd, frame_size);
+        self.amd.mov(MEM, SP);
+
+        sub_rsp(&mut self.amd, align_stack(cap as u32 * REG_SIZE));
+        self.amd.mov(STACK, SP);
+
+        for i in (0..count_states).step_by(2) {
+            self.amd
+                .vmovdd_mem_xmm(MEM, (i as u32 * REG_SIZE) as i32, i as u8);
+        }
+    }
+
+    #[cfg(target_family = "windows")]
+    fn prologue_fast(&mut self, cap: usize, count_states: usize, count_obs: usize) {
+        self.amd.push(Amd::RBP);
+        self.amd.push(STACK);
+        self.amd.push(MEM);
+        self.amd.mov(Amd::RBP, SP);
+
+        let frame_size = align_stack((count_states + count_obs) as u32 * REG_SIZE);
+        sub_rsp(&mut self.amd, frame_size);
+        self.amd.mov(MEM, SP);
+
+        sub_rsp(&mut self.amd, align_stack(cap as u32 * REG_SIZE));
+        self.amd.mov(STACK, SP);
+
+        for i in (0..count_states.min(8)).step_by(2) {
+            self.amd
+                .vmovdd_mem_xmm(MEM, (i as u32 * REG_SIZE) as i32, i as u8);
+        }
+
+        for i in (8..count_states).step_by(2) {
+            let i = i as u32;
+            // the offset of the fifth or eight arguments:
+            // +4 for the 32-byte home
+            // +1 for the return address in the stack
+            // +1 for RBP in the stack
+            // -4 for the first four arguments passed in XMM0-XMM3
+            self.amd
+                .vmovdd_xmm_mem(0, MEM, (frame_size + (i + 2) * REG_SIZE) as i32);
+            self.amd.vmovdd_mem_xmm(MEM, (i * REG_SIZE) as i32, 0);
+        }
+    }
+
+    fn epilogue_fast(
+        &mut self,
+        _cap: usize,
+        _count_states: usize,
+        _count_obs: usize,
+        idx_ret: i32,
+    ) {
+        self.vzeroupper();
+        self.amd.vmovdd_xmm_mem(0, MEM, idx_ret * REG_SIZE as i32);
+        self.vzeroupper();
+        self.amd.mov(SP, Amd::RBP);
+        self.amd.pop(MEM);
+        self.amd.pop(STACK);
+        self.amd.pop(Amd::RBP);
+        self.amd.ret();
+    }
+
+    fn prologue_indirect(
+        &mut self,
+        cap: usize,
+        count_states: usize,
+        count_obs: usize,
+        count_params: usize,
+    ) {
+        let regions = StackRegions::new(cap, count_states, count_obs, count_params);
+
+        if row_first(&self.config) {
+            self.prologue_symbolica(&regions)
+        } else {
+            self.prologue_sympy(&regions)
+        }
+    }
+
+    fn epilogue_indirect(
+        &mut self,
+        cap: usize,
+        count_states: usize,
+        count_obs: usize,
+        count_params: usize,
+    ) {
+        let regions = StackRegions::new(cap, count_states, count_obs, count_params);
+
+        if row_first(&self.config) {
+            self.epilogue_symbolica(&regions)
+        } else {
+            self.epilogue_sympy(&regions)
+        }
+    }
+
+    fn save_used_registers(&mut self, used: &[Reg]) {
+        if cfg!(target_family = "windows") {
+            for r in used {
+                let phys_reg = ϕ(*r);
+                if (6..=15).contains(&phys_reg) {
+                    self.save_stack(*r, phys_reg as u32);
+                }
+            }
+        }
+    }
+
+    fn load_used_registers(&mut self, used: &[Reg]) {
+        self.set_label("@success");
+        self.amd.xor(Amd::RAX, Amd::RAX);
+        self.set_label("@epilogue");
+
+        if cfg!(target_family = "windows") {
+            for r in used {
+                let phys_reg = ϕ(*r);
+                if (6..=15).contains(&phys_reg) {
+                    self.load_stack(*r, phys_reg as u32);
+                }
+            }
+        }
+    }
+}
+
+impl AmdComplexGenerator {
+    fn prologue_sympy(&mut self, regions: &StackRegions) {
+        save_nonvolatile_regs(&mut self.amd);
+
+        self.amd.or(STATES, STATES);
+        self.amd.jz("@main");
+
+        let frame_size = align_stack((regions.count_states + regions.count_obs) * REG_SIZE);
+        sub_rsp(&mut self.amd, frame_size);
+        self.amd.mov(MEM, SP); // in indirect mode, MEM is allocated on the stack
+
+        for i in 0..regions.count_states {
+            self.amd.mov_reg_mem(Amd::RAX, STATES, 2 * 8 * i as i32);
+            let k = i * REG_SIZE;
+            self.amd.vmovsd_xmm_indexed(RET, Amd::RAX, IDX, 8);
+            self.amd.vmovsd_mem_xmm(MEM, k as i32, RET);
+        }
+
+        self.set_label("@main");
+        allocate_stack(&mut self.amd, regions.cap * REG_SIZE, false);
+    }
+
+    fn epilogue_sympy(&mut self, regions: &StackRegions) {
+        self.amd.or(STATES, STATES);
+        self.amd.jz("@done");
+
+        for i in 0..regions.count_obs {
+            self.amd
+                .mov_reg_mem(Amd::RCX, STATES, 2 * 8 * (regions.count_states + i) as i32);
+            let k = (regions.count_states + i) * REG_SIZE;
+            self.amd.vmovsd_xmm_mem(RET, MEM, k as i32);
+            self.amd.vmovsd_indexed_xmm(Amd::RCX, IDX, 8, RET);
+        }
+
+        self.set_label("@done");
+        load_nonvolatile_regs(&mut self.amd);
+        self.amd.ret();
+    }
+
+    fn prologue_symbolica(&mut self, regions: &StackRegions) {
+        save_nonvolatile_regs(&mut self.amd);
+        allocate_stack(&mut self.amd, regions.cap * REG_SIZE, true);
+    }
+
+    fn epilogue_symbolica(&mut self, _regions: &StackRegions) {
+        load_nonvolatile_regs(&mut self.amd);
+        self.amd.ret();
+    }
+}
+
+impl AmdComplexGenerator {
+    /// (offset, symbol) of the calls of C library functions in the code (`bytes`)
+    pub fn relocations(&self) -> Vec<(usize, String)> {
+        self.amd.a.relocations.clone()
+    }
+}
