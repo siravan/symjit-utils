@@ -113,14 +113,14 @@ library functions the kernels call and which instructions they use.
 
 ## Implementation
 
-`src/obj/` holds copies of symjit's (v227's) `rust/amd/{mod,asm,f64x8,fused,scalar,complex}.rs`,
+`src/obj/` holds copies of symjit's (2.28's) `rust/amd/{mod,asm,f64x8,fused,scalar,complex}.rs`,
 `rust/arm/{mod,macros,scalar,complex}.rs`, `rust/assembler.rs` and `rust/complexify.rs`, with the
 object mode of the development line (`patches/v228-0004-obj.patch`, `v228-0028-object-math.patch`)
 built in: no table of function addresses (`add_func` does nothing), direct calls of the C library
 recorded in `Assembler::relocations` (`amd::object_call`, `arm::object_call`), PC-relative constant
 loads on AArch64, and C99 calls for complex functions (`Complexifier::call_complex_object`, used
-for every complex call). The modules at the top of `src/obj/mod.rs` stand in for the v227 paths the
+for every complex call). The modules at the top of `src/obj/mod.rs` stand in for the symjit paths the
 copies use (`symjit::backend`); `KernelType::RowFirst` is `config::row_first`. Keep the copies close
-to v227's files, so that a fix there can be carried over (`diff -u ../v227/rust/amd/scalar.rs
+to symjit's files, so that a fix there can be carried over (`diff -u <symjit>/rust/amd/scalar.rs
 src/obj/amd/scalar.rs` shows the object mode). `SavedModel::object` chooses the kernels as the JIT
 does; `src/linker/` (from sjc) writes ELF and Mach-O objects (`ObjectBuilder`) and the header.

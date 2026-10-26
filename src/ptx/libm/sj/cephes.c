@@ -1,5 +1,5 @@
 /* sjb2ptx math library: Cephes' sine, cosine, hyperbolic sine and hyperbolic cosine integrals,
- * ported line by line from the Rust port that v227 calls (spec_math 0.1.6, src/cephes64/
+ * ported line by line from the Rust port that stable calls (spec_math 0.1.6, src/cephes64/
  * {sici,shichi,polevl,chbevl,consts}.rs; MIT OR Apache-2.0), with the same operations in the
  * same order.
  *

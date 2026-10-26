@@ -15,6 +15,9 @@ pub struct HeaderInfo<'a> {
     pub fast: bool,
     /// a Composer/Symbolica model: inputs are the parameters, outputs go to `mem`
     pub symbolica: bool,
+    /// a direct-arena (plane) model: inputs and outputs are planes of points, called
+    /// through `states` (pyAmpliCol's plane kernels)
+    pub direct_arena: bool,
     /// the instruction set the kernels need, e.g. "AVX and FMA (x86-64-v3)"
     pub cpu: &'a str,
     /// the C math library functions the kernels call
@@ -49,7 +52,17 @@ pub fn header(h: &HeaderInfo) -> String {
         "All values are doubles."
     };
 
-    let usage = if h.symbolica {
+    let usage = if h.direct_arena {
+        format!(
+            "   A plane kernel: `states` points to {up}_COUNT_STATES + {up}_COUNT_OBS planes (`symjit_slice`,\n\
+             \x20  the inputs, then the outputs); {n}(NULL, states, i, params) reads point i of each input\n\
+             \x20  plane and writes point i of each output plane ({up}_COUNT_PARAMS parameters in `params`).\n\
+             \n\
+             \x20      symjit_slice planes[{up}_COUNT_STATES + {up}_COUNT_OBS];   // {{data, points}} each\n\
+             \x20      for (size_t i = 0; i < points; i++)\n\
+             \x20          if ({n}(NULL, planes, i, params)) break;    // 0 on success\n"
+        )
+    } else if h.symbolica {
         format!(
             "   Inputs are the parameters and outputs are written to `mem`:\n\
              \n\

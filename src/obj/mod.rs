@@ -6,11 +6,11 @@
 //! are C99's (`<complex.h>`), and the ones C does not have are composed of C functions
 //! (`complexify`, `lower`).
 //!
-//! The files are v227's (`rust/amd`, `rust/arm`, `rust/assembler.rs`, `rust/complexify.rs`) with
+//! The files are stable's (`rust/amd`, `rust/arm`, `rust/assembler.rs`, `rust/complexify.rs`) with
 //! the object mode of dev's `v228-0004`/`0028` patches, so that the kernels compute the bits of
-//! the JIT's kernels. The modules below stand in for the paths of v227's crate they use.
+//! the JIT's kernels. The modules below stand in for the paths of stable's crate they use.
 
-// copies of v227's files, kept close to them: the helpers they share with the SIMD
+// copies of stable's files, kept close to them: the helpers they share with the SIMD
 // generators (not copied) stay
 #[allow(dead_code)]
 pub(crate) mod amd;
@@ -224,6 +224,7 @@ impl SavedModel {
             complex: config.is_complex(),
             fast,
             symbolica: config.symbolica(),
+            direct_arena: config.direct_arena(),
             cpu,
             imports: &imports,
             functions: &[],
@@ -327,7 +328,7 @@ pub(crate) mod generator {
     pub use symjit::backend::{Generator, GeneratorType, StackRegions};
 
     /// The C math library function computing `op` (symjit's `log` is the decimal logarithm and
-    /// `ln` the natural one), as `VirtualTable::c_name` of v227.
+    /// `ln` the natural one), as `VirtualTable::c_name` of stable.
     pub fn c_name(op: &str) -> Option<&'static str> {
         let name = match op {
             "sin" => "sin",

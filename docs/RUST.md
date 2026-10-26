@@ -91,7 +91,7 @@ that do not assign outer variables; `const` items of the file and `std::f64::con
   rust2sjb: error: kernels.rs:12:9: macros (`println!`) are not supported by rust2sjb
   ```
 
-**Fixed in v227 (2026-10-18):** a complex kernel loop whose condition depends on the complex
+**Fixed in stable (2026-10-18):** a complex kernel loop whose condition depends on the complex
 values (e.g. an escape-time loop) was wrong when symjit lowered the complex code (`Complexifier`:
 the bytecode interpreter, `fast_complex=false`, `sjb2wasm` modules, objects of complex models
 that call functions): its `not` negated the zero imaginary part of a mask

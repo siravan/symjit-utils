@@ -1,5 +1,5 @@
 """What the Python tests of symjit-utils share: the symjit package (`$SYMJIT_PYTHON_PATH`, else
-`v227/python` of this checkout) and its test helpers (`v227/python/tests`), the utility binaries
+`stable/python` of this checkout) and its test helpers (`stable/python/tests`), the utility binaries
 (`$SJB2WASM`/`$SJB2OBJ`/`$SJB2PTX`, else `target/release/sjb2wasm`/`sjb2obj`/`sjb2ptx`; build them with
 `cargo build --release` in `symjit-utils/`), and the outputs of saved functions compiled by them."""
 
@@ -9,11 +9,11 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UTILS_ROOT = os.path.normpath(os.path.join(HERE, "..", ".."))
-V227 = os.path.normpath(os.path.join(UTILS_ROOT, "..", "v227"))
+STABLE = os.path.normpath(os.path.join(UTILS_ROOT, "..", "stable"))
 
-sys.path.insert(0, os.environ.get("SYMJIT_PYTHON_PATH", os.path.join(V227, "python")))
+sys.path.insert(0, os.environ.get("SYMJIT_PYTHON_PATH", os.path.join(STABLE, "python")))
 # test_fuzz and test_composer_fuzz of the symjit package
-sys.path.insert(0, os.path.join(V227, "python", "tests"))
+sys.path.insert(0, os.path.join(STABLE, "python", "tests"))
 sys.path.insert(0, HERE)
 
 SJB2WASM = os.environ.get("SJB2WASM", os.path.join(UTILS_ROOT, "target", "release", "sjb2wasm"))
@@ -29,7 +29,7 @@ def save(f, path, **save_args):
     kernel unless `dtype` says otherwise."""
     if hasattr(f, "complex_compiler") and "dtype" not in save_args:
         save_args["dtype"] = "complex128" if f.is_complex else "float64"
-    if not hasattr(f, "save"):  # v227's `compile_ode` functions save through their compiler
+    if not hasattr(f, "save"):  # stable's `compile_ode` functions save through their compiler
         f.compiler.save(path)
         return
     f.save(path, **save_args)

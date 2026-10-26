@@ -1,10 +1,10 @@
 [package]
 name = "symjit-utils"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Shahriar Iravanian <siravan@svtsim.com>"]
 license = "MIT"
-description = "command-line utilities for saved symjit applications (.sjb): sjb2wasm, sjb2obj, rust2sjb, sjbinfo, sjb2ptx"
+description = "command-line utilities for saved symjit applications (.sjb): sjb2wasm, sjb2obj, rust2sjb, sjbinfo, sjb2ptx, pacman"
 repository = "https://github.com/siravan/symjit"
 
 [lib]
@@ -30,6 +30,10 @@ path = "src/bin/sjbinfo.rs"
 name = "sjb2ptx"
 path = "src/bin/sjb2ptx.rs"
 
+[[bin]]
+name = "pacman"
+path = "src/bin/pacman.rs"
+
 [dependencies]
 anyhow = "1"
 # rust2sjb: Rust source parsed with `syn`, positions (line:column) in its messages
@@ -37,6 +41,8 @@ syn = { version = "3", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 # the JIT: the .sjb format, the MIR and the `Generator` trait (`symjit::backend`); neither the
 # C interface (`sympy`) nor the coroutines (`async`) are needed
-symjit = { version = "2.28.0", default-features = false }
+symjit = { version = "2.28.1", default-features = false }
+# pacman plan: the executor templates of pyAmpliCol's `eager-kernel-pack.json`
+serde_json = "1"
 
 [workspace]

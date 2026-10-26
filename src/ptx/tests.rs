@@ -331,7 +331,7 @@ fn kernel_loops() {
     assert!(p.text.contains("0d4024000000000000"), "{}", p.text);
 }
 
-/// The entry points of the math library: every function of v227's `VirtualTable` except
+/// The entry points of the math library: every function of stable's `VirtualTable` except
 /// `random` (and `sin_cos`, which the MIR does not use).
 const REAL_FUNCTIONS: [&str; 37] = [
     "sin", "cos", "tan", "csc", "sec", "cot", "sinc", "sinh", "cosh", "tanh", "csch", "sech",

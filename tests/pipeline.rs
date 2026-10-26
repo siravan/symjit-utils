@@ -254,7 +254,7 @@ fn rust_kernels_through_objects_and_modules() {
 /// computes the same in the packed-complex native kernel, in the kernel symjit lowers with
 /// `Complexifier` (`fast_complex=false`) and in the WebAssembly module (also lowered). Symjit
 /// 2.27's complexifier negated the (zero) imaginary part of a mask kept in a complex slot, which
-/// the test of the loop then found non-zero (fixed in `v227`, `tests/complex_mask_not.rs`).
+/// the test of the loop then found non-zero (fixed in `stable`, `tests/complex_mask_not.rs`).
 #[test]
 fn complex_loop_condition() {
     let d = dir("escape");

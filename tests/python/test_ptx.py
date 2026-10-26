@@ -1,4 +1,4 @@
-"""Tests of sjb2ptx: functions compiled by symjit (v227's Python package) are saved and compiled
+"""Tests of sjb2ptx: functions compiled by symjit (stable's Python package) are saved and compiled
 by sjb2ptx into PTX modules with their C drivers (`sjb_util.write_ptx`), which are built into one
 shared library per test (`Batch`) and called with ctypes; the CUDA driver runs the kernels on
 the GPU.
@@ -311,7 +311,7 @@ class Ptx(unittest.TestCase):
         ]
         rng = np.random.default_rng(1)
         pts = [(a, b, c) for a, b, c in zip(rng.uniform(-3, 3, 200), rng.uniform(1.01, 6, 200), rng.uniform(-0.99, 0.99, 200))]
-        # v227's Cephes loggamma is off by up to 3e-9 near 1 and 2 (src/ptx/libm/README.md)
+        # stable's Cephes loggamma is off by up to 3e-9 near 1 and 2 (src/ptx/libm/README.md)
         rtol = np.full(len(eqs), 1e-13)
         rtol[eqs.index(sp.loggamma(y))] = 1e-8
         for opt_level in (0, 2, 3):
@@ -326,7 +326,7 @@ class Ptx(unittest.TestCase):
 
     def test_math_special_values(self):
         # the same values as the JIT, but for gamma(±0), loggamma(-inf) and loggamma of
-        # subnormals, where musl follows C (±inf, +inf, -log|x|) and v227's Cephes does not (NaN,
+        # subnormals, where musl follows C (±inf, +inf, -log|x|) and stable's Cephes does not (NaN,
         # -inf, inf): see src/ptx/libm/README.md
         vals = [0.0, -0.0, 1.0, -1.0, 2.0, np.inf, -np.inf, np.nan, 1e-310, 1e300, -1e300, 0.5, 710.0]
         eqs = [sp.sin(x), sp.exp(x), sp.log(x), sp.sqrt(x) * sp.atan(x), sp.tanh(x), sp.cosh(x), sp.erfc(x),

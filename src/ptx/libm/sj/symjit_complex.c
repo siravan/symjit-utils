@@ -1,4 +1,4 @@
-/* sjb2ptx math library: symjit's complex functions (v227 rust/code.rs without its `libm`
+/* sjb2ptx math library: symjit's complex functions (stable rust/code.rs without its `libm`
  * feature), on musl's real functions.
  *
  * The formulas are num_complex 0.4.6's (src/lib.rs; MIT OR Apache-2.0), ported operation by

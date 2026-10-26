@@ -1,4 +1,4 @@
-"""Tests of sjb2obj: functions compiled by symjit (v227's Python package) are saved (`f.save`),
+"""Tests of sjb2obj: functions compiled by symjit (stable's Python package) are saved (`f.save`),
 compiled by sjb2obj into relocatable objects with C headers (`sjb_util.write_obj`), linked into a
 generated C program with `cc ... -lm`, run, and compared with the JIT-compiled functions (the
 kernels come from copies of the JIT's generators, so results must be bit-identical, except for

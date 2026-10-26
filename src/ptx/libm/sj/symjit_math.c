@@ -1,8 +1,8 @@
-/* sjb2ptx math library: symjit's real functions (v227 rust/code.rs, `VirtualTable`) on musl.
+/* sjb2ptx math library: symjit's real functions (stable rust/code.rs, `VirtualTable`) on musl.
  *
- * Names are symjit's: `ln` is the natural logarithm and `log` the decimal one (v227), `power`
+ * Names are symjit's: `ln` is the natural logarithm and `log` the decimal one (stable), `power`
  * is pow, `gamma` tgamma, `loggamma` lgamma, `arg` of a real is 0. The reciprocal functions and
- * sinc are composed as code.rs composes them. erf, erfc, tgamma and lgamma are musl's (v227 uses
+ * sinc are composed as code.rs composes them. erf, erfc, tgamma and lgamma are musl's (stable uses
  * Cephes); Si, Ci, Shi and Chi are Cephes' (cephes.c). */
 
 #include "sj.h"

@@ -676,7 +676,7 @@ fn complex_models_match_the_jit() {
     }
 }
 
-/// The math library's entry points (src/ptx/libm): v227's functions but `random`.
+/// The math library's entry points (src/ptx/libm): stable's functions but `random`.
 const REAL_FUNCTIONS: [&str; 36] = [
     "sin", "cos", "tan", "csc", "sec", "cot", "sinc", "sinh", "cosh", "tanh", "csch", "sech",
     "coth", "arcsin", "arccos", "arctan", "arcsinh", "arccosh", "arctanh", "cbrt", "exp", "ln",
@@ -978,7 +978,7 @@ fn relative(g: (f64, f64), e: (f64, f64)) -> f64 {
 
 /// The library against the JIT (glibc's functions, Cephes' and num_complex's on glibc's):
 /// real functions within 8 ulps, complex ones within 1e-12 (relative) for arguments of moderate
-/// size. Known deviations: v227's Cephes gamma(±0) is NaN (musl: ±inf, as C's tgamma), it
+/// size. Known deviations: stable's Cephes gamma(±0) is NaN (musl: ±inf, as C's tgamma), it
 /// flushes subnormal results to 0, and its lgamma is +inf for subnormal arguments, -inf at -inf and off by up to 3e-9 near 1 and 2
 /// (musl's is right, checked with mpmath); num_complex's arcsin, arccos and arcsinh cancel for
 /// large |z|, and their results depend on the last bits of the real functions there.

@@ -259,7 +259,23 @@ fn usage() {
 #[test]
 fn output_names_and_formats() {
     let d = dir("names");
-    let app = compile(&rational(), config(CompilerType::Native, 1, true));
+    // objects hold x86-64 or AArch64 kernels: on other hosts (RISC-V) the native model is
+    // rejected, and the names and formats are checked with AArch64 objects, which are only
+    // written here, not run
+    let ty = if cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64") {
+        CompilerType::Native
+    } else {
+        let app = compile(&rational(), config(CompilerType::Native, 1, true));
+        save(&app, &d.join("native.sjb"));
+        fails(
+            &sjb2obj(&d, &["native.sjb"]),
+            1,
+            "object files hold x86-64 or AArch64 kernels",
+        );
+        eprintln!("native model rejected as expected on this host; checking with AArch64 objects");
+        CompilerType::Arm
+    };
+    let app = compile(&rational(), config(ty, 1, true));
     save(&app, &d.join("model.sjb"));
 
     // model.o and model.h, kernel `model`

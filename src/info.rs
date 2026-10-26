@@ -12,7 +12,7 @@ use symjit::{Application, CompilerType, Config};
 
 use crate::obj::generator::{c_name, complex_c_name};
 
-const MAGIC: u64 = 0x40568795410d08e9;
+pub(crate) const MAGIC: u64 = 0x40568795410d08e9;
 
 /// The report of the saved application in `bytes` (the contents of the file `name`). With
 /// `options.compile`, the application is compiled as symjit loads it (`Application::load`), for
@@ -152,7 +152,7 @@ pub fn describe(name: &str, bytes: &[u8], options: &Options) -> Result<String> {
 }
 
 /// The version of the symjit crate (`measure("version")` of a trivial application).
-fn symjit_version() -> String {
+pub(crate) fn symjit_version() -> String {
     use symjit::{var, Compiler};
     let x = var("x");
     let n = Compiler::with_config(Config::new(CompilerType::ByteCode, 0).unwrap())
@@ -223,7 +223,7 @@ fn list(o: &mut String, key: &str, items: &[&str]) {
 }
 
 /// 1234567 as "1,234,567".
-fn thousands(n: usize) -> String {
+pub(crate) fn thousands(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -298,7 +298,7 @@ fn host() -> &'static str {
     }
 }
 
-/// The option bits of `Config::opt`, as v227's `rust/config.rs` defines them (its module is
+/// The option bits of `Config::opt`, as stable's `rust/config.rs` defines them (its module is
 /// private), by their `Config::set_option` names (`direct_arena_identity_output` has none).
 /// The getters (`Config::use_simd`, `fastmath`, ...) also test the machine; these are the bits
 /// the file holds. The opt level (0x0f00) and the arena operation (0x0600_0000) are fields.
@@ -338,7 +338,7 @@ fn has(config: &Config, name: &str) -> bool {
 }
 
 /// The options and whether the file sets them; the debug options only when set.
-fn option_list(config: &Config) -> Vec<(&'static str, bool)> {
+pub(crate) fn option_list(config: &Config) -> Vec<(&'static str, bool)> {
     OPTION_BITS
         .iter()
         .map(|(name, bit)| (*name, config.opt & bit != 0))

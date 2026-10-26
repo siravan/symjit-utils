@@ -1,4 +1,4 @@
-"""Tests of sjb2wasm: functions compiled by symjit (v227's Python package) are saved and
+"""Tests of sjb2wasm: functions compiled by symjit (stable's Python package) are saved and
 compiled by sjb2wasm into WebAssembly modules (`sjb_util.write_wasm`).
 
 The generated modules are checked with wabt's `wasm-validate` and executed in Node
