@@ -173,6 +173,7 @@ fn run(a: &Args) -> Result<()> {
         name,
         layout: a.layout,
         sm: a.sm,
+        mapping: None,
     };
     let ptx = model.ptx(&options)?;
 

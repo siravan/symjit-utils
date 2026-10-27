@@ -77,6 +77,11 @@ pub struct PtxOptions {
     pub layout: Layout,
     /// `.target sm_<sm>`
     pub sm: u32,
+    /// planes of one arena (a pacman runner's): slot `k` of the inputs at plane `mapping[k]`
+    /// and output `j` at plane `mapping[count_in + j]`, with `in` = `out` the arena and
+    /// `ld_in` = `ld_out` its leading dimension (SoA plane kernels only; outputs distinct and
+    /// disjoint from the inputs, which keeps `ld.global.nc` legal)
+    pub mapping: Option<Vec<u32>>,
 }
 
 impl PtxOptions {
@@ -85,6 +90,7 @@ impl PtxOptions {
             name: name.to_string(),
             layout: Layout::Soa,
             sm: DEFAULT_SM,
+            mapping: None,
         }
     }
 }
@@ -128,6 +134,9 @@ impl SavedModel {
             row_first,
         };
 
+        if let Some(map) = &options.mapping {
+            check_mapping(map, &shape, options.layout)?;
+        }
         let mut generator = PtxGenerator::new(options.clone(), shape);
         let (count_states, count_obs, count_params) =
             (prog.count_states, prog.count_obs, prog.count_params);
@@ -144,6 +153,35 @@ impl SavedModel {
             shape,
         })
     }
+}
+
+/// A plane mapping fits `shape`: one plane per slot, SoA, no shared parameters, a model whose
+/// inputs are states (a plane kernel), and outputs distinct and disjoint from the inputs.
+fn check_mapping(map: &[u32], shape: &Shape, layout: Layout) -> Result<()> {
+    if layout != Layout::Soa || shape.row_first || shape.count_params != 0 {
+        return Err(anyhow!(
+            "a plane mapping needs the SoA layout and a plane (direct-arena) kernel without shared parameters"
+        ));
+    }
+    if map.len() != shape.count_in + shape.count_out {
+        return Err(anyhow!(
+            "the plane mapping has {} planes, the kernel {} inputs and {} outputs",
+            map.len(),
+            shape.count_in,
+            shape.count_out
+        ));
+    }
+    let (inputs, outputs) = map.split_at(shape.count_in);
+    let mut written = std::collections::HashSet::new();
+    for &p in outputs {
+        if !written.insert(p) {
+            return Err(anyhow!("the plane mapping writes plane {} twice", p));
+        }
+    }
+    if let Some(p) = inputs.iter().find(|p| written.contains(p)) {
+        return Err(anyhow!("the plane mapping reads and writes plane {}", p));
+    }
+    Ok(())
 }
 
 enum Item {
@@ -532,8 +570,14 @@ impl PtxGenerator {
         false
     }
 
-    /// The address of slot `k` of the point in `%a1` (SoA), or the operand addressing it.
+    /// The address of slot `k` of the point in `%a1` (SoA), or the operand addressing it; with a
+    /// plane mapping, slot `k` of `%pin` (an input) or `%pout` (an output) is its plane.
     fn slot(&self, o: &mut String, base: &str, ld: &str, k: usize) -> String {
+        let k = match &self.options.mapping {
+            Some(map) if base == "%pout" => map[self.shape.count_in + k] as usize,
+            Some(map) => map[k] as usize,
+            None => k,
+        };
         match self.options.layout {
             Layout::Soa if k == 0 => format!("[{}]", base),
             Layout::Soa => {

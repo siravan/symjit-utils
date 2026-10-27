@@ -98,6 +98,12 @@ Options:
       --execution PAT  runner: the execution, if no recording names it
       --cc CC          runner: the C compiler (default: cc)
       --no-build       runner: write the files only (`make` builds them)
+      --cuda           runner: a CUDA runner (the kernels as PTX, compiled by
+                       ptxas for the GPUs of --sm; needs the CUDA toolkit to
+                       build, only the NVIDIA driver to run)
+      --sm LIST        runner: the GPUs' SM numbers, e.g. 80,90,120 (implies
+                       --cuda; default: the local GPU's, from nvidia-smi)
+      --jobs N         runner: ptxas runs at a time (default: the CPUs)
   -h, --help           print this help
   -V, --version        print the version";
 
@@ -120,6 +126,9 @@ struct Runner {
     execution: Option<String>,
     cc: String,
     build: bool,
+    /// a CUDA runner, for these SMs (empty: the local GPU's)
+    cuda: Option<Vec<u32>>,
+    jobs: usize,
 }
 
 struct Replay {
@@ -171,6 +180,8 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
     let mut execution: Option<String> = None;
     let mut cc = "cc".to_string();
     let mut build = true;
+    let mut cuda: Option<Vec<u32>> = None;
+    let mut jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
 
     let mut it = args[1..].iter();
     while let Some(arg) = it.next() {
@@ -227,6 +238,26 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             ("runner", "--execution") => execution = Some(value(arg)?),
             ("runner", "--cc") => cc = value(arg)?,
             ("runner", "--no-build") => build = false,
+            ("runner", "--cuda") => {
+                cuda.get_or_insert_with(Vec::new);
+            }
+            ("runner", "--sm") => {
+                let v = value(arg)?;
+                let list = cuda.get_or_insert_with(Vec::new);
+                for sm in v.split(',') {
+                    list.push(sm.trim().parse().ok().filter(|&n| n >= 50).ok_or_else(|| {
+                        format!("`--sm` takes SM numbers such as 80,90,120, not `{}`", v)
+                    })?);
+                }
+            }
+            ("runner", "--jobs") => {
+                let v = value(arg)?;
+                jobs = v
+                    .parse()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| format!("`--jobs` takes a positive number, not `{}`", v))?;
+            }
             ("extract", "-a" | "--all") => all = true,
             ("extract", "--no-mapping") => mapping = false,
             ("extract", "-o" | "--output") => output = Some(value(arg)?),
@@ -292,6 +323,8 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             execution,
             cc,
             build,
+            cuda,
+            jobs,
         })),
         _ => Err(format!(
             "unknown command `{}` (info, list, extract, plan, bindings, replay or runner)",
@@ -836,6 +869,48 @@ fn replay_one(
     Ok(false)
 }
 
+/// `pacman runner --cuda`: the runner of `spec` with its kernels on the GPU.
+fn cuda_runner(
+    args: &Runner,
+    spec: &symjit_utils::runner::Spec,
+    members: &HashMap<&str, &[u8]>,
+    dir: &Path,
+    sms: &[u32],
+) -> Result<()> {
+    let mut sms = sms.to_vec();
+    if sms.is_empty() {
+        sms.push(symjit_utils::runner::local_sm().ok_or_else(|| {
+            anyhow!("no local GPU found (nvidia-smi): name the GPUs with `--sm`, e.g. --sm 80,90")
+        })?);
+    }
+    sms.sort_unstable();
+    sms.dedup();
+    let start = std::time::Instant::now();
+    let modules = symjit_utils::runner::ptx_modules(spec, members, symjit_utils::ptx::DEFAULT_SM)?;
+    symjit_utils::runner::write_cuda(dir, spec, &modules, &sms)?;
+    eprintln!(
+        "pacman: wrote the CUDA runner of {} of {} to {}: {} leaves, {} bytes of PTX in {:.2} s",
+        spec.execution,
+        spec.process,
+        dir.display(),
+        modules.len(),
+        modules.iter().map(String::len).sum::<usize>(),
+        start.elapsed().as_secs_f64()
+    );
+    if args.build {
+        let start = std::time::Instant::now();
+        symjit_utils::runner::build_cuda(dir, &args.cc, modules.len(), &sms, args.jobs)?;
+        let sms: Vec<String> = sms.iter().map(|sm| format!("sm_{}", sm)).collect();
+        eprintln!(
+            "pacman: built {0}/runner and {0}/librunner.so for {1} in {2:.1} s",
+            dir.display(),
+            sms.join(", "),
+            start.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
 /// `pacman runner`.
 fn runner(args: &Runner) -> Result<()> {
     let (processes, pacbin) = bindings::load(&args.artifact)?;
@@ -902,12 +977,15 @@ fn runner(args: &Runner) -> Result<()> {
         .filter(|m| m.kind == Kind::SymjitApplication)
         .map(|m| (m.path.as_str(), container.payload(m)))
         .collect();
-    let start = std::time::Instant::now();
-    let (objects, of_leaf) = symjit_utils::runner::objects(&spec, &members)?;
     let dir = args
         .output
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("runner-{}", spec.process)));
+    if let Some(sms) = &args.cuda {
+        return cuda_runner(args, &spec, &members, &dir, sms);
+    }
+    let start = std::time::Instant::now();
+    let (objects, of_leaf) = symjit_utils::runner::objects(&spec, &members)?;
     symjit_utils::runner::write(&dir, &spec, &objects, &of_leaf)?;
     let code: usize = objects.iter().map(Vec::len).sum();
     eprintln!(
