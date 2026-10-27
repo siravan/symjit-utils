@@ -61,7 +61,8 @@ Commands:
             writes their arenas (`runner OUTDIR RECORDING.json...`, then
             `replay --scalar --against OUTDIR`), and `librunner.so`, which
             exports the interface of `pacman_runner.h` (pacman-runner-v1);
-            the execution is a recording's, or `--execution`
+            the execution is a recording's, or `--execution` (with
+            `--process` where several processes have it)
 
 Options:
       --compile        info: compile every kernel for this machine (never run)
@@ -96,6 +97,7 @@ Options:
                        or --scalar
   -o, --output DIR     runner: the directory (default: runner-<process>)
       --execution PAT  runner: the execution, if no recording names it
+      --process PAT    runner: only the processes matching PAT, for --execution
       --cc CC          runner: the C compiler (default: cc)
       --no-build       runner: write the files only (`make` builds them)
       --cuda           runner: a CUDA runner (the kernels as PTX, compiled by
@@ -124,6 +126,8 @@ struct Runner {
     recording: Option<PathBuf>,
     output: Option<PathBuf>,
     execution: Option<String>,
+    /// `--process`: the processes `execution` is looked up in (`None`: all)
+    process: Option<String>,
     cc: String,
     build: bool,
     /// a CUDA runner, for these SMs (empty: the local GPU's)
@@ -178,6 +182,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
     let mut dump: Option<PathBuf> = None;
     let mut against: Option<PathBuf> = None;
     let mut execution: Option<String> = None;
+    let mut process: Option<String> = None;
     let mut cc = "cc".to_string();
     let mut build = true;
     let mut cuda: Option<Vec<u32>> = None;
@@ -236,6 +241,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             ("replay", "--against") => against = Some(value(arg)?.into()),
             ("runner", "-o" | "--output") => output = Some(value(arg)?),
             ("runner", "--execution") => execution = Some(value(arg)?),
+            ("runner", "--process") => process = Some(value(arg)?),
             ("runner", "--cc") => cc = value(arg)?,
             ("runner", "--no-build") => build = false,
             ("runner", "--cuda") => {
@@ -321,6 +327,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             recording: inputs.get(1).map(PathBuf::from),
             output: output.map(PathBuf::from),
             execution,
+            process,
             cc,
             build,
             cuda,
@@ -948,6 +955,12 @@ fn runner(args: &Runner) -> Result<()> {
             let pattern = args.execution.as_deref().unwrap_or_default();
             let found: Vec<_> = processes
                 .iter()
+                .filter(|p| {
+                    args.process.as_deref().is_none_or(|process| {
+                        let name = p.prefix.strip_prefix("processes/").unwrap_or(&p.prefix);
+                        pacman::glob(process.as_bytes(), name.as_bytes())
+                    })
+                })
                 .flat_map(|p| p.executions.iter().map(move |e| (p, e)))
                 .filter(|(_, e)| pacman::glob(pattern.as_bytes(), e.name.as_bytes()))
                 .collect();
@@ -956,7 +969,7 @@ fn runner(args: &Runner) -> Result<()> {
                 [] => return Err(anyhow!("no execution matches `{}`", pattern)),
                 many => {
                     return Err(anyhow!(
-                        "`{}` matches {} executions: {}",
+                        "`{}` matches {} executions (choose one with --process): {}",
                         pattern,
                         many.len(),
                         many.iter()

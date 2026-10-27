@@ -49,6 +49,7 @@ r/runner out arena/*.json && pacman replay --scalar --against out artifacts/qq_z
 | `--against DIR` | replay | Compare with `DIR/NAME.arena` (a runner's output) instead of `.post`; differences are errors, also with `--whole` or `--scalar`. |
 | `-o`, `--output DIR` | runner | The runner's directory (default `runner-<process>`). |
 | `--execution PAT` | runner | The execution (it must match one), when no recording names it. |
+| `--process PAT` | runner | Look the execution up only in the processes whose names match (`p_p_to_z_j_j_1`), where several have it. |
 | `--cc CC` | runner | The C compiler (default `cc`). |
 | `--no-build` | runner | Write the files only; `make` in the directory builds them. |
 | `--cuda` | runner | A CUDA runner (below). |
