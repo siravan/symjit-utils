@@ -194,26 +194,31 @@ fn layouts() {
     let aos = ptx_with(&app, Layout::Aos).unwrap();
     ptxas(&aos.text, "aos");
 
-    // SoA: a pointer that steps by ld_in per slot; AoS: offsets from the point's row
+    // the inputs are read where they are used and the outputs written where they are saved:
+    // SoA at slot * ld_in (ld_out) from the point's first slot, AoS at offsets from its row
     assert!(
-        soa.text.contains("ld.global.nc.b64 %m2, [%a1];"),
+        soa.text
+            .contains("mul.lo.u64 %a1, %ldi, 2;\n\tadd.u64 %a1, %a1, %pin;\n\tld.global.nc.b64"),
         "{}",
         soa.text
     );
-    assert!(soa.text.contains("add.u64 %a1, %a1, %ldi;"));
-    assert!(
-        aos.text.contains("ld.global.nc.b64 %m2, [%pin+16];"),
-        "{}",
-        aos.text
-    );
+    assert!(aos.text.contains(", [%pin+16];"), "{}", aos.text);
     assert!(aos.text.contains("mul.lo.u64 %a0, %i, %ldi;"));
-    // five outputs after the three states
-    assert_eq!(count(&soa.text, "st.global.b64 [%a1], %m"), 5);
     assert!(
-        aos.text.contains("st.global.b64 [%pout+32], %m7;"),
+        soa.text.contains(
+            "mul.lo.u64 %a1, %ldo, 4;\n\tadd.u64 %a1, %a1, %pout;\n\tst.global.b64 [%a1], %g"
+        ),
+        "{}",
+        soa.text
+    );
+    assert!(
+        aos.text.contains("st.global.b64 [%pout+32], %g"),
         "{}",
         aos.text
     );
+    // five outputs, each stored once; no state is gathered into a memory register
+    assert_eq!(count(&soa.text, "st.global.b64"), 5);
+    assert_eq!(count(&soa.text, "ld.global.nc.b64 %m"), 0);
 }
 
 #[test]
@@ -329,6 +334,69 @@ fn kernel_loops() {
     assert!(p.text.contains("bra.uni $L"), "{}", p.text);
     // the constants as immediates (10 = 0x4024000000000000)
     assert!(p.text.contains("0d4024000000000000"), "{}", p.text);
+    // with conditional jumps, the output stays a memory register, written in the epilogue
+    assert!(p.text.contains("st.global.b64 [%pout], %m"), "{}", p.text);
+}
+
+#[test]
+fn direct_arena_placement() {
+    // a plane kernel as pyAmpliCol's: Symbolica, complex, direct arena with identity output
+    let mut config = config(CompilerType::Native, 2, true);
+    config.set_complex(true);
+    config.set_symbolica(true);
+    config.set_direct_arena(true);
+    config.set_direct_arena_identity_output(true);
+    // more outputs than the MIR has registers, so that it keeps them in stack slots until the
+    // end, the case of large leaves
+    let (n_in, n_out) = (6, 24);
+    let mut t = Translator::new(config);
+    t.set_num_params(n_in);
+    for k in 0..n_out {
+        let (a, b) = (Slot::Param(k % n_in), Slot::Param((k * 5 + 1) % n_in));
+        t.append_mul(&Slot::Temp(2 * k), &[a, b], 0).unwrap();
+        t.append_add(&Slot::Temp(2 * k + 1), &[Slot::Temp(2 * k), a], 0)
+            .unwrap();
+    }
+    for k in 0..n_out {
+        let prev = Slot::Temp(2 * ((k + 1) % n_out) + 1);
+        t.append_mul(&Slot::Out(k), &[Slot::Temp(2 * k + 1), prev], 0)
+            .unwrap();
+    }
+    let app = t.compile().unwrap();
+    let p = ptx(&app);
+    assert!(!p.shape.row_first, "{:?}", p.shape);
+    ptxas(&p.text, "direct arena");
+    // every state is read where it is used, never gathered into a memory register
+    assert_eq!(count(&p.text, "ld.global.nc.b64 %m"), 0, "{}", p.text);
+    // each output slot (re, im) is written once, without a memory register
+    assert_eq!(
+        count(&p.text, "st.global.b64"),
+        2 * n_out as usize,
+        "{}",
+        p.text
+    );
+    assert_eq!(count(&p.text, "st.global.b64 [%a1], %m"), 0, "{}", p.text);
+    // the outputs are written where the MIR saves them to stack slots (not copied from those
+    // slots at the end): each store follows the write of its register to a stack slot
+    let lines: Vec<&str> = p.text.lines().map(str::trim).collect();
+    for (at, line) in lines.iter().enumerate() {
+        let Some(src) = line.strip_prefix("st.global.b64 ") else {
+            continue;
+        };
+        let src = src.split(", ").nth(1).unwrap().trim_end_matches(';');
+        let before = lines[..at]
+            .iter()
+            .rev()
+            .find(|l| !l.starts_with("mul.lo.u64 %a1") && !l.starts_with("add.u64 %a1"))
+            .unwrap();
+        assert!(
+            before.starts_with("mov.b64 %s") && before.ends_with(&format!(", {};", src)),
+            "`{}` after `{}`:\n{}",
+            line,
+            before,
+            p.text
+        );
+    }
 }
 
 /// The entry points of the math library: every function of stable's `VirtualTable` except

@@ -407,6 +407,42 @@ fn arithmetic() -> Model {
     (vec![x, y, z], obs)
 }
 
+/// Outputs that are copies of inputs between computed ones: the inputs are read where they are
+/// used and the outputs written where they are saved (`Placement`), and at opt level 0 the MIR
+/// copies an input to an output through a register it also loads from stack slots elsewhere
+/// (around the call of `exp`, which is why it is there). The GPU's `exp` differs from the host's
+/// in the last bit, so the results are compared within 1e-12; a misplaced output is far off.
+#[test]
+fn copied_inputs_match_the_jit() {
+    let d = dir("copies");
+    let (x, y, z) = (var("x"), var("y"), var("z"));
+    let one = Expr::from(1.0);
+    let model: Model = (
+        vec![x.clone(), y.clone(), z.clone()],
+        vec![
+            (&x / &Expr::from(4.0)).exp(),
+            y.clone(),
+            (&(&(&z * &z) / &Expr::from(4.0)) + &one).pow(&Expr::from(1.5)),
+            x.clone(),
+            &(&x * &y) - &z,
+            z.clone(),
+        ],
+    );
+    let pts = points(3, 1_001, 7);
+    for opt_level in 0..=3 {
+        for fastmath in [false, true] {
+            let what = format!("opt level {}, fastmath {}", opt_level, fastmath);
+            let mut app = compile(&model, config(CompilerType::Native, opt_level, fastmath));
+            save(&app, &d.join("copies.sjb"));
+            let expected = jit_of(&mut app, &pts);
+            let Some(got) = gpu(&d, "copies", RUN, &pts, &[], 6) else {
+                return;
+            };
+            assert_close(&got, &expected, &pts, &what);
+        }
+    }
+}
+
 fn compile(model: &Model, config: Config) -> Application {
     Compiler::with_config(config)
         .compile(&model.0, &model.1)

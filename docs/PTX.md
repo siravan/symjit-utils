@@ -156,8 +156,13 @@ Exceptions:
 ## How
 
 `src/ptx/mod.rs` (`PtxGenerator`) implements symjit's `Generator` trait and writes PTX text.
-* Every MIR register, stack slot and memory slot becomes a `.b64` virtual register. The memory
-  registers are loaded from `in` at the start, and the outputs are stored to `out` at the end.
+* Every MIR register, stack slot and memory slot becomes a `.b64` virtual register. An input the
+  kernel never writes is read from `in` where it is used, and an output it never reads is stored
+  to `out` where it is computed, when all its stores are unconditional (no conditional jumps
+  outside funclets). If the MIR keeps such an output in a stack slot until a copy at the end,
+  the store moves to the slot's last write. The other memory slots are loaded at the start and
+  stored at the end. This keeps inputs and outputs out of the live registers: in pyAmpliCol's
+  large plane kernels, loading every input at the start made ptxas spill most of the kernel.
 * Funclets, such as the complex square root, run on the kernel's registers. A call sets `%site`
   and jumps; the return is a `brx.idx` through the table of return sites.
 * Labels are numbered, and constants are immediates.
