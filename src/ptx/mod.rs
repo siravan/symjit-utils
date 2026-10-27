@@ -13,8 +13,11 @@
 // the diffs; `params` holds the shared parameters of other models.
 //
 // Every value is a `.b64` virtual register (ptxas allocates the machine registers): the MIR's
-// registers, its stack slots (%s<k>) and its memory slots (%m<k>), gathered from `in` at the
-// start and scattered to `out` at the end. The arithmetic is that of the x86-64 scalar
+// registers, its stack slots (%s<k>) and its memory slots (%m<k>). An input the MIR never writes
+// is read from `in` where it is used, and an output it never reads is written to `out` where it
+// is saved, if every save is unconditional (`Placement`), so that neither stays live across the
+// kernel; the other memory slots are gathered from `in` at the start and scattered to `out` at
+// the end. The arithmetic is that of the x86-64 scalar
 // generator (`amd/scalar.rs`): correctly rounded `.rn` operations, `fma.rn` only for the MIR's
 // fused operations (so ptxas contracts nothing), unordered `gt`/`geq`, masks of all bits.
 // Funclets run on the kernel's registers: a call sets %site and jumps, `ret` is a `brx.idx`
@@ -147,6 +150,14 @@ enum Item {
     Line(String),
     /// `mov.b64 <reg>, consts[idx]`; the constants arrive after the code (`add_consts`)
     Const(String, u32),
+    /// `<reg> := memory slot idx`, placed in `seal` (see `Placement`)
+    LoadMem(String, u32),
+    /// `memory slot idx := <reg>`, placed in `seal`
+    SaveMem(String, u32),
+    /// `<reg> := stack slot idx`
+    LoadStack(String, u32),
+    /// `stack slot idx := <reg>`; may also write an output (`Placement::forward`)
+    SaveStack(String, u32),
     Label(String),
     Branch(String),
     /// jump if the mask `cond` is true (all bits set: a NaN) when `if_true`, else if false
@@ -177,6 +188,23 @@ pub struct PtxGenerator {
     calls: Vec<String>,
     unsupported: Vec<String>,
     module: String,
+}
+
+/// Where the memory slots live. A slot that is not direct is a register: gathered from `in`
+/// (states) or zeroed in the prologue, scattered to `out` (outputs) in the epilogue.
+struct Placement {
+    /// the input is read from `in` at each use (it is never written)
+    direct_in: Vec<bool>,
+    /// the output is written to `out` at each save (it is never read, and saved only
+    /// unconditionally: outside funclets, in a body without conditional jumps)
+    direct_out: Vec<bool>,
+    /// `SaveStack` item -> the direct outputs that are copies of the value it writes: the MIR
+    /// keeps an output in a stack slot until a copy at the end; the output is written where
+    /// the slot is (by its last write before the copy, at the top level, the slot written by
+    /// no funclet), and the copy is dropped, so that the value is not live until the end
+    forward: HashMap<usize, Vec<usize>>,
+    /// the `SaveMem` items replaced by a forwarded write
+    forwarded: Vec<bool>,
 }
 
 impl PtxGenerator {
@@ -337,12 +365,12 @@ impl PtxGenerator {
         let d = self.reg(dst);
         match loc {
             Loc::Mem(idx) => {
-                let m = self.mem(idx);
-                self.mov(d, m);
+                self.mem(idx);
+                self.body.push(Item::LoadMem(d, idx));
             }
             Loc::Stack(idx) => {
-                let s = self.stack(idx);
-                self.mov(d, s);
+                self.stack(idx);
+                self.body.push(Item::LoadStack(d, idx));
             }
             Loc::Param(idx) => self.param(d, idx),
         }
@@ -352,12 +380,12 @@ impl PtxGenerator {
         let s = self.reg(src);
         match loc {
             Loc::Mem(idx) => {
-                let m = self.mem(idx);
-                self.mov(m, s);
+                self.mem(idx);
+                self.body.push(Item::SaveMem(s, idx));
             }
             Loc::Stack(idx) => {
-                let t = self.stack(idx);
-                self.mov(t, s);
+                self.stack(idx);
+                self.body.push(Item::SaveStack(s, idx));
             }
             Loc::Param(_) => self.unsupported("stores to parameters"),
         }
@@ -380,6 +408,143 @@ impl PtxGenerator {
         }
     }
 
+    /// The first memory slot of the outputs.
+    fn first_out(&self) -> usize {
+        if self.shape.row_first {
+            0
+        } else {
+            self.count_states as usize
+        }
+    }
+
+    fn placement(&self) -> Placement {
+        let n = self.count_mem as usize;
+        let (mut loaded, mut saved, mut saved_in_funclet) =
+            (vec![false; n], vec![false; n], vec![false; n]);
+        let targets: Vec<&String> = self
+            .body
+            .iter()
+            .filter_map(|item| match item {
+                Item::CallFunclet { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        let (mut in_funclet, mut conditional) = (false, false);
+        // stack slots some funclet writes
+        let mut funclet_stack: Vec<u32> = Vec::new();
+        for item in self.body.iter() {
+            match item {
+                Item::SaveStack(_, idx) if in_funclet => funclet_stack.push(*idx),
+                Item::Label(l) if targets.contains(&l) => in_funclet = true,
+                Item::Ret => in_funclet = false,
+                Item::BranchIf { .. } if !in_funclet => conditional = true,
+                Item::LoadMem(_, idx) => loaded[*idx as usize] = true,
+                Item::SaveMem(_, idx) => {
+                    saved[*idx as usize] = true;
+                    saved_in_funclet[*idx as usize] |= in_funclet;
+                }
+                _ => {}
+            }
+        }
+        let states = if self.shape.row_first {
+            0
+        } else {
+            self.count_states as usize
+        };
+        let first = self.first_out();
+        let outs = first..first + self.shape.count_out;
+        let direct_out: Vec<bool> = (0..n)
+            .map(|k| {
+                outs.contains(&k) && saved[k] && !loaded[k] && !saved_in_funclet[k] && !conditional
+            })
+            .collect();
+
+        // forwarding: a direct output saved once (live saves only), from a register loaded
+        // from a stack slot among the memory and stack moves just before it
+        let mut live_saves = vec![0usize; n];
+        for (at, item) in self.body.iter().enumerate() {
+            if let Item::SaveMem(_, idx) = item {
+                if direct_out[*idx as usize] && !self.overwritten(at) {
+                    live_saves[*idx as usize] += 1;
+                }
+            }
+        }
+        let mut forward: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut forwarded = vec![false; self.body.len()];
+        for (at, item) in self.body.iter().enumerate() {
+            let Item::SaveMem(src, idx) = item else {
+                continue;
+            };
+            let k = *idx as usize;
+            if !direct_out[k] || live_saves[k] != 1 || self.overwritten(at) {
+                continue;
+            }
+            // the stack slot the saved register was loaded from, just before
+            let mut slot = None;
+            for (back, prev) in self.body[..at].iter().enumerate().rev() {
+                match prev {
+                    Item::LoadStack(dst, s) if dst == src => {
+                        slot = Some((*s, back));
+                        break;
+                    }
+                    // the register is not a copy of a stack slot
+                    Item::LoadMem(dst, _) if dst == src => break,
+                    Item::LoadStack(..) | Item::SaveMem(..) | Item::LoadMem(..) => {}
+                    _ => break,
+                }
+            }
+            let Some((slot, load)) = slot else {
+                continue;
+            };
+            if funclet_stack.contains(&slot) {
+                continue;
+            }
+            // its last write before the load (straight-line: no conditional jumps)
+            let write = self.body[..load]
+                .iter()
+                .rposition(|item| matches!(item, Item::SaveStack(_, s) if *s == slot));
+            if let Some(write) = write {
+                forward.entry(write).or_default().push(k);
+                forwarded[at] = true;
+            }
+        }
+        Placement {
+            direct_in: (0..n).map(|k| k < states && !saved[k]).collect(),
+            direct_out,
+            forward,
+            forwarded,
+        }
+    }
+
+    /// The save of a direct output at `at` is dead: a later save to its slot comes before any
+    /// jump or label (direct outputs are never read, and other items do not touch memory slots).
+    fn overwritten(&self, at: usize) -> bool {
+        let Some(Item::SaveMem(_, idx)) = self.body.get(at) else {
+            return false;
+        };
+        for item in self.body[at + 1..].iter().take(64) {
+            match item {
+                Item::SaveMem(_, next) if next == idx => return true,
+                Item::Line(_) | Item::Const(..) | Item::LoadMem(..) | Item::SaveMem(..) => {}
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// The address of slot `k` of the point in `%a1` (SoA), or the operand addressing it.
+    fn slot(&self, o: &mut String, base: &str, ld: &str, k: usize) -> String {
+        match self.options.layout {
+            Layout::Soa if k == 0 => format!("[{}]", base),
+            Layout::Soa => {
+                let _ = writeln!(o, "\tmul.lo.u64 %a1, {}, {};", ld, k);
+                let _ = writeln!(o, "\tadd.u64 %a1, %a1, {};", base);
+                "[%a1]".to_string()
+            }
+            Layout::Aos => format!("[{}+{}]", base, 8 * k),
+        }
+    }
+
     /// The label of a MIR label: MIR labels contain `@` and other characters PTX does not
     /// allow, so each gets a number.
     fn label(labels: &mut HashMap<String, usize>, label: &str) -> String {
@@ -387,9 +552,9 @@ impl PtxGenerator {
         format!("$L{}", labels.entry(label.to_string()).or_insert(n))
     }
 
-    /// The thread's index, the bounds test and the input pointers; the states are gathered
-    /// into the memory registers, the other memory registers are zeroed.
-    fn prologue(&self, o: &mut String) {
+    /// The thread's index, the bounds test and the input pointers; the states that are not
+    /// direct are gathered into the memory registers, the other registers are zeroed.
+    fn prologue(&self, o: &mut String, place: &Placement) {
         let (layout, shape) = (self.options.layout, self.shape);
         let _ = writeln!(o, "\tmov.u32 %t0, %ctaid.x;");
         let _ = writeln!(o, "\tmov.u32 %t1, %ntid.x;");
@@ -438,50 +603,27 @@ impl PtxGenerator {
         } else {
             self.count_states as usize
         };
-        if layout == Layout::Soa && count_states > 0 {
-            let _ = writeln!(o, "\tmov.u64 %a1, %pin;");
-        }
         for k in 0..self.count_mem as usize {
+            if place.direct_in[k] || place.direct_out[k] {
+                continue;
+            }
             if k < count_states {
-                match layout {
-                    Layout::Soa => {
-                        let _ = writeln!(o, "\tld.global.nc.b64 %m{}, [%a1];", k);
-                        if k + 1 < count_states {
-                            let _ = writeln!(o, "\tadd.u64 %a1, %a1, %ldi;");
-                        }
-                    }
-                    Layout::Aos => {
-                        let _ = writeln!(o, "\tld.global.nc.b64 %m{}, [%pin+{}];", k, 8 * k);
-                    }
-                }
+                let a = self.slot(o, "%pin", "%ldi", k);
+                let _ = writeln!(o, "\tld.global.nc.b64 %m{}, {};", k, a);
             } else {
                 let _ = writeln!(o, "\tmov.b64 %m{}, {};", k, ZERO);
             }
         }
     }
 
-    /// The outputs are scattered from the memory registers after the states.
-    fn epilogue(&self, o: &mut String) {
-        let first = if self.shape.row_first {
-            0
-        } else {
-            self.count_states as usize
-        };
-        if self.options.layout == Layout::Soa && self.shape.count_out > 0 {
-            let _ = writeln!(o, "\tmov.u64 %a1, %pout;");
-        }
+    /// The outputs that are not direct are scattered from the memory registers.
+    fn epilogue(&self, o: &mut String, place: &Placement) {
+        let first = self.first_out();
         for j in 0..self.shape.count_out {
             let k = first + j;
-            match self.options.layout {
-                Layout::Soa => {
-                    let _ = writeln!(o, "\tst.global.b64 [%a1], %m{};", k);
-                    if j + 1 < self.shape.count_out {
-                        let _ = writeln!(o, "\tadd.u64 %a1, %a1, %ldo;");
-                    }
-                }
-                Layout::Aos => {
-                    let _ = writeln!(o, "\tst.global.b64 [%pout+{}], %m{};", 8 * j, k);
-                }
+            if !place.direct_out[k] {
+                let a = self.slot(o, "%pout", "%ldo", j);
+                let _ = writeln!(o, "\tst.global.b64 {}, %m{};", a, k);
             }
         }
         let _ = writeln!(o, "$Lexit:");
@@ -489,7 +631,7 @@ impl PtxGenerator {
     }
 
     /// The body with its labels, jumps, constants and funclet calls resolved.
-    fn lower_body(&mut self) -> String {
+    fn lower_body(&mut self, place: &Placement) -> String {
         let mut labels: HashMap<String, usize> = HashMap::new();
         let mut sites: Vec<String> = Vec::new();
         let mut o = String::new();
@@ -507,10 +649,42 @@ impl PtxGenerator {
         let mut nested = false;
         let mut stray_ret = false;
 
-        for item in self.body.iter() {
+        let first = self.first_out();
+        for (at, item) in self.body.iter().enumerate() {
             match item {
                 Item::Line(line) => {
                     let _ = writeln!(o, "\t{}", line);
+                }
+                Item::LoadMem(dst, idx) => {
+                    let k = *idx as usize;
+                    if place.direct_in[k] {
+                        let a = self.slot(&mut o, "%pin", "%ldi", k);
+                        let _ = writeln!(o, "\tld.global.nc.b64 {}, {};", dst, a);
+                    } else if *dst != format!("%m{}", k) {
+                        let _ = writeln!(o, "\tmov.b64 {}, %m{};", dst, k);
+                    }
+                }
+                Item::LoadStack(dst, idx) => {
+                    let _ = writeln!(o, "\tmov.b64 {}, %s{};", dst, idx);
+                }
+                Item::SaveStack(src, idx) => {
+                    let _ = writeln!(o, "\tmov.b64 %s{}, {};", idx, src);
+                    for &k in place.forward.get(&at).into_iter().flatten() {
+                        let a = self.slot(&mut o, "%pout", "%ldo", k - first);
+                        let _ = writeln!(o, "\tst.global.b64 {}, {};", a, src);
+                    }
+                }
+                Item::SaveMem(src, idx) => {
+                    let k = *idx as usize;
+                    if place.direct_out[k] {
+                        if self.overwritten(at) || place.forwarded[at] {
+                            continue;
+                        }
+                        let a = self.slot(&mut o, "%pout", "%ldo", k - first);
+                        let _ = writeln!(o, "\tst.global.b64 {}, {};", a, src);
+                    } else if *src != format!("%m{}", k) {
+                        let _ = writeln!(o, "\tmov.b64 %m{}, {};", k, src);
+                    }
                 }
                 Item::Const(reg, idx) => match self.consts.get(*idx as usize) {
                     Some(v) => {
@@ -579,7 +753,8 @@ impl PtxGenerator {
     }
 
     fn build_module(&mut self) -> String {
-        let body = self.lower_body();
+        let place = self.placement();
+        let body = self.lower_body(&place);
         let name = self.options.name.clone();
         let mut o = String::new();
 
@@ -634,9 +809,9 @@ impl PtxGenerator {
             }
         }
         let _ = writeln!(o);
-        self.prologue(&mut o);
+        self.prologue(&mut o, &place);
         o += &body;
-        self.epilogue(&mut o);
+        self.epilogue(&mut o, &place);
         let _ = writeln!(o, "}}");
         o
     }
