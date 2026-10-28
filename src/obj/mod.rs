@@ -29,7 +29,9 @@ use symjit::{Config, Program};
 
 use crate::linker::{header, Arch, Format, HeaderInfo, ObjectBuilder, Relocation, Target};
 use crate::sjb::SavedModel;
-use amd::{AmdComplexGenerator, AmdScalarGenerator, AmdVectorF64x4Generator};
+use amd::{
+    AmdComplexGenerator, AmdScalarGenerator, AmdVectorF64x4Generator, AmdVectorF64x8Generator,
+};
 use arm::{ArmComplexGenerator, ArmGenerator};
 use complexify::Complexifier;
 use lower::lower_for_object;
@@ -181,15 +183,15 @@ impl SavedModel {
         Ok(obj)
     }
 
-    /// The AVX2 SIMD kernel of the model (4 lanes) as the function `name` of a relocatable
-    /// object file, with the scalar kernel's calling convention: a call computes the points
-    /// `idx .. idx + 4`. `simd_branch` is on, so lanes that take different branches are merged
+    /// The SIMD kernel of the model as the function `name` of a relocatable object file, with
+    /// `lanes` lanes: 4 (AVX2) or 8 (AVX-512). It has the scalar kernel's calling convention: a
+    /// call computes the points `idx .. idx + lanes`. `simd_branch` is on, so lanes that take different branches are merged
     /// and the kernel never asks for the scalar kernel. x86-64 only. As the JIT does, a complex
     /// model is compiled from its complexified (real) MIR; one that calls complex functions is
     /// an error.
-    pub fn object_simd(&self, name: &str, target: Target) -> Result<ObjectBuilder> {
+    pub fn object_simd(&self, name: &str, target: Target, lanes: usize) -> Result<ObjectBuilder> {
         if target.arch != Arch::X86_64 {
-            return Err(anyhow!("SIMD object kernels are x86-64 (AVX2) only"));
+            return Err(anyhow!("SIMD object kernels are x86-64 (AVX2, AVX-512) only"));
         }
         let mut config = self.config().clone();
         config.set_simd_branch(true);
@@ -199,10 +201,21 @@ impl SavedModel {
         } else {
             lower_for_object(&self.mir, &mut prog)?
         };
-        let mut g = AmdVectorF64x4Generator::new(config);
-        compile(&mir, &mut prog, &mut g, None)?;
+        let (code, relocs) = match lanes {
+            4 => {
+                let mut g = AmdVectorF64x4Generator::new(config);
+                compile(&mir, &mut prog, &mut g, None)?;
+                (g.bytes(), g.relocations())
+            }
+            8 => {
+                let mut g = AmdVectorF64x8Generator::new(config);
+                compile(&mir, &mut prog, &mut g, None)?;
+                (g.bytes(), g.relocations())
+            }
+            _ => return Err(anyhow!("SIMD object kernels have 4 or 8 lanes, not {}", lanes)),
+        };
         let mut obj = ObjectBuilder::new(target);
-        obj.add_function(name, &g.bytes(), &relocations(g.relocations()))?;
+        obj.add_function(name, &code, &relocations(relocs))?;
         Ok(obj)
     }
 

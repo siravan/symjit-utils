@@ -416,15 +416,16 @@ Generating takes 0.06 s and building 0.1 s. The `.so` is tested through `dlopen`
 argument errors, a point range split in two) in `runner::tests`, and the real recordings in
 `tests/pacman.rs` (`PACMAN_REPLAY_SAMPLES`).
 
-### SIMD runners (`--simd`)
+### SIMD runners (`--simd`, `--simd512`)
 
 `pacman runner --simd` writes the same files with AVX2 kernels: each leaf's SIMD kernel
 (`SavedModel::object_simd`, a port of symjit 2.28.1's `amd/vector.rs` in object mode), with the
-scalar kernel's arguments, 4 points per call. There is no scalar kernel in the runner:
+scalar kernel's arguments, 4 points per call. `--simd512` takes AVX-512 kernels instead (its
+`amd/vector_f64x8.rs`), 8 points per call. There is no scalar kernel in the runner:
 - the kernels are compiled with `simd_branch` on, so lanes that take different branches are
   merged and a kernel never asks for the scalar one;
 - `point_start` and `point_count` must be multiples of 8 (status 1 otherwise);
-- a CPU without AVX2 and FMA gets status 3, with a message.
+- a CPU without AVX2 and FMA (AVX-512: AVX512F and AVX512DQ) gets status 3, with a message.
 
 A complex model is compiled from its complexified MIR, as the JIT does; calls of complex
 functions are an error.
@@ -433,9 +434,10 @@ The leaves run on blocks of `PACMAN_RUNNER_BLOCK` points (a multiple of 8, defau
 leaf on one block, then the next, so the block's planes stay in the cache. `PACMAN_RUNNER_STATS=1`
 prints calls, points and time when the library is unloaded.
 
-The SIMD runner computes the bits of RustiCol's SIMD path: `pacman replay --against OUTDIR`
-(without `--scalar`) equals it bit for bit on all 9 recordings (Z+6g colour sector and helicity
-sum, g g > g g), and so do the values of `pyamplicol evaluate` through RustiCol.
+The SIMD runners compute the bits of RustiCol's SIMD path (4 lanes), the AVX-512 one too: `pacman
+replay --against OUTDIR` (without `--scalar`) equals both bit for bit on all 9 recordings (Z+6g
+colour sector and helicity sum, g g > g g), and so do the values of `pyamplicol evaluate` through
+RustiCol.
 
 Results (2026-10-28, Ryzen 9 9900X, one thread; Z+6g compiled at chunk 64, through RustiCol with
 `PACMAN_RUNNER`, `RUSTICOL_TILE_POINTS=2000`):
@@ -444,15 +446,16 @@ Results (2026-10-28, Ryzen 9 9900X, one thread; Z+6g compiled at chunk 64, throu
 |---|---|---|
 | stock RustiCol (default tiles) | 14.2 s | 25.7 µs/point |
 | RustiCol, tile 2000 | 3.19 s | 28.7 µs/point |
-| SIMD runner, tile 2000, blocks of 64 | 3.15 s | 26.5 µs/point |
+| SIMD runner (AVX2), tile 2000, blocks of 64 | 3.15 s | 26.5 µs/point |
+| SIMD runner (AVX-512), tile 2000, blocks of 64 | 2.76 s | 19.3 µs/point |
 | scalar runner, tile 16384 | 17.2 s | 204 µs/point |
 
-On one thread the SIMD runner is as fast as RustiCol's own SIMD kernels at the same tile (the
-same code); stock RustiCol's `evaluate` is slower because it runs the colour sector one point per
+On one thread the AVX2 runner is as fast as RustiCol's own SIMD kernels at the same tile (the
+same code), and the AVX-512 one 27% faster on one flow (Zen 5 has full-width AVX-512 units); stock RustiCol's `evaluate` is slower because it runs the colour sector one point per
 tile, with scalar kernels. The runner is the base for threads.
 
-Blocks: at tile 2000, one flow takes 37.8 µs/point with blocks of 8, 27.7 with 32, 26.5 with 64,
-27.6 with 128, 29.4 with 256.
+Blocks: at tile 2000, one flow takes (AVX2) 37.8 µs/point with blocks of 8, 27.7 with 32, 26.5 with
+64, 27.6 with 128, 29.4 with 256; (AVX-512) 21.2 with 32, 19.3 with 64, 21.6 with 128, 23.4 with 256.
 
 The tile matters on the CPU: plane `p` of point `i` is at `planes[p] + i` in RustiCol's arena,
 whose planes are a tile apart. A power-of-two tile puts the planes in the same cache sets: one flow
