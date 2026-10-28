@@ -49,8 +49,12 @@ r/runner out arena/*.json && pacman replay --scalar --against out artifacts/qq_z
 | `--against DIR` | replay | Compare with `DIR/NAME.arena` (a runner's output) instead of `.post`; differences are errors, also with `--whole` or `--scalar`. |
 | `-o`, `--output DIR` | runner | The runner's directory (default `runner-<process>`). |
 | `--execution PAT` | runner | The execution (it must match one), when no recording names it. |
+| `--process PAT` | runner | Look the execution up only in the processes whose names match (`p_p_to_z_j_j_1`), where several have it. |
 | `--cc CC` | runner | The C compiler (default `cc`). |
 | `--no-build` | runner | Write the files only; `make` in the directory builds them. |
+| `--cuda` | runner | A CUDA runner (below). |
+| `--sm LIST` | runner | The GPUs' SM numbers, e.g. `80,90,120` (implies `--cuda`; default: the local GPU's). |
+| `--jobs N` | runner | `ptxas` runs at a time (default: the CPUs). |
 
 `extract` selects the members whose paths match one of its MEMBER arguments (a path, or a
 pattern: `*` matches any characters, `/` included, `?` one); without them it extracts the kernels.
@@ -411,6 +415,57 @@ replay bit for bit:
 Generating takes 0.06 s and building 0.1 s. The `.so` is tested through `dlopen` (metadata,
 argument errors, a point range split in two) in `runner::tests`, and the real recordings in
 `tests/pacman.rs` (`PACMAN_REPLAY_SAMPLES`).
+
+### CUDA runners (`--cuda`)
+
+`pacman runner --cuda [--sm 80,90,120] [--jobs N]` writes the same execution for the GPU.
+`--sm` defaults to the local GPU's, from `nvidia-smi`. The interface, tables, metadata and
+`main.c` are the CPU runner's, so the checks are the same (`runner OUTDIR REC.json`, then
+`replay --scalar --against OUTDIR`), and RustiCol loads it the same way.
+
+| file | what it holds |
+|---|---|
+| `kernels/leaf<k>.ptx` | each leaf's plane kernel through `sjb2ptx` with the leaf's planes compiled in (`PtxOptions::mapping`): slot `k` at plane `map[k]` of one arena, which the kernel gets as both `in` and `out` |
+| `kernels/leaf<k>.sm_<N>.cubin`, `kernels/leaf<k>.fatbin` | `ptxas -O3` per SM (in parallel, the largest first), packed by `fatbinary` |
+| `runner.c` | the tables and metadata, the fatbinaries embedded (`.incbin`), and `pacman_runner_v1_run` on the GPU |
+| `Makefile` | the build `pacman` runs (`PTXAS`, `FATBINARY`, `SMS`) |
+
+The library opens `libcuda.so.1` with `dlopen` on its first call, so building needs the CUDA
+toolkit but running needs only the driver. It uses the primary context of device 0 and loads the
+leaves' modules. Per call:
+- it keeps a device arena of all planes, `ld` = the points rounded up to 32, grown when a call
+  needs more;
+- it copies in the planes the leaves read before writing them (RustiCol writes those before the
+  call: sources, momenta, parameters, the zero plane);
+- it runs the leaves in order, one thread per point;
+- it copies back the **amplitude planes** the leaves write: RustiCol reduces only those, and the
+  currents are scratch within a call. Planes the call does not write, such as cleared inactive
+  amplitudes, are left alone.
+
+The host's current planes therefore keep stale values after a call. RustiCol never reads them:
+a schedule reads only planes RustiCol writes before the call, and its arena reuses planes across
+currents (a source's plane can later hold a leaf's output), so the host must stay the authority
+for everything a call reads first. `PACMAN_RUNNER_COPY_BACK=all` copies back every written plane,
+as before; so does `PACMAN_SAVE_ARENA` (a recording must hold the currents) and the `runner`
+executable (its arenas are checked whole).
+
+Copies are 2D copies over runs of equally spaced host planes, a few per region.
+`PACMAN_RUNNER_STATS=1` prints calls, points, copies and time when the library is unloaded.
+Status 3 (`PACMAN_RUNNER_DEVICE_ERROR`) reports a GPU failure, with the step on standard error.
+
+Results (2026-10-26, RTX 5060, sm_120): the Z+6g colour-sector recording equals the scalar replay
+bit for bit, per tile and as one call. The PTX of the 13 chunk-512 leaves is 35 MB and takes
+0.35 s to generate; ptxas takes 33 s; `librunner.so` is 16 MB. A call on 256 points takes 18 ms
+(11 copies); on 32-point tiles, 6 ms per call.
+
+In RustiCol (`runner_check.py`, 100 points, with CUDA runners for all three engines), every value
+equals the CPU runners' result. Totals are bit-equal to stock RustiCol; one helicity is within
+1.2e-14 and one colour flow within 4.8e-16, from scalar against SIMD rounding. But it took 6 min 20 s:
+- RustiCol called the colour-sector engine 72,004 times for 72,100 points, about one point per
+  call;
+- each call costs about 5 ms of GPU overhead (launches, copies, synchronization).
+
+So the GPU needs RustiCol to pass many points per call (`plans/pacman-ptx/INTEGRATION.md` §2.3).
 
 A `pacman` RustiCol build loads runners with `PACMAN_RUNNER=LIB[:LIB...]`.
 Each compiled engine takes the library whose metadata matches it and calls it in place of its leaf
