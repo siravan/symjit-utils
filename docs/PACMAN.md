@@ -432,7 +432,30 @@ functions are an error.
 
 The leaves run on blocks of `PACMAN_RUNNER_BLOCK` points (a multiple of 8, default 64): every
 leaf on one block, then the next, so the block's planes stay in the cache. `PACMAN_RUNNER_STATS=1`
-prints calls, points and time when the library is unloaded.
+prints calls, points, threads and time when the library is unloaded.
+
+`PACMAN_RUNNER_THREADS=N` (default 1, at most 256) splits the points of a call over up to N
+threads (pthreads, started per call with 16 MiB stacks): contiguous ranges of whole 8-point groups,
+at least `PACMAN_RUNNER_BLOCK` points each, so a call of fewer than two blocks stays on the calling
+thread. The calling thread runs the first range; a thread that cannot be started has its range run
+there too. The values do not depend on the threads (every point is computed by the same kernel
+calls). The runner expects one caller at a time, as RustiCol calls it.
+
+Threads (2026-10-28, the same machine and artifact, AVX-512, `profile`, one flow; µs/point, the
+runner alone from `PACMAN_RUNNER_STATS` in brackets):
+
+| threads | 1,000 points per call (tile 2000) | 16,000 points per call (tile 16000) |
+|---|---|---|
+| 1 | 19.3 (18.4) | 21.6 (20.8) |
+| 2 | 10.8 | 13.0 |
+| 4 | 6.4 | 9.1 |
+| 8 | 4.5 | 6.4 |
+| 12 | 4.0 (3.1) | 5.1 (4.3) |
+| 24 | 4.2 | 5.1 (4.2) |
+
+AVX2 runs from 26.1 (1 thread) to 4.3 (12) at 1,000 points per call. About 0.9 µs/point is
+RustiCol's own work outside the runner, which stays on one thread; 12 cores make the runner about
+6x faster at 1,000 points per call and 5x at 16,000, and SMT (24 threads) adds nothing.
 
 The SIMD runners compute the bits of RustiCol's SIMD path (4 lanes), the AVX-512 one too: `pacman
 replay --against OUTDIR` (without `--scalar`) equals both bit for bit on all 9 recordings (Z+6g
