@@ -12,7 +12,8 @@
 //!   order, the current map compiled in, and `pacman_runner_v1_run`.
 //! - `--simd`, `--simd512`: the kernels are AVX2 or AVX-512 SIMD kernels instead
 //!   (`SavedModel::object_simd`, 4 or 8 points per call, `simd_branch` on, no scalar kernel); the runner takes point ranges of multiples of 8 and
-//!   runs every leaf on blocks of `PACMAN_RUNNER_BLOCK` points (default 64) at a time.
+//!   runs every leaf on blocks of `PACMAN_RUNNER_BLOCK` points (default 64) at a time, the
+//!   points of a call split over `PACMAN_RUNNER_THREADS` threads (default 1).
 //! - `main.c` reads recordings (`NAME.json`, `NAME.pre`), runs their schedules per recorded tile
 //!   and writes the arena as `NAME.arena` (the layout of `.post`), for `pacman replay
 //!   --against`.
@@ -348,6 +349,7 @@ const RUN_C: &str = r#"const pacman_runner_metadata *pacman_runner_v1_metadata(v
 }
 
 #if LANES > 1
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -360,6 +362,9 @@ static struct {
     double seconds;
 } STATS;
 
+/* the settings, read once: PACMAN_RUNNER_BLOCK, PACMAN_RUNNER_THREADS */
+static uint32_t BLOCK, THREADS;
+
 static double now(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -368,9 +373,11 @@ static double now(void) {
 
 __attribute__((destructor)) static void print_stats(void) {
     if (STATS.on && STATS.calls > 0) {
-        fprintf(stderr, "pacman runner (%s of %s): %llu calls, %llu points, %.3f s (%.2f us/point)\n",
-                METADATA.execution, METADATA.process, STATS.calls, STATS.points, STATS.seconds,
-                1e6 * STATS.seconds / STATS.points);
+        fprintf(stderr,
+                "pacman runner (%s of %s): %llu calls, %llu points, %u threads, %.3f s (%.2f "
+                "us/point)\n",
+                METADATA.execution, METADATA.process, STATS.calls, STATS.points, THREADS,
+                STATS.seconds, 1e6 * STATS.seconds / STATS.points);
     }
 }
 
@@ -414,6 +421,85 @@ static int run_leaf(uint32_t leaf, double *const *planes, uint32_t start, uint32
     return PACMAN_RUNNER_OK;
 }
 
+/* every leaf of `leaves` (count of them) on the points start..stop, a block of points at a time */
+static int run_points(double *const *planes, const uint32_t *leaves, uint32_t count,
+                      uint32_t start, uint32_t stop, uint32_t block) {
+    for (uint32_t first = start; first < stop; first += block) {
+        uint32_t last = stop - first < block ? stop : first + block;
+        for (uint32_t k = 0; k < count; k++) {
+            int status = run_leaf(leaves == NULL ? k : leaves[k], planes, first, last);
+            if (status != PACMAN_RUNNER_OK) {
+                return status;
+            }
+        }
+    }
+    return PACMAN_RUNNER_OK;
+}
+
+#if LANES > 1
+/* the points of one thread */
+typedef struct {
+    double *const *planes;
+    const uint32_t *leaves;
+    uint32_t count, start, stop;
+    int status;
+} share_t;
+
+static void *run_share(void *arg) {
+    share_t *share = arg;
+    share->status =
+        run_points(share->planes, share->leaves, share->count, share->start, share->stop, BLOCK);
+    return NULL;
+}
+
+#define MAX_THREADS 256
+#define STACK_SIZE (16u << 20) /* of every worker thread, for the kernels' spills */
+
+/* the points start..start+point_count on up to THREADS threads, contiguous ranges of whole
+   8-point groups and at least BLOCK points each; the calling thread runs the first range */
+static int run_threads(double *const *planes, const uint32_t *leaves, uint32_t count,
+                       uint32_t start, uint32_t point_count) {
+    uint32_t threads = point_count / BLOCK;
+    threads = threads < 1 ? 1 : threads > THREADS ? THREADS : threads;
+    if (threads == 1) {
+        return run_points(planes, leaves, count, start, start + point_count, BLOCK);
+    }
+    share_t shares[MAX_THREADS];
+    pthread_t ids[MAX_THREADS];
+    int started[MAX_THREADS];
+    uint32_t groups = point_count / 8, point = start;
+    for (uint32_t t = 0; t < threads; t++) {
+        uint32_t n = groups / threads + (t < groups % threads);
+        shares[t] = (share_t){planes, leaves, count, point, point + 8 * n, PACMAN_RUNNER_OK};
+        point += 8 * n;
+    }
+    pthread_attr_t attr;
+    int attr_ok = pthread_attr_init(&attr) == 0;
+    if (attr_ok) {
+        pthread_attr_setstacksize(&attr, STACK_SIZE);
+    }
+    for (uint32_t t = 1; t < threads; t++) {
+        started[t] = pthread_create(&ids[t], attr_ok ? &attr : NULL, run_share, &shares[t]) == 0;
+    }
+    if (attr_ok) {
+        pthread_attr_destroy(&attr);
+    }
+    run_share(&shares[0]);
+    int status = shares[0].status;
+    for (uint32_t t = 1; t < threads; t++) {
+        if (started[t]) {
+            pthread_join(ids[t], NULL);
+        } else {
+            run_share(&shares[t]); /* no thread: its points on this one */
+        }
+        if (status == PACMAN_RUNNER_OK) {
+            status = shares[t].status;
+        }
+    }
+    return status;
+}
+#endif
+
 int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint32_t *leaves,
                          uint32_t num_leaves, uint32_t point_start, uint32_t point_count) {
     if (planes == NULL || num_planes != NUM_PLANES || point_count == 0 ||
@@ -439,36 +525,30 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
     if (!cpu_ok()) {
         return PACMAN_RUNNER_DEVICE_ERROR;
     }
-    /* every leaf on a block of points at a time, so that the block's planes stay in the
-       cache (PACMAN_RUNNER_BLOCK points, a multiple of 8, default 64) */
-    static uint32_t block;
-    if (block == 0) {
+    if (BLOCK == 0) {
+        /* every leaf on a block of points at a time, so that the block's planes stay in the
+           cache (PACMAN_RUNNER_BLOCK points, a multiple of 8, default 64) */
         const char *env = getenv("PACMAN_RUNNER_BLOCK");
         uint32_t b = env != NULL ? (uint32_t)strtoul(env, NULL, 10) : 64;
-        block = b < 8 ? 8 : b / 8 * 8;
+        /* the points of a call split over PACMAN_RUNNER_THREADS threads (default 1) */
+        env = getenv("PACMAN_RUNNER_THREADS");
+        uint32_t t = env != NULL ? (uint32_t)strtoul(env, NULL, 10) : 1;
+        THREADS = t < 1 ? 1 : t > MAX_THREADS ? MAX_THREADS : t;
         const char *stats = getenv("PACMAN_RUNNER_STATS");
         STATS.on = stats != NULL && stats[0] != '\0' && strcmp(stats, "0") != 0;
+        BLOCK = b < 8 ? 8 : b / 8 * 8;
     }
     double started = now();
-#else
-    uint32_t block = point_count;
-#endif
-    uint32_t stop = point_start + point_count;
-    for (uint32_t first = point_start; first < stop; first += block) {
-        uint32_t last = stop - first < block ? stop : first + block;
-        for (uint32_t k = 0; k < count; k++) {
-            int status = run_leaf(leaves == NULL ? k : leaves[k], planes, first, last);
-            if (status != PACMAN_RUNNER_OK) {
-                return status;
-            }
-        }
+    int status = run_threads(planes, leaves, count, point_start, point_count);
+    if (status == PACMAN_RUNNER_OK) {
+        STATS.calls++;
+        STATS.points += point_count;
+        STATS.seconds += now() - started;
     }
-#if LANES > 1
-    STATS.calls++;
-    STATS.points += point_count;
-    STATS.seconds += now() - started;
+    return status;
+#else
+    return run_points(planes, leaves, count, point_start, point_start + point_count, point_count);
 #endif
-    return PACMAN_RUNNER_OK;
 }
 "#;
 
@@ -832,11 +912,11 @@ pub fn makefile(kernels: usize) -> String {
          KERNELS = {}\n\n\
          all: runner librunner.so\n\n\
          runner.o: runner.c pacman_runner.h\n\
-         \t$(CC) $(CFLAGS) -fPIC -c runner.c -o runner.o\n\n\
+         \t$(CC) $(CFLAGS) -pthread -fPIC -c runner.c -o runner.o\n\n\
          librunner.so: runner.o $(KERNELS)\n\
-         \t$(CC) -shared -o librunner.so runner.o $(KERNELS)\n\n\
+         \t$(CC) -pthread -shared -o librunner.so runner.o $(KERNELS)\n\n\
          runner: main.c runner.o $(KERNELS) pacman_runner.h\n\
-         \t$(CC) $(CFLAGS) -o runner main.c runner.o $(KERNELS)\n",
+         \t$(CC) $(CFLAGS) -pthread -o runner main.c runner.o $(KERNELS)\n",
         objects.join(" ")
     )
 }
@@ -875,15 +955,17 @@ pub fn write(
 pub fn build(dir: &Path, cc: &str, kernels: usize) -> Result<()> {
     let objects: Vec<String> = (0..kernels).map(|k| format!("kernels/k{}.o", k)).collect();
     let steps: Vec<Vec<String>> = vec![
-        ["-O1", "-fPIC", "-c", "runner.c", "-o", "runner.o"]
-            .map(String::from)
-            .to_vec(),
-        ["-shared", "-o", "librunner.so", "runner.o"]
+        [
+            "-O1", "-pthread", "-fPIC", "-c", "runner.c", "-o", "runner.o",
+        ]
+        .map(String::from)
+        .to_vec(),
+        ["-pthread", "-shared", "-o", "librunner.so", "runner.o"]
             .map(String::from)
             .into_iter()
             .chain(objects.iter().cloned())
             .collect(),
-        ["-O1", "-o", "runner", "main.c", "runner.o"]
+        ["-O1", "-pthread", "-o", "runner", "main.c", "runner.o"]
             .map(String::from)
             .into_iter()
             .chain(objects.iter().cloned())
@@ -1705,20 +1787,30 @@ int main(int argc, char **argv) {
             .arena;
         assert!(want[3 * n..4 * n].iter().all(|x| x.is_finite()));
 
-        for args in [&["out"][..], &["--whole", "out"][..]] {
-            let out = Command::new(dir.join("runner"))
-                .args(args)
-                .arg(&json)
-                .current_dir(&dir)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let got = recording::read_f64s(&dir.join("out/t.e0.r0.arena"), 12 * n).unwrap();
-            assert!(recording::compare(&got, &want, n).is_empty(), "{:?}", args);
+        // one thread, then the 16 points of `--whole` split over 2 threads (blocks of 8)
+        for threads in ["1", "3"] {
+            for args in [&["out"][..], &["--whole", "out"][..]] {
+                let out = Command::new(dir.join("runner"))
+                    .args(args)
+                    .arg(&json)
+                    .env("PACMAN_RUNNER_THREADS", threads)
+                    .env("PACMAN_RUNNER_BLOCK", "8")
+                    .current_dir(&dir)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let got = recording::read_f64s(&dir.join("out/t.e0.r0.arena"), 12 * n).unwrap();
+                assert!(
+                    recording::compare(&got, &want, n).is_empty(),
+                    "{:?} on {} threads",
+                    args,
+                    threads
+                );
+            }
         }
 
         // a point range that is not a multiple of 8 is refused
