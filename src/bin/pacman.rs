@@ -100,6 +100,8 @@ Options:
       --process PAT    runner: only the processes matching PAT, for --execution
       --cc CC          runner: the C compiler (default: cc)
       --no-build       runner: write the files only (`make` builds them)
+      --simd           runner: AVX2 SIMD kernels, 4 points per call (x86-64;
+                       the runner takes point ranges of multiples of 8)
       --cuda           runner: a CUDA runner (the kernels as PTX, compiled by
                        ptxas for the GPUs of --sm; needs the CUDA toolkit to
                        build, only the NVIDIA driver to run)
@@ -130,6 +132,8 @@ struct Runner {
     process: Option<String>,
     cc: String,
     build: bool,
+    /// `--simd`: AVX2 kernels in the CPU runner
+    simd: bool,
     /// a CUDA runner, for these SMs (empty: the local GPU's)
     cuda: Option<Vec<u32>>,
     jobs: usize,
@@ -185,6 +189,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
     let mut process: Option<String> = None;
     let mut cc = "cc".to_string();
     let mut build = true;
+    let mut simd = false;
     let mut cuda: Option<Vec<u32>> = None;
     let mut jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
 
@@ -244,6 +249,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             ("runner", "--process") => process = Some(value(arg)?),
             ("runner", "--cc") => cc = value(arg)?,
             ("runner", "--no-build") => build = false,
+            ("runner", "--simd") => simd = true,
             ("runner", "--cuda") => {
                 cuda.get_or_insert_with(Vec::new);
             }
@@ -322,6 +328,9 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
         "runner" if inputs.len() == 1 && execution.is_none() => {
             Err("`runner` needs a recording or `--execution`".into())
         }
+        "runner" if simd && cuda.is_some() => {
+            Err("`--simd` is for CPU runners, not with `--cuda` or `--sm`".into())
+        }
         "runner" => Ok(Command::Runner(Runner {
             artifact: inputs[0].clone().into(),
             recording: inputs.get(1).map(PathBuf::from),
@@ -330,6 +339,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             process,
             cc,
             build,
+            simd,
             cuda,
             jobs,
         })),
@@ -998,11 +1008,12 @@ fn runner(args: &Runner) -> Result<()> {
         return cuda_runner(args, &spec, &members, &dir, sms);
     }
     let start = std::time::Instant::now();
-    let (objects, of_leaf) = symjit_utils::runner::objects(&spec, &members)?;
-    symjit_utils::runner::write(&dir, &spec, &objects, &of_leaf)?;
+    let (objects, of_leaf) = symjit_utils::runner::objects(&spec, &members, args.simd)?;
+    symjit_utils::runner::write(&dir, &spec, &objects, &of_leaf, args.simd)?;
     let code: usize = objects.iter().map(Vec::len).sum();
     eprintln!(
-        "pacman: wrote the runner of {} of {} to {}: {} leaves, {} kernel object{} ({} bytes) in {:.2} s",
+        "pacman: wrote the {}runner of {} of {} to {}: {} leaves, {} kernel object{} ({} bytes) in {:.2} s",
+        if args.simd { "SIMD (AVX2) " } else { "" },
         spec.execution,
         spec.process,
         dir.display(),
