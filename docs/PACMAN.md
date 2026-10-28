@@ -437,7 +437,11 @@ leaves' modules. Per call:
   needs more;
 - it copies in the planes the leaves read before writing them (RustiCol writes those before the
   call: sources, momenta, parameters, the zero plane);
-- it runs the leaves in order, one thread per point;
+- it runs the leaves one thread per point, in groups: a group is a run of consecutive leaves that
+  do not conflict (none reads a plane another writes, no two write the same plane), in effect a
+  stage. A group's leaves are spread over `PACMAN_RUNNER_STREAMS` streams (default 8; 1 runs every
+  leaf in order on the default stream), so that small grids run side by side; the default stream
+  waits for every stream after a group (events), and the streams wait for it before the next one;
 - it copies back the **amplitude planes** the leaves write: RustiCol reduces only those, and the
   currents are scratch within a call. Planes the call does not write, such as cleared inactive
   amplitudes, are left alone.
@@ -450,13 +454,18 @@ as before; so does `PACMAN_SAVE_ARENA` (a recording must hold the currents) and 
 executable (its arenas are checked whole).
 
 Copies are 2D copies over runs of equally spaced host planes, a few per region.
-`PACMAN_RUNNER_STATS=1` prints calls, points, copies and time when the library is unloaded.
+`PACMAN_RUNNER_STATS=1` prints calls, points, copies, streams, groups and time when the library is
+unloaded.
 Status 3 (`PACMAN_RUNNER_DEVICE_ERROR`) reports a GPU failure, with the step on standard error.
 
 Results (2026-10-26, RTX 5060, sm_120): the Z+6g colour-sector recording equals the scalar replay
 bit for bit, per tile and as one call. The PTX of the 13 chunk-512 leaves is 35 MB and takes
 0.35 s to generate; ptxas takes 33 s; `librunner.so` is 16 MB. A call on 256 points takes 18 ms
 (11 copies); on 32-point tiles, 6 ms per call.
+
+Streams (2026-10-28, RTX 5060, Z+6g at chunk 64, one colour flow, `pyamplicol profile`): with
+1,000 points per call, 13.9 µs/point on one stream, 7.9 on 2, 5.9 on 8; with 16,384 points per
+call, 5.2 on one and 4.7 on 8. The amplitudes are the same bit for bit.
 
 In RustiCol (`runner_check.py`, 100 points, with CUDA runners for all three engines), every value
 equals the CPU runners' result. Totals are bit-equal to stock RustiCol; one helicity is within
