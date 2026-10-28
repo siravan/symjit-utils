@@ -78,7 +78,10 @@ impl Complexifier {
         // self.mir.labels = mir.labels.clone();
         mir.rerun(self)?;
         self.mir.populate_labels();
-        Ok(std::mem::take(&mut self.mir))
+        // Not `std::mem::take`: its `Mir::default()` calls `Config::default()`, which
+        // reads `$SYMJIT_TOML` or `./symjit.toml`, on every load of a saved application.
+        let config = self.mir.config.clone();
+        Ok(std::mem::replace(&mut self.mir, Mir::new(config)))
     }
 
     // temporary registers

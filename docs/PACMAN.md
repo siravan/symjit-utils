@@ -430,7 +430,7 @@ scalar kernel's arguments, 4 points per call. `--simd512` takes AVX-512 kernels 
 A complex model is compiled from its complexified MIR, as the JIT does; calls of complex
 functions are an error.
 
-The leaves run on blocks of `PACMAN_RUNNER_BLOCK` points (a multiple of 8, default 64): every
+The leaves run on blocks of `PACMAN_RUNNER_BLOCK` points (a multiple of 8, default 64, at most 2^20): every
 leaf on one block, then the next, so the block's planes stay in the cache. `PACMAN_RUNNER_STATS=1`
 prints calls, points, threads and time when the library is unloaded.
 

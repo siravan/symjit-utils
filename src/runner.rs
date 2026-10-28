@@ -424,8 +424,9 @@ static int run_leaf(uint32_t leaf, double *const *planes, uint32_t start, uint32
 /* every leaf of `leaves` (count of them) on the points start..stop, a block of points at a time */
 static int run_points(double *const *planes, const uint32_t *leaves, uint32_t count,
                       uint32_t start, uint32_t stop, uint32_t block) {
-    for (uint32_t first = start; first < stop; first += block) {
-        uint32_t last = stop - first < block ? stop : first + block;
+    /* `first = last`, not `first += block`: a block may end past UINT32_MAX */
+    for (uint32_t first = start, last; first < stop; first = last) {
+        last = stop - first < block ? stop : first + block;
         for (uint32_t k = 0; k < count; k++) {
             int status = run_leaf(leaves == NULL ? k : leaves[k], planes, first, last);
             if (status != PACMAN_RUNNER_OK) {
@@ -527,7 +528,7 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
     }
     if (BLOCK == 0) {
         /* every leaf on a block of points at a time, so that the block's planes stay in the
-           cache (PACMAN_RUNNER_BLOCK points, a multiple of 8, default 64) */
+           cache (PACMAN_RUNNER_BLOCK points, a multiple of 8, default 64, at most 2^20) */
         const char *env = getenv("PACMAN_RUNNER_BLOCK");
         uint32_t b = env != NULL ? (uint32_t)strtoul(env, NULL, 10) : 64;
         /* the points of a call split over PACMAN_RUNNER_THREADS threads (default 1) */
@@ -536,7 +537,7 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
         THREADS = t < 1 ? 1 : t > MAX_THREADS ? MAX_THREADS : t;
         const char *stats = getenv("PACMAN_RUNNER_STATS");
         STATS.on = stats != NULL && stats[0] != '\0' && strcmp(stats, "0") != 0;
-        BLOCK = b < 8 ? 8 : b / 8 * 8;
+        BLOCK = b < 8 ? 8 : b > (1u << 20) ? (1u << 20) : b / 8 * 8;
     }
     double started = now();
     int status = run_threads(planes, leaves, count, point_start, point_count);

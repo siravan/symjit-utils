@@ -308,7 +308,9 @@ impl Generator for AmdVectorF64x4Generator {
 
         self.amd.jz(label);
 
-        if !self.config.simd_branch() {
+        // the option bit itself (symjit's `Config::SIMD_BRANCH`): `Config::simd_branch()` also
+        // asks whether the CPU running pacman has AVX, which says nothing about the target
+        if self.config.opt & 0x0000_0080 == 0 {
             self.amd.or(Amd::RAX, Amd::RAX);
             self.amd.jnz("@epilogue");
         }
