@@ -859,6 +859,7 @@ typedef void *CUcontext;
 typedef void *CUmodule;
 typedef void *CUfunction;
 typedef void *CUstream;
+typedef void *CUevent;
 typedef unsigned long long CUdeviceptr;
 
 typedef struct {
@@ -878,8 +879,10 @@ typedef struct {
 } CUDA_MEMCPY2D;
 
 enum { CU_MEMORYTYPE_HOST = 1, CU_MEMORYTYPE_DEVICE = 2 };
+enum { CU_STREAM_NON_BLOCKING = 1, CU_EVENT_DISABLE_TIMING = 2 };
 
 #define BLOCK 128u
+#define MAX_STREAMS 32
 #define READ_FIRST 1u
 #define WRITTEN 2u
 #define COPY_BACK 4u /* written and copied back */
@@ -893,6 +896,11 @@ static struct {
     CUdeviceptr arena; /* NUM_PLANES planes of `ld` points */
     size_t ld;
     int copy_all; /* PACMAN_RUNNER_COPY_BACK=all or PACMAN_SAVE_ARENA: every written plane */
+    /* PACMAN_RUNNER_STREAMS=S (default 8): the independent leaves of a group run on S streams */
+    unsigned num_streams;
+    CUstream streams[MAX_STREAMS];
+    CUevent joins[MAX_STREAMS]; /* one per stream, recorded after its part of a group */
+    CUevent fork;               /* recorded on the default stream before a group */
     struct {
         CUresult (*Init)(unsigned);
         CUresult (*DeviceGet)(CUdevice *, int);
@@ -907,15 +915,22 @@ static struct {
         CUresult (*LaunchKernel)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned,
                                  unsigned, unsigned, CUstream, void **, void **);
         CUresult (*GetErrorString)(CUresult, const char **);
+        CUresult (*StreamCreate)(CUstream *, unsigned);
+        CUresult (*EventCreate)(CUevent *, unsigned);
+        CUresult (*EventRecord)(CUevent, CUstream);
+        CUresult (*StreamWaitEvent)(CUstream, CUevent, unsigned);
     } cu;
 } G;
 
 static unsigned char FLAGS[NUM_PLANES];
+/* the group that last read or wrote each plane (groups of leaves without conflicts) */
+static uint32_t READ_IN[NUM_PLANES], WRITTEN_IN[NUM_PLANES];
+static uint32_t GROUP;
 
 /* PACMAN_RUNNER_STATS=1: calls, points, copies and time, printed when the library is unloaded */
 static struct {
     int on;
-    unsigned long long calls, points, copies, bytes;
+    unsigned long long calls, points, copies, bytes, groups;
     double seconds;
 } STATS;
 
@@ -929,9 +944,9 @@ __attribute__((destructor)) static void print_stats(void) {
     if (STATS.on && STATS.calls > 0) {
         fprintf(stderr,
                 "pacman runner (%s of %s): %llu calls, %llu points, %llu copies (%.1f MB), "
-                "%.3f s (%.2f us/point)\n",
+                "%u streams, %llu groups, %.3f s (%.2f us/point)\n",
                 METADATA.execution, METADATA.process, STATS.calls, STATS.points, STATS.copies,
-                STATS.bytes * 1e-6, STATS.seconds,
+                STATS.bytes * 1e-6, G.num_streams, STATS.groups, STATS.seconds,
                 STATS.points ? 1e6 * STATS.seconds / STATS.points : 0.0);
     }
 }
@@ -1021,6 +1036,10 @@ static int cuda_open(void) {
     const char *capture = getenv("PACMAN_SAVE_ARENA");
     G.copy_all = (copy_back != NULL && strcmp(copy_back, "all") == 0) ||
                  (capture != NULL && capture[0] != '\0');
+    const char *streams = getenv("PACMAN_RUNNER_STREAMS");
+    G.num_streams = streams != NULL ? (unsigned)strtoul(streams, NULL, 10) : 8;
+    if (G.num_streams < 1) G.num_streams = 1;
+    if (G.num_streams > MAX_STREAMS) G.num_streams = MAX_STREAMS;
     G.lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
     if (G.lib == NULL) {
         fprintf(stderr, "pacman runner: cannot open libcuda.so.1: %s\n", dlerror());
@@ -1042,6 +1061,10 @@ static int cuda_open(void) {
         {(void **)&G.cu.Memcpy2DUnaligned, "cuMemcpy2DUnaligned_v2"},
         {(void **)&G.cu.LaunchKernel, "cuLaunchKernel"},
         {(void **)&G.cu.GetErrorString, "cuGetErrorString"},
+        {(void **)&G.cu.StreamCreate, "cuStreamCreate"},
+        {(void **)&G.cu.EventCreate, "cuEventCreate"},
+        {(void **)&G.cu.EventRecord, "cuEventRecord"},
+        {(void **)&G.cu.StreamWaitEvent, "cuStreamWaitEvent"},
     };
     for (size_t i = 0; i < sizeof symbols / sizeof symbols[0]; i++) {
         *symbols[i].fn = dlsym(G.lib, symbols[i].name);
@@ -1062,6 +1085,14 @@ static int cuda_open(void) {
         CU(G.cu.ModuleLoadData(&module, LEAF_FATBINS[k]), "cuModuleLoadData (no kernel for this GPU?)");
         CU(G.cu.ModuleGetFunction(&G.functions[k], module, name), "cuModuleGetFunction");
     }
+    if (G.num_streams > 1) {
+        /* non-blocking: ordered against the default stream (the copies) only by the events */
+        CU(G.cu.EventCreate(&G.fork, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+        for (unsigned s = 0; s < G.num_streams; s++) {
+            CU(G.cu.StreamCreate(&G.streams[s], CU_STREAM_NON_BLOCKING), "cuStreamCreate");
+            CU(G.cu.EventCreate(&G.joins[s], CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+        }
+    }
     G.cu.CtxPopCurrent(&previous);
     G.state = 1;
     return 1;
@@ -1071,6 +1102,79 @@ fail:
 
 const pacman_runner_metadata *pacman_runner_v1_metadata(void) {
     return &METADATA;
+}
+
+/* starts a new group of leaves (no plane marked) */
+static void new_group(void) {
+    if (++GROUP == 0) {
+        memset(READ_IN, 0, sizeof READ_IN);
+        memset(WRITTEN_IN, 0, sizeof WRITTEN_IN);
+        GROUP = 1;
+    }
+}
+
+/* adds `leaf` to the current group if it does not conflict with it (reads a plane the group
+   writes, or writes one it reads or writes); 0 if it conflicts */
+static int join_group(uint32_t leaf) {
+    const uint32_t *map = LEAF_PLANES[leaf];
+    uint32_t inputs = LEAF_INPUTS[leaf], end = inputs + LEAF_OUTPUTS[leaf];
+    for (uint32_t i = 0; i < inputs; i++) {
+        if (WRITTEN_IN[map[i]] == GROUP) return 0;
+    }
+    for (uint32_t i = inputs; i < end; i++) {
+        if (WRITTEN_IN[map[i]] == GROUP || READ_IN[map[i]] == GROUP) return 0;
+    }
+    for (uint32_t i = 0; i < inputs; i++) READ_IN[map[i]] = GROUP;
+    for (uint32_t i = inputs; i < end; i++) WRITTEN_IN[map[i]] = GROUP;
+    return 1;
+}
+
+/* the default stream waits for the streams used by the last group (`used` of them) */
+static int join_streams(unsigned used) {
+    for (unsigned s = 0; s < used; s++) {
+        CU(G.cu.EventRecord(G.joins[s], G.streams[s]), "cuEventRecord");
+        CU(G.cu.StreamWaitEvent(NULL, G.joins[s], 0), "cuStreamWaitEvent");
+    }
+    return 0;
+fail:
+    return -1;
+}
+
+/* launches the leaves: on the default stream in order, or, with several streams, each group of
+   independent leaves spread over the streams, which wait for the default stream before the group
+   (the copies in, the previous group) and which the default stream waits for after it */
+static int launch(const uint32_t *leaves, uint32_t count, unsigned grid, void **args) {
+    if (G.num_streams == 1) {
+        for (uint32_t k = 0; k < count; k++) {
+            uint32_t leaf = leaves == NULL ? k : leaves[k];
+            CU(G.cu.LaunchKernel(G.functions[leaf], grid, 1, 1, BLOCK, 1, 1, 0, NULL, args, NULL),
+               "cuLaunchKernel");
+        }
+        STATS.groups++;
+        return 0;
+    }
+    unsigned used = 0; /* launches in the current group */
+    for (uint32_t k = 0; k < count; k++) {
+        uint32_t leaf = leaves == NULL ? k : leaves[k];
+        if (k == 0 || !join_group(leaf)) {
+            if (join_streams(used < G.num_streams ? used : G.num_streams) != 0) return -1;
+            new_group();
+            join_group(leaf);
+            CU(G.cu.EventRecord(G.fork, NULL), "cuEventRecord");
+            for (unsigned s = 0; s < G.num_streams; s++) {
+                CU(G.cu.StreamWaitEvent(G.streams[s], G.fork, 0), "cuStreamWaitEvent");
+            }
+            used = 0;
+            STATS.groups++;
+        }
+        CUstream stream = G.streams[used % G.num_streams];
+        CU(G.cu.LaunchKernel(G.functions[leaf], grid, 1, 1, BLOCK, 1, 1, 0, stream, args, NULL),
+           "cuLaunchKernel");
+        used++;
+    }
+    return join_streams(used < G.num_streams ? used : G.num_streams);
+fail:
+    return -1;
 }
 
 int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint32_t *leaves,
@@ -1138,12 +1242,10 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
     CUdeviceptr arena = G.arena;
     void *args[] = {&arena, &arena, &arena, &n, &stride, &stride};
     unsigned grid = (point_count + BLOCK - 1) / BLOCK;
-    for (uint32_t k = 0; k < count; k++) {
-        uint32_t leaf = leaves == NULL ? k : leaves[k];
-        CU(G.cu.LaunchKernel(G.functions[leaf], grid, 1, 1, BLOCK, 1, 1, 0, NULL, args, NULL),
-           "cuLaunchKernel");
+    if (launch(leaves, count, grid, args) != 0) {
+        goto fail;
     }
-    /* synchronous: it waits for the kernels */
+    /* synchronous: it waits for the kernels (the default stream joins the streams) */
     if (copy_planes(planes, point_start, point_count, FLAGS, COPY_BACK, 0) != 0) {
         goto fail;
     }
