@@ -555,6 +555,11 @@ fn runner_errors() {
     assert_eq!(out.status.code(), Some(2));
     let out = run(&["runner", "--cc"]);
     assert_eq!(out.status.code(), Some(2));
+    // one kind of SIMD kernels
+    let out = run(&["runner", "--simd512", "--simd", "--execution", "top", d]);
+    assert_eq!(out.status.code(), Some(2));
+    let e = String::from_utf8(out.stderr).unwrap();
+    assert!(e.contains("exclude each other"), "{}", e);
     let out = run(&["runner", "--execution", "top", d]);
     assert_eq!(out.status.code(), Some(1));
     let e = String::from_utf8(out.stderr).unwrap();

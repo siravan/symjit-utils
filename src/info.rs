@@ -270,7 +270,10 @@ fn target(config: &Config) -> String {
 fn host() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512f") {
+        // symjit's AVX code also needs FMA3 (since 2.28.2): without it, the SSE code runs
+        if !is_x86_feature_detected!("fma") {
+            "x86-64 with SSE only (no FMA3)"
+        } else if is_x86_feature_detected!("avx512f") {
             "x86-64 with AVX-512"
         } else if is_x86_feature_detected!("avx2") {
             "x86-64 with AVX2"
@@ -328,6 +331,7 @@ const OPTION_BITS: &[(&str, u32)] = &[
     ("debug_topology", 0x1000_0000),
     ("debug_instructions", 0x2000_0000),
     ("coroutines", 0x4000_0000),
+    ("ultra", 0x8000_0000),
 ];
 const FIELD_BITS: u32 = 0x0000_0f00 | 0x0600_0000;
 

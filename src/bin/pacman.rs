@@ -251,8 +251,13 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             ("runner", "--process") => process = Some(value(arg)?),
             ("runner", "--cc") => cc = value(arg)?,
             ("runner", "--no-build") => build = false,
-            ("runner", "--simd") => lanes = 4,
-            ("runner", "--simd512") => lanes = 8,
+            ("runner", "--simd" | "--simd512") => {
+                let l = if arg == "--simd" { 4 } else { 8 };
+                if lanes != 1 && lanes != l {
+                    return Err("`--simd` and `--simd512` exclude each other".into());
+                }
+                lanes = l;
+            }
             ("runner", "--cuda") => {
                 cuda.get_or_insert_with(Vec::new);
             }
