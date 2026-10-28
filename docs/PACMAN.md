@@ -435,10 +435,19 @@ toolkit but running needs only the driver. It uses the primary context of device
 leaves' modules. Per call:
 - it keeps a device arena of all planes, `ld` = the points rounded up to 32, grown when a call
   needs more;
-- it copies in the planes the leaves read before writing them;
+- it copies in the planes the leaves read before writing them (RustiCol writes those before the
+  call: sources, momenta, parameters, the zero plane);
 - it runs the leaves in order, one thread per point;
-- it copies back every plane they write (amplitudes and currents, so recordings stay complete,
-  and planes the call does not write, such as cleared inactive amplitudes, are left alone).
+- it copies back the **amplitude planes** the leaves write: RustiCol reduces only those, and the
+  currents are scratch within a call. Planes the call does not write, such as cleared inactive
+  amplitudes, are left alone.
+
+The host's current planes therefore keep stale values after a call. RustiCol never reads them:
+a schedule reads only planes RustiCol writes before the call, and its arena reuses planes across
+currents (a source's plane can later hold a leaf's output), so the host must stay the authority
+for everything a call reads first. `PACMAN_RUNNER_COPY_BACK=all` copies back every written plane,
+as before; so does `PACMAN_SAVE_ARENA` (a recording must hold the currents) and the `runner`
+executable (its arenas are checked whole).
 
 Copies are 2D copies over runs of equally spaced host planes, a few per region.
 `PACMAN_RUNNER_STATS=1` prints calls, points, copies and time when the library is unloaded.

@@ -698,6 +698,8 @@ done:
 
 int main(int argc, char **argv) {
     int whole = 0, poison = 1, i = 1;
+    /* a CUDA runner: the arenas written must be complete, currents included */
+    setenv("PACMAN_RUNNER_COPY_BACK", "all", 1);
     for (; i < argc && argv[i][0] == '-'; i++) {
         if (strcmp(argv[i], "--whole") == 0) {
             whole = 1;
@@ -880,6 +882,7 @@ enum { CU_MEMORYTYPE_HOST = 1, CU_MEMORYTYPE_DEVICE = 2 };
 #define BLOCK 128u
 #define READ_FIRST 1u
 #define WRITTEN 2u
+#define COPY_BACK 4u /* written and copied back */
 
 static struct {
     int state; /* 0: not opened yet, 1: ready, -1: failed */
@@ -889,6 +892,7 @@ static struct {
     CUfunction functions[NUM_LEAVES];
     CUdeviceptr arena; /* NUM_PLANES planes of `ld` points */
     size_t ld;
+    int copy_all; /* PACMAN_RUNNER_COPY_BACK=all or PACMAN_SAVE_ARENA: every written plane */
     struct {
         CUresult (*Init)(unsigned);
         CUresult (*DeviceGet)(CUdevice *, int);
@@ -950,24 +954,24 @@ static void report(const char *step, CUresult r) {
         }                           \
     } while (0)
 
-/* copies the planes with `flag` between the host planes (points start .. start + count) and
-   the device arena, a run of equally spaced host planes in one 2D copy */
-static int copy_planes(double *const *planes, uint32_t start, uint32_t count, unsigned char flag,
-                       int to_device) {
+/* copies the planes with `flag` in `flags` between the host planes (points start .. start +
+   count) and the device arena, a run of equally spaced host planes in one 2D copy */
+static int copy_planes(double *const *planes, uint32_t start, uint32_t count,
+                       const unsigned char *flags, unsigned char flag, int to_device) {
     size_t bytes = (size_t)count * sizeof(double);
     uint32_t p = 0;
     while (p < NUM_PLANES) {
-        if (!(FLAGS[p] & flag)) {
+        if (!(flags[p] & flag)) {
             p++;
             continue;
         }
         uint32_t q = p + 1;
         ptrdiff_t pitch = (ptrdiff_t)bytes;
-        if (q < NUM_PLANES && (FLAGS[q] & flag)) {
+        if (q < NUM_PLANES && (flags[q] & flag)) {
             ptrdiff_t d = (char *)planes[q] - (char *)planes[p];
             if (d >= (ptrdiff_t)bytes) {
                 pitch = d;
-                while (q < NUM_PLANES && (FLAGS[q] & flag) &&
+                while (q < NUM_PLANES && (flags[q] & flag) &&
                        (char *)planes[q] - (char *)planes[q - 1] == pitch) {
                     q++;
                 }
@@ -1013,6 +1017,10 @@ static int cuda_open(void) {
     G.state = -1;
     const char *stats = getenv("PACMAN_RUNNER_STATS");
     STATS.on = stats != NULL && stats[0] != '\0' && strcmp(stats, "0") != 0;
+    const char *copy_back = getenv("PACMAN_RUNNER_COPY_BACK");
+    const char *capture = getenv("PACMAN_SAVE_ARENA");
+    G.copy_all = (copy_back != NULL && strcmp(copy_back, "all") == 0) ||
+                 (capture != NULL && capture[0] != '\0');
     G.lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
     if (G.lib == NULL) {
         fprintf(stderr, "pacman runner: cannot open libcuda.so.1: %s\n", dlerror());
@@ -1086,7 +1094,9 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
         return PACMAN_RUNNER_DEVICE_ERROR;
     }
 
-    /* the planes to copy in (read before the leaves write them) and out (written) */
+    /* the planes to copy in (read before the leaves write them: RustiCol writes them before the
+       call) and out (written; by default only the amplitudes, which RustiCol reduces; the
+       currents are scratch) */
     memset(FLAGS, 0, sizeof FLAGS);
     for (uint32_t k = 0; k < count; k++) {
         uint32_t leaf = leaves == NULL ? k : leaves[k];
@@ -1096,6 +1106,14 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
         }
         for (uint32_t i = LEAF_INPUTS[leaf]; i < LEAF_INPUTS[leaf] + LEAF_OUTPUTS[leaf]; i++) {
             FLAGS[map[i]] |= WRITTEN;
+        }
+    }
+    uint32_t amplitudes = METADATA.regions[PACMAN_AMPLITUDE_RE][0];
+    uint32_t amplitudes_end =
+        METADATA.regions[PACMAN_AMPLITUDE_IM][0] + METADATA.regions[PACMAN_AMPLITUDE_IM][1];
+    for (uint32_t p = 0; p < NUM_PLANES; p++) {
+        if ((FLAGS[p] & WRITTEN) && (G.copy_all || (p >= amplitudes && p < amplitudes_end))) {
+            FLAGS[p] |= COPY_BACK;
         }
     }
 
@@ -1113,7 +1131,7 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
         CU(G.cu.MemAlloc(&G.arena, (size_t)NUM_PLANES * ld * sizeof(double)), "cuMemAlloc (the arena)");
         G.ld = ld;
     }
-    if (copy_planes(planes, point_start, point_count, READ_FIRST, 1) != 0) {
+    if (copy_planes(planes, point_start, point_count, FLAGS, READ_FIRST, 1) != 0) {
         goto fail;
     }
     unsigned long long n = point_count, stride = G.ld;
@@ -1126,7 +1144,7 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
            "cuLaunchKernel");
     }
     /* synchronous: it waits for the kernels */
-    if (copy_planes(planes, point_start, point_count, WRITTEN, 0) != 0) {
+    if (copy_planes(planes, point_start, point_count, FLAGS, COPY_BACK, 0) != 0) {
         goto fail;
     }
     G.cu.CtxPopCurrent(&previous);
@@ -1638,14 +1656,22 @@ int main(int argc, char **argv) {
             assert!(recording::compare(&got, &want, 9).is_empty(), "{:?}", args);
         }
 
-        // through dlopen, as RustiCol loads it: argument errors, then two calls
-        let out = Command::new(dir.join("dltest"))
-            .args(["./librunner.so", "t.e0.r0.pre", "9", "out/dl.arena"])
-            .current_dir(&dir)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "dltest: {:?}", out.status.code());
-        let got = recording::read_f64s(&dir.join("out/dl.arena"), 12 * 9).unwrap();
+        // through dlopen, as RustiCol loads it: argument errors, then two calls; with
+        // PACMAN_RUNNER_COPY_BACK=all every written plane comes back
+        let dltest = |copy_back: Option<&str>| {
+            let mut command = Command::new(dir.join("dltest"));
+            command
+                .args(["./librunner.so", "t.e0.r0.pre", "9", "out/dl.arena"])
+                .current_dir(&dir)
+                .env_remove("PACMAN_RUNNER_COPY_BACK")
+                .env_remove("PACMAN_SAVE_ARENA");
+            if let Some(value) = copy_back {
+                command.env("PACMAN_RUNNER_COPY_BACK", value);
+            }
+            let out = command.output().unwrap();
+            assert!(out.status.success(), "dltest: {:?}", out.status.code());
+            recording::read_f64s(&dir.join("out/dl.arena"), 12 * 9).unwrap()
+        };
         let plain = replay::Options {
             poison: false,
             ..scalar
@@ -1653,7 +1679,10 @@ int main(int argc, char **argv) {
         let want = replay::replay(&rec, &spec.calls, &ks, &plain)
             .unwrap()
             .arena;
-        assert!(recording::compare(&got, &want, 9).is_empty());
+        assert!(recording::compare(&dltest(Some("all")), &want, 9).is_empty());
+        // by default only amplitude planes come back, and this arena has none: the host's
+        // currents keep their values
+        assert!(recording::compare(&dltest(None), &pre, 9).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
