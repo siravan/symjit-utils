@@ -10,6 +10,9 @@
 //! - `runner.c` holds the execution: per leaf the arena planes of its descriptor table (the
 //!   `.mapping` rows: inputs, then outputs, in the numbering of `bindings::Arena`), the leaf
 //!   order, the current map compiled in, and `pacman_runner_v1_run`.
+//! - `--simd`: the kernels are AVX2 SIMD kernels instead (`SavedModel::object_simd`, 4 points per
+//!   call, `simd_branch` on, no scalar kernel); the runner takes point ranges of multiples of 8 and
+//!   runs every leaf on blocks of `PACMAN_RUNNER_BLOCK` points (default 64) at a time.
 //! - `main.c` reads recordings (`NAME.json`, `NAME.pre`), runs their schedules per recorded tile
 //!   and writes the arena as `NAME.arena` (the layout of `.post`), for `pacman replay
 //!   --against`.
@@ -94,8 +97,14 @@ impl Spec {
 }
 
 /// The kernels of `spec` as object files: one per distinct kernel (`pacman_kernel_<k>`), and
-/// for each leaf the index of its kernel. `members` maps member paths to their bytes.
-pub fn objects(spec: &Spec, members: &HashMap<&str, &[u8]>) -> Result<(Vec<Vec<u8>>, Vec<usize>)> {
+/// for each leaf the index of its kernel. `members` maps member paths to their bytes. With
+/// `simd`, the kernels are AVX2 SIMD kernels (`SavedModel::object_simd`, 4 points per call)
+/// instead of scalar ones.
+pub fn objects(
+    spec: &Spec,
+    members: &HashMap<&str, &[u8]>,
+    simd: bool,
+) -> Result<(Vec<Vec<u8>>, Vec<usize>)> {
     let mut objects = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
     let mut of_leaf = Vec::new();
@@ -131,10 +140,14 @@ pub fn objects(spec: &Spec, members: &HashMap<&str, &[u8]>) -> Result<(Vec<Vec<u
         }
         let k = objects.len();
         let target = model.object_target("")?;
-        let object = model
-            .object(&format!("pacman_kernel_{}", k), target)
-            .and_then(|o| o.build())
-            .with_context(|| format!("cannot compile `{}` into an object", call.member))?;
+        let name = format!("pacman_kernel_{}", k);
+        let object = if simd {
+            model.object_simd(&name, target)
+        } else {
+            model.object(&name, target)
+        }
+        .and_then(|o| o.build())
+        .with_context(|| format!("cannot compile `{}` into an object", call.member))?;
         objects.push(object);
         index.insert(&call.member, k);
         of_leaf.push(k);
@@ -292,8 +305,9 @@ fn tables_c(spec: &Spec) -> String {
     s
 }
 
-/// `runner.c`: the execution `spec` with the kernels `of_leaf` (from `objects`).
-pub fn runner_c(spec: &Spec, of_leaf: &[usize], kernels: usize) -> String {
+/// `runner.c`: the execution `spec` with the kernels `of_leaf` (from `objects`); `simd`: they
+/// are SIMD kernels (4 points per call).
+pub fn runner_c(spec: &Spec, of_leaf: &[usize], kernels: usize, simd: bool) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -323,6 +337,7 @@ pub fn runner_c(spec: &Spec, of_leaf: &[usize], kernels: usize) -> String {
         let _ = writeln!(s, "    pacman_kernel_{},", k);
     }
     s.push_str("};\n\n");
+    let _ = writeln!(s, "#define LANES {}\n", if simd { 4 } else { 1 });
     s.push_str(RUN_C);
     s
 }
@@ -332,7 +347,49 @@ const RUN_C: &str = r#"const pacman_runner_metadata *pacman_runner_v1_metadata(v
     return &METADATA;
 }
 
-/* the scalar kernel of `leaf` on each point of start..stop */
+#if LANES > 1
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* PACMAN_RUNNER_STATS=1: calls, points and time, printed when the library is unloaded */
+static struct {
+    int on;
+    unsigned long long calls, points;
+    double seconds;
+} STATS;
+
+static double now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + 1e-9 * t.tv_nsec;
+}
+
+__attribute__((destructor)) static void print_stats(void) {
+    if (STATS.on && STATS.calls > 0) {
+        fprintf(stderr, "pacman runner (%s of %s): %llu calls, %llu points, %.3f s (%.2f us/point)\n",
+                METADATA.execution, METADATA.process, STATS.calls, STATS.points, STATS.seconds,
+                1e6 * STATS.seconds / STATS.points);
+    }
+}
+
+/* whether the CPU runs the SIMD kernels (AVX2 and FMA), checked once */
+static int cpu_ok(void) {
+    static int state; /* 0: not checked, 1: yes, -1: no */
+    if (state == 0) {
+        __builtin_cpu_init();
+        state = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") ? 1 : -1;
+        if (state < 0) {
+            fprintf(stderr, "pacman runner (%s of %s): this CPU has no AVX2 and FMA\n",
+                    METADATA.execution, METADATA.process);
+        }
+    }
+    return state > 0;
+}
+#endif
+
+/* the kernel of `leaf` on the points start..stop, LANES points per call */
 static int run_leaf(uint32_t leaf, double *const *planes, uint32_t start, uint32_t stop) {
     symjit_slice table[MAX_TABLE];
     const uint32_t *map = LEAF_PLANES[leaf];
@@ -342,7 +399,7 @@ static int run_leaf(uint32_t leaf, double *const *planes, uint32_t start, uint32
         table[i].len = stop;
     }
     kernel_fn kernel = LEAF_KERNELS[leaf];
-    for (uint32_t point = start; point < stop; point++) {
+    for (uint32_t point = start; point < stop; point += LANES) {
         if (kernel(NULL, table, point, NULL) != 0) {
             return PACMAN_RUNNER_KERNEL_STATUS;
         }
@@ -367,13 +424,43 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
             return PACMAN_RUNNER_BAD_ARGUMENTS;
         }
     }
-    for (uint32_t k = 0; k < count; k++) {
-        int status = run_leaf(leaves == NULL ? k : leaves[k], planes, point_start,
-                              point_start + point_count);
-        if (status != PACMAN_RUNNER_OK) {
-            return status;
+#if LANES > 1
+    /* SIMD kernels only: whole blocks of 8 points */
+    if (point_start % 8 != 0 || point_count % 8 != 0) {
+        return PACMAN_RUNNER_BAD_ARGUMENTS;
+    }
+    if (!cpu_ok()) {
+        return PACMAN_RUNNER_DEVICE_ERROR;
+    }
+    /* every leaf on a block of points at a time, so that the block's planes stay in the
+       cache (PACMAN_RUNNER_BLOCK points, a multiple of 8, default 64) */
+    static uint32_t block;
+    if (block == 0) {
+        const char *env = getenv("PACMAN_RUNNER_BLOCK");
+        uint32_t b = env != NULL ? (uint32_t)strtoul(env, NULL, 10) : 64;
+        block = b < 8 ? 8 : b / 8 * 8;
+        const char *stats = getenv("PACMAN_RUNNER_STATS");
+        STATS.on = stats != NULL && stats[0] != '\0' && strcmp(stats, "0") != 0;
+    }
+    double started = now();
+#else
+    uint32_t block = point_count;
+#endif
+    uint32_t stop = point_start + point_count;
+    for (uint32_t first = point_start; first < stop; first += block) {
+        uint32_t last = stop - first < block ? stop : first + block;
+        for (uint32_t k = 0; k < count; k++) {
+            int status = run_leaf(leaves == NULL ? k : leaves[k], planes, first, last);
+            if (status != PACMAN_RUNNER_OK) {
+                return status;
+            }
         }
     }
+#if LANES > 1
+    STATS.calls++;
+    STATS.points += point_count;
+    STATS.seconds += now() - started;
+#endif
     return PACMAN_RUNNER_OK;
 }
 "#;
@@ -401,9 +488,11 @@ extern "C" {
 
 /* status codes of pacman_runner_v1_run */
 #define PACMAN_RUNNER_OK 0
-#define PACMAN_RUNNER_BAD_ARGUMENTS 1   /* counts, null pointers, leaf indices, point range */
+#define PACMAN_RUNNER_BAD_ARGUMENTS 1   /* counts, null pointers, leaf indices, point range (a
+                                           SIMD runner: start and count multiples of 8) */
 #define PACMAN_RUNNER_KERNEL_STATUS 2   /* a kernel returned a nonzero status */
-#define PACMAN_RUNNER_DEVICE_ERROR 3    /* the GPU (a CUDA runner): see standard error */
+#define PACMAN_RUNNER_DEVICE_ERROR 3    /* the GPU (a CUDA runner) or a CPU without AVX2 (a SIMD
+                                           runner): see standard error */
 
 /* the arena's regions, in order (the indices of `regions`) */
 enum {
@@ -747,7 +836,13 @@ pub fn makefile(kernels: usize) -> String {
 
 /// Writes the runner of `spec` into `dir`: `kernels/k<k>.o`, `runner.c`, `pacman_runner.h`,
 /// `main.c`, `Makefile`.
-pub fn write(dir: &Path, spec: &Spec, objects: &[Vec<u8>], of_leaf: &[usize]) -> Result<()> {
+pub fn write(
+    dir: &Path,
+    spec: &Spec,
+    objects: &[Vec<u8>],
+    of_leaf: &[usize],
+    simd: bool,
+) -> Result<()> {
     let write = |name: &str, bytes: &[u8]| -> Result<()> {
         let path = dir.join(name);
         if let Some(parent) = path.parent() {
@@ -761,7 +856,7 @@ pub fn write(dir: &Path, spec: &Spec, objects: &[Vec<u8>], of_leaf: &[usize]) ->
     }
     write(
         "runner.c",
-        runner_c(spec, of_leaf, objects.len()).as_bytes(),
+        runner_c(spec, of_leaf, objects.len(), simd).as_bytes(),
     )?;
     write("pacman_runner.h", RUNNER_H.as_bytes())?;
     write("main.c", MAIN_C.as_bytes())?;
@@ -1536,6 +1631,94 @@ int main(int argc, char **argv) {
            "leaves": [{"leaf": 0, "application_path": "evaluators/b.plane.symjit"}]}]}"#;
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd_runner_reproduces_the_replay() {
+        if !have_cc() || !std::is_x86_feature_detected!("avx2") {
+            eprintln!("no C compiler (cc) or no AVX2: the SIMD runner is not built");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pacman-simd-runner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        let (a, b) = (
+            plane_application(PRODUCT_PLUS_ONE),
+            plane_application(SQUARE_MINUS),
+        );
+        let spec = spec();
+        let members: HashMap<&str, &[u8]> = [
+            (spec.calls[0].member.as_str(), &a[..]),
+            (spec.calls[1].member.as_str(), &b[..]),
+        ]
+        .into_iter()
+        .collect();
+        let (objects, of_leaf) = objects(&spec, &members, true).unwrap();
+        write(&dir, &spec, &objects, &of_leaf, true).unwrap();
+        build(&dir, "cc", objects.len()).unwrap();
+
+        // the recording of `runner_reproduces_the_scalar_replay` on 16 points, in tiles of 8
+        let n = 16;
+        let json = dir.join("t.e0.r0.json");
+        let text = RECORDING
+            .replace("\"num_points\": 9", "\"num_points\": 16")
+            .replace("\"tiles\": [5, 4]", "\"tiles\": [8, 8]");
+        std::fs::write(&json, text).unwrap();
+        let mut pre = vec![7.0; 12 * n];
+        for p in [0, 1, 5, 6, 10] {
+            for i in 0..n {
+                pre[p * n + i] = ((p * n + i) as f64 * 0.37).sin();
+            }
+        }
+        pre[11 * n..12 * n].fill(0.0);
+        let bytes: Vec<u8> = pre.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(json.with_extension("pre"), &bytes).unwrap();
+        std::fs::write(json.with_extension("post"), &bytes).unwrap();
+        let rec = Recording::read(&json).unwrap();
+        let kernels = [
+            CpuKernel::load("a", &a).unwrap(),
+            CpuKernel::load("b", &b).unwrap(),
+        ];
+        let ks: Vec<&CpuKernel> = kernels.iter().collect();
+        let want = replay::replay(&rec, &spec.calls, &ks, &replay::Options::default())
+            .unwrap()
+            .arena;
+        assert!(want[3 * n..4 * n].iter().all(|x| x.is_finite()));
+
+        for args in [&["out"][..], &["--whole", "out"][..]] {
+            let out = Command::new(dir.join("runner"))
+                .args(args)
+                .arg(&json)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let got = recording::read_f64s(&dir.join("out/t.e0.r0.arena"), 12 * n).unwrap();
+            assert!(recording::compare(&got, &want, n).is_empty(), "{:?}", args);
+        }
+
+        // a point range that is not a multiple of 8 is refused
+        let text = RECORDING.replace("\"tiles\": [5, 4]", "\"tiles\": [9]");
+        std::fs::write(&json, text).unwrap();
+        let mut pre9 = vec![0.0; 12 * 9];
+        for p in 0..12 {
+            pre9[p * 9..p * 9 + 9].copy_from_slice(&pre[p * n..p * n + 9]);
+        }
+        let bytes: Vec<u8> = pre9.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(json.with_extension("pre"), &bytes).unwrap();
+        let out = Command::new(dir.join("runner"))
+            .args(["out"])
+            .arg(&json)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn runner_reproduces_the_scalar_replay() {
         if !have_cc() {
             eprintln!("no C compiler (cc): the runner is not built");
@@ -1555,9 +1738,9 @@ int main(int argc, char **argv) {
         ]
         .into_iter()
         .collect();
-        let (objects, of_leaf) = objects(&spec, &members).unwrap();
+        let (objects, of_leaf) = objects(&spec, &members, false).unwrap();
         assert_eq!(of_leaf, vec![0, 1]);
-        write(&dir, &spec, &objects, &of_leaf).unwrap();
+        write(&dir, &spec, &objects, &of_leaf, false).unwrap();
         build(&dir, "cc", objects.len()).unwrap();
 
         // a recording: sources in current planes 0, 1 (re 0, 1, im 5, 6) and the momentum
@@ -1815,14 +1998,14 @@ int main(int argc, char **argv) {
         spec.calls[0].outputs.push(4);
         let member = spec.calls[0].member.clone();
         let members: HashMap<&str, &[u8]> = [(member.as_str(), &a[..])].into_iter().collect();
-        let err = format!("{:#}", objects(&spec, &members).unwrap_err());
+        let err = format!("{:#}", objects(&spec, &members, false).unwrap_err());
         assert!(
             err.contains("a table of 4 input and 3 output planes"),
             "{}",
             err
         );
         spec.calls[0].member = "missing".into();
-        assert!(objects(&spec, &members).is_err());
+        assert!(objects(&spec, &members, false).is_err());
     }
 
     #[test]
