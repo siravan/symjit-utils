@@ -435,11 +435,22 @@ leaf on one block, then the next, so the block's planes stay in the cache. `PACM
 prints calls, points, threads and time when the library is unloaded.
 
 `PACMAN_RUNNER_THREADS=N` (default 1, at most 256) splits the points of a call over up to N
-threads (pthreads, started per call with 16 MiB stacks): contiguous ranges of whole 8-point groups,
-at least `PACMAN_RUNNER_BLOCK` points each, so a call of fewer than two blocks stays on the calling
-thread. The calling thread runs the first range; a thread that cannot be started has its range run
-there too. The values do not depend on the threads (every point is computed by the same kernel
-calls). The runner expects one caller at a time, as RustiCol calls it.
+threads (pthreads, started per call): contiguous ranges of whole 8-point groups, at least
+`PACMAN_RUNNER_BLOCK` points each, so a call of fewer than two blocks runs as one range. The values
+do not depend on the threads (every point is computed by the same kernel calls).
+
+Stacks: `pacman` records the largest stack a kernel reserves (`KERNEL_STACK` in `runner.c`, the
+sum of the kernel's `sub rsp`s; 111 KB for the Z+6g AVX-512 kernels). A thread that runs kernels
+needs that and 256 KiB for the C library's math functions and the runner (`STACK_NEEDED`). Worker
+threads get `STACK_NEEDED`, at least 1 MiB. The calling thread runs the first range only if its own
+stack has `STACK_NEEDED` bytes left below the runner's frame (`pthread_getattr_np`); otherwise that
+range runs on a worker too, even when it is the only one, so a caller with a small stack (e.g. a
+128 KiB thread, where the runner of PR #6 crashed) is safe. A range whose thread cannot be started
+runs on the caller.
+
+Calls may come from several threads at once: the settings and the CPU check are read once
+(`pthread_once`), the `PACMAN_RUNNER_STATS` counters are updated under a mutex, and every call
+keeps its ranges on its own stack. Each concurrent call starts its own threads.
 
 Threads (2026-10-28, the same machine and artifact, AVX-512, `profile`, one flow; µs/point, the
 runner alone from `PACMAN_RUNNER_STATS` in brackets):

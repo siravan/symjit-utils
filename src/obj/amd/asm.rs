@@ -11,6 +11,9 @@ pub enum RoundingMode {
 pub struct Amd {
     pub a: Assembler,
     pub dtype: DataType,
+    /// the bytes of all `sub_rsp`s: at least the stack the code reserves (prologues; pushes,
+    /// alignment and calls are extra)
+    pub reserved: usize,
 }
 
 #[allow(dead_code)]
@@ -19,6 +22,7 @@ impl Amd {
         Amd {
             a: Assembler::new(),
             dtype,
+            reserved: 0,
         }
     }
 
@@ -1431,6 +1435,7 @@ impl Amd {
     }
 
     pub fn sub_rsp(&mut self, imm: u32) {
+        self.reserved += imm as usize;
         self.append_bytes(&[0x48, 0x81, 0xec]);
         self.append_word(imm);
     }

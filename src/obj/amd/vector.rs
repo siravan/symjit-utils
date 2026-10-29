@@ -957,4 +957,9 @@ impl AmdVectorF64x4Generator {
     pub fn relocations(&self) -> Vec<(usize, String)> {
         self.amd.a.relocations.clone()
     }
+
+    /// The stack the code reserves, in bytes (see `Amd::reserved`).
+    pub fn reserved_stack(&self) -> usize {
+        self.amd.reserved
+    }
 }
