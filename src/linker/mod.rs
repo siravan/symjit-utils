@@ -126,6 +126,9 @@ pub struct ObjectBuilder {
     pub code: Vec<u8>,
     pub functions: Vec<Function>,
     pub relocations: Vec<Relocation>,
+    /// The stack its functions reserve, in bytes, where the generator reports it (the SIMD
+    /// kernels of `SavedModel::object_simd`); 0 otherwise.
+    pub stack: usize,
 }
 
 impl ObjectBuilder {
@@ -135,6 +138,7 @@ impl ObjectBuilder {
             code: Vec::new(),
             functions: Vec::new(),
             relocations: Vec::new(),
+            stack: 0,
         }
     }
 

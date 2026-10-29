@@ -1016,8 +1016,9 @@ fn runner(args: &Runner) -> Result<()> {
         return cuda_runner(args, &spec, &members, &dir, sms);
     }
     let start = std::time::Instant::now();
-    let (objects, of_leaf) = symjit_utils::runner::objects(&spec, &members, args.lanes)?;
-    symjit_utils::runner::write(&dir, &spec, &objects, &of_leaf, args.lanes)?;
+    let kernels = symjit_utils::runner::objects(&spec, &members, args.lanes)?;
+    symjit_utils::runner::write(&dir, &spec, &kernels)?;
+    let objects = &kernels.objects;
     let code: usize = objects.iter().map(Vec::len).sum();
     eprintln!(
         "pacman: wrote the {}runner of {} of {} to {}: {} leaves, {} kernel object{} ({} bytes) in {:.2} s",

@@ -201,21 +201,22 @@ impl SavedModel {
         } else {
             lower_for_object(&self.mir, &mut prog)?
         };
-        let (code, relocs) = match lanes {
+        let (code, relocs, stack) = match lanes {
             4 => {
                 let mut g = AmdVectorF64x4Generator::new(config);
                 compile(&mir, &mut prog, &mut g, None)?;
-                (g.bytes(), g.relocations())
+                (g.bytes(), g.relocations(), g.reserved_stack())
             }
             8 => {
                 let mut g = AmdVectorF64x8Generator::new(config);
                 compile(&mir, &mut prog, &mut g, None)?;
-                (g.bytes(), g.relocations())
+                (g.bytes(), g.relocations(), g.reserved_stack())
             }
             _ => return Err(anyhow!("SIMD object kernels have 4 or 8 lanes, not {}", lanes)),
         };
         let mut obj = ObjectBuilder::new(target);
         obj.add_function(name, &code, &relocations(relocs))?;
+        obj.stack = stack;
         Ok(obj)
     }
 
