@@ -56,6 +56,7 @@ r/runner out arena/*.json && pacman replay --scalar --against out artifacts/qq_z
 | `--sm LIST` | runner | The GPUs' SM numbers, e.g. `80,90,120` (implies `--cuda`; default: the local GPU's). |
 | `--jobs N` | runner | `ptxas` runs at a time (default: the CPUs). |
 | `--f32` | runner | f32 CUDA kernels (with `--cuda`; below). |
+| `--fallback PCT` | runner | A hybrid runner (with `--cuda --f32`; below): its reductions rerun the PCT largest points (`1%` or `0.01`) and every non-finite one on the CPU in f64, with scalar kernels or those of `--simd`/`--simd512`. |
 | `--set KEY=VALUE` | runner | An option of the kernels' configuration (symjit's `set_option`, e.g. `stable_math=true`), set before they are compiled (CPU and CUDA runners); may be repeated. |
 
 `extract` selects the members whose paths match one of its MEMBER arguments (a path, or a
@@ -597,6 +598,31 @@ the f32 arena; after the leaves, it widens the planes to copy back into the f64 
 over PCIe are therefore the f64 runner's. The `runner` executable and the statistics (`, f32`)
 work as before. Results are not bit-equal to the CPU: the test compares the toy execution with the
 scalar replay within 1e-6. Accuracy and speed for Z+6g: `plans/pacman-ptx/F32.md`.
+
+**Hybrid runners (`--cuda --f32 --fallback PCT`).** An f32 CUDA runner whose reductions rerun
+their largest points on the CPU in f64 (`plans/pacman-ptx/HYBRID.md`). The library holds both:
+- `runner.c` (`#define HYBRID 1`): the f32 runner;
+- `cpu.c`: `pacman runner`'s CPU `runner.c` with its entry points renamed `pacman_cpu_v1_*`,
+  plus the CPU kernel objects (`kernels/k<k>.o`; scalar, or SIMD with `--simd`/`--simd512`).
+
+After the GPU reduction of a `pacman_runner_v1_run_reduce` call, it:
+- selects every point whose value is not finite, plus the ceil(PCT × count) largest finite values;
+- gathers their read-first planes from the host planes into a compact arena (padded to 8 points
+  for SIMD kernels);
+- runs the leaves and the reduction there with `pacman_cpu_v1_run_reduce`;
+- writes those values over the GPU's.
+
+A plain `pacman_runner_v1_run` (no reduction) reruns nothing.
+
+`PACMAN_RUNNER_FALLBACK` (`1%`, `0.01`; `0` reruns only non-finite values) overrides PCT. The CPU
+part runs blocks of 8 points on every online CPU (`PACMAN_RUNNER_BLOCK`, `PACMAN_RUNNER_THREADS`
+override this). `PACMAN_RUNNER_STATS=1` adds a line with the points rerun and their time; the CPU
+part prints its own line. Test `runner::tests::hybrid_runner_reruns_on_the_cpu`: with PCT 100%
+the values equal the CPU runner's bit for bit; with 0 only the point that overflows f32 is rerun.
+
+Results for Z+6g, one flow (`HYBRID.md` §8), at 16,384 points per call: a 1% cut brings the
+error of Σ|M|² from 5.2e-4 (f32) to 1.2e-7 at 1.55 µs/point, against 1.33 for f32 alone and 4.12
+for f64.
 
 A `pacman` RustiCol build loads runners with `PACMAN_RUNNER=LIB[:LIB...]`.
 Each compiled engine takes the library whose metadata matches it and calls it in place of its leaf

@@ -375,6 +375,12 @@ pub fn runner_c(spec: &Spec, kernels: &Kernels) -> String {
         "#define LANES {}\n#define KERNEL_STACK {}u /* the largest stack a kernel reserves */\n",
         kernels.lanes, kernels.stack
     );
+    s.push_str(
+        "/* SIMD kernels: PACMAN_RUNNER_BLOCK and PACMAN_RUNNER_THREADS when unset (a hybrid\n\
+         \x20  runner's cpu.c sets its own) */\n\
+         #ifndef DEFAULT_BLOCK\n#define DEFAULT_BLOCK 64u\n#endif\n\
+         #ifndef DEFAULT_THREADS\n#define DEFAULT_THREADS 1\n#endif\n\n",
+    );
     s.push_str(REDUCE_C);
     s.push_str(RUN_C);
     s
@@ -387,6 +393,7 @@ const RUN_C: &str = r#"const pacman_runner_metadata *pacman_runner_v1_metadata(v
 
 #if LANES > 1
 #include <pthread.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -447,14 +454,16 @@ static void setup(void) {
                 METADATA.process, needs);
     }
     /* every leaf on a block of points at a time, so that the block's planes stay in the
-       cache (PACMAN_RUNNER_BLOCK points, a multiple of 8, default 64, at most 2^20) */
+       cache (PACMAN_RUNNER_BLOCK points, a multiple of 8, default DEFAULT_BLOCK, at most 2^20) */
     const char *env = getenv("PACMAN_RUNNER_BLOCK");
-    uint32_t b = env != NULL ? (uint32_t)strtoul(env, NULL, 10) : 64;
+    uint32_t b = env != NULL ? (uint32_t)strtoul(env, NULL, 10) : DEFAULT_BLOCK;
     BLOCK = b < 8 ? 8 : b > (1u << 20) ? (1u << 20) : b / 8 * 8;
-    /* the points of a call split over PACMAN_RUNNER_THREADS threads (default 1) */
+    /* the points of a call split over PACMAN_RUNNER_THREADS threads (default DEFAULT_THREADS;
+       0: the online CPUs) */
     env = getenv("PACMAN_RUNNER_THREADS");
-    uint32_t t = env != NULL ? (uint32_t)strtoul(env, NULL, 10) : 1;
-    THREADS = t < 1 ? 1 : t > MAX_THREADS ? MAX_THREADS : t;
+    long t = env != NULL ? (long)strtoul(env, NULL, 10) : DEFAULT_THREADS;
+    if (t == 0) t = sysconf(_SC_NPROCESSORS_ONLN);
+    THREADS = t < 1 ? 1 : t > MAX_THREADS ? MAX_THREADS : (uint32_t)t;
     const char *stats = getenv("PACMAN_RUNNER_STATS");
     STATS.on = stats != NULL && stats[0] != '\0' && strcmp(stats, "0") != 0;
 }
@@ -1221,7 +1230,7 @@ pub fn build(dir: &Path, cc: &str, kernels: usize) -> Result<()> {
 /// leaves are single precision: the f64 planes RustiCol passes are copied as before into the f64
 /// device arena, converted into an f32 one for the leaves, and the planes copied back are
 /// converted back to f64 first (`CONVERT_PTX`).
-pub fn runner_cuda_c(spec: &Spec, f32: bool) -> String {
+pub fn runner_cuda_c(spec: &Spec, f32: bool, fallback: Option<(f64, u32)>) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -1245,6 +1254,16 @@ pub fn runner_cuda_c(spec: &Spec, f32: bool) -> String {
         s,
         "/* 1: the leaves are f32 kernels on an f32 copy of the arena */\n#define F32 {}\n",
         f32 as u8
+    );
+    let (fraction, lanes) = fallback.unwrap_or((0.0, 1));
+    let _ = writeln!(
+        s,
+        "/* 1: a hybrid runner, whose reductions rerun their largest points on the CPU (cpu.c),\n\
+         \x20  FALLBACK_DEFAULT of them (PACMAN_RUNNER_FALLBACK), with kernels of CPU_LANES points */\n\
+         #define HYBRID {}\n#define FALLBACK_DEFAULT {:?}\n#define CPU_LANES {}u\n",
+        fallback.is_some() as u8,
+        fraction,
+        lanes
     );
     s.push_str(&tables_c(spec));
     if f32 {
@@ -1587,6 +1606,20 @@ static struct {
     double seconds;
 } STATS;
 
+#if HYBRID
+/* the CPU reruns: the fraction of points, the selection, the compact arena of `cap` points */
+static struct {
+    double fraction;
+    uint32_t *order, *selected;
+    size_t points_cap;
+    double *arena, *values;
+    double *table[NUM_PLANES];
+    size_t cap;
+    unsigned long long points;
+    double seconds;
+} H;
+#endif
+
 static double now(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -1602,6 +1635,12 @@ __attribute__((destructor)) static void print_stats(void) {
                 STATS.points, STATS.reduced, STATS.copies,
                 STATS.bytes * 1e-6, G.num_streams, STATS.groups, STATS.seconds,
                 STATS.points ? 1e6 * STATS.seconds / STATS.points : 0.0);
+#if HYBRID
+        fprintf(stderr,
+                "pacman runner (%s of %s): %llu points rerun on the CPU in f64 (fallback %g%%), "
+                "%.3f s of the time above\n",
+                METADATA.execution, METADATA.process, H.points, 100.0 * H.fraction, H.seconds);
+#endif
     }
 }
 
@@ -1694,6 +1733,17 @@ static int cuda_open(void) {
     G.num_streams = streams != NULL ? (unsigned)strtoul(streams, NULL, 10) : 8;
     if (G.num_streams < 1) G.num_streams = 1;
     if (G.num_streams > MAX_STREAMS) G.num_streams = MAX_STREAMS;
+#if HYBRID
+    /* PACMAN_RUNNER_FALLBACK=F: a fraction (0.01) or a percentage (1%) */
+    H.fraction = FALLBACK_DEFAULT;
+    const char *fallback = getenv("PACMAN_RUNNER_FALLBACK");
+    if (fallback != NULL && fallback[0] != '\0') {
+        char *end;
+        double f = strtod(fallback, &end);
+        if (*end == '%') f /= 100.0;
+        H.fraction = f < 0.0 ? 0.0 : f > 1.0 ? 1.0 : f;
+    }
+#endif
     G.lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
     if (G.lib == NULL) {
         fprintf(stderr, "pacman runner: cannot open libcuda.so.1: %s\n", dlerror());
@@ -1867,6 +1917,104 @@ fail:
     return -1;
 }
 
+#if HYBRID
+/* the f64 CPU runner (cpu.c: `pacman runner`'s runner.c with its entry points renamed) */
+int pacman_cpu_v1_run_reduce(double *const *planes, uint32_t num_planes,
+                             const uint32_t *leaves, uint32_t num_leaves, uint32_t point_start,
+                             uint32_t point_count, const pacman_runner_reduction *reduction,
+                             double *out);
+
+static const double *SORT_VALUES;
+
+/* descending values, then ascending indices */
+static int by_value(const void *a, const void *b) {
+    uint32_t i = *(const uint32_t *)a, j = *(const uint32_t *)b;
+    double x = SORT_VALUES[i], y = SORT_VALUES[j];
+    if (x > y) return -1;
+    if (x < y) return 1;
+    return (i > j) - (i < j);
+}
+
+/* the points of `values` (n) to rerun, into H.selected: every point whose value is not finite,
+   then the ceil(fraction x n) largest finite values; their number */
+static uint32_t select_points(const double *values, uint32_t n) {
+    if (n > H.points_cap) {
+        free(H.order);
+        free(H.selected);
+        H.order = malloc((size_t)n * sizeof *H.order);
+        H.selected = malloc((size_t)n * sizeof *H.selected);
+        H.points_cap = H.order != NULL && H.selected != NULL ? n : 0;
+        if (H.points_cap == 0) return UINT32_MAX;
+    }
+    uint32_t count = 0, finite = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (values[i] - values[i] != 0.0) {
+            H.selected[count++] = i; /* NaN or infinite */
+        } else {
+            H.order[finite++] = i;
+        }
+    }
+    double want = H.fraction * n;
+    uint32_t k = (uint32_t)want;
+    if (k < want) k++;
+    if (k > finite) k = finite;
+    if (k > 0) {
+        SORT_VALUES = values;
+        qsort(H.order, finite, sizeof *H.order, by_value);
+        memcpy(H.selected + count, H.order, (size_t)k * sizeof *H.order);
+        count += k;
+    }
+    return count;
+}
+
+/* reruns the selected points of the call on the CPU in f64 and writes their values into `out`:
+   their planes read first are gathered from the host planes (still those RustiCol wrote: only
+   amplitudes, written by the leaves, are copied back, and after this) into a compact arena */
+static int rerun_on_cpu(double *const *planes, const uint32_t *leaves, uint32_t num_leaves,
+                        uint32_t point_start, uint32_t point_count,
+                        const pacman_runner_reduction *reduction, double *out) {
+    uint32_t n = select_points(out, point_count);
+    if (n == UINT32_MAX) {
+        fprintf(stderr, "pacman runner: out of memory\n");
+        return PACMAN_RUNNER_DEVICE_ERROR;
+    }
+    if (n == 0) return PACMAN_RUNNER_OK;
+    double started = now();
+    /* SIMD kernels: whole blocks of 8, padded with the last point */
+    uint32_t padded = CPU_LANES > 1 ? (n + 7) / 8 * 8 : n;
+    if (padded > H.cap) {
+        free(H.arena);
+        free(H.values);
+        H.arena = malloc((size_t)NUM_PLANES * padded * sizeof(double));
+        H.values = malloc((size_t)padded * sizeof(double));
+        H.cap = H.arena != NULL && H.values != NULL ? padded : 0;
+        if (H.cap == 0) {
+            fprintf(stderr, "pacman runner: out of memory\n");
+            return PACMAN_RUNNER_DEVICE_ERROR;
+        }
+    }
+    for (uint32_t p = 0; p < NUM_PLANES; p++) {
+        H.table[p] = H.arena + (size_t)p * padded;
+        if (!(FLAGS[p] & READ_FIRST)) continue;
+        const double *from = planes[p] + point_start;
+        for (uint32_t j = 0; j < padded; j++) {
+            H.table[p][j] = from[H.selected[j < n ? j : n - 1]];
+        }
+    }
+    int status = pacman_cpu_v1_run_reduce(H.table, NUM_PLANES, leaves, num_leaves, 0, padded,
+                                          reduction, H.values);
+    if (status != PACMAN_RUNNER_OK) {
+        fprintf(stderr, "pacman runner (%s of %s): the CPU rerun returned status %d\n",
+                METADATA.execution, METADATA.process, status);
+        return status;
+    }
+    for (uint32_t j = 0; j < n; j++) out[H.selected[j]] = H.values[j];
+    H.points += n;
+    H.seconds += now() - started;
+    return PACMAN_RUNNER_OK;
+}
+#endif
+
 /* uploads the tables of `r` unless they equal the last ones, then reduces points 0 .. n of the
    f64 arena into G.values, on the default stream */
 static int reduce_device(const pacman_runner_reduction *r, uint32_t n) {
@@ -2027,6 +2175,14 @@ static int run(double *const *planes, uint32_t num_planes, const uint32_t *leave
         STATS.copies++;
         STATS.bytes += (size_t)point_count * sizeof(double);
         STATS.reduced += point_count;
+#if HYBRID
+        int status = rerun_on_cpu(planes, leaves, num_leaves, point_start, point_count,
+                                  reduction, out);
+        if (status != PACMAN_RUNNER_OK) {
+            G.cu.CtxPopCurrent(&previous);
+            return status;
+        }
+#endif
     }
     /* synchronous: it waits for the kernels (the default stream joins the streams); with a
        reduction, only for captures (PACMAN_RUNNER_COPY_BACK=all, PACMAN_SAVE_ARENA) */
@@ -2062,11 +2218,39 @@ int pacman_runner_v1_run_reduce(double *const *planes, uint32_t num_planes,
 
 /// The `Makefile` of the CUDA runner: `ptxas` per leaf and SM, `fatbinary`, `cc` (the commands
 /// `build_cuda` runs).
-pub fn makefile_cuda(leaves: usize, sms: &[u32]) -> String {
+/// `cpu.c` of a hybrid runner: the CPU runner of `spec` (`runner_c`) with its entry points
+/// renamed `pacman_cpu_v1_*`, linked into the CUDA runner for its f64 reruns.
+pub fn hybrid_cpu_c(spec: &Spec, kernels: &Kernels) -> String {
+    format!(
+        "/* cpu.c: the f64 CPU kernels of a hybrid runner (runner.c reruns its largest points\n\
+         \x20  here), `pacman runner`'s runner.c with its entry points renamed. */\n\
+         #define pacman_runner_v1_metadata pacman_cpu_v1_metadata\n\
+         #define pacman_runner_v1_run pacman_cpu_v1_run\n\
+         #define pacman_runner_v1_run_reduce pacman_cpu_v1_run_reduce\n\
+         /* its reruns are a few hundred points: blocks of 8 on every online CPU */\n\
+         #define DEFAULT_BLOCK 8u\n#define DEFAULT_THREADS 0\n\n{}",
+        runner_c(spec, kernels)
+    )
+}
+
+/// The `Makefile` of the CUDA runner, with `cpu_kernels` CPU kernel objects (a hybrid runner).
+pub fn makefile_cuda(leaves: usize, sms: &[u32], cpu_kernels: Option<usize>) -> String {
     let sms: Vec<String> = sms.iter().map(|sm| sm.to_string()).collect();
     let fatbins: Vec<String> = (0..leaves)
         .map(|k| format!("kernels/leaf{}.fatbin", k))
         .collect();
+    let (objects, cpu) = match cpu_kernels {
+        None => (String::new(), String::new()),
+        Some(n) => {
+            let kernels: Vec<String> = (0..n).map(|k| format!("kernels/k{}.o", k)).collect();
+            (
+                format!(" cpu.o {}", kernels.join(" ")),
+                "cpu.o: cpu.c pacman_runner.h\n\
+                 \t$(CC) $(CFLAGS) -ffp-contract=off -pthread -fPIC -c cpu.c -o cpu.o\n\n"
+                    .to_string(),
+            )
+        }
+    };
     format!(
         "# generated by pacman runner --cuda\n\
          CC ?= cc\n\
@@ -2074,21 +2258,25 @@ pub fn makefile_cuda(leaves: usize, sms: &[u32]) -> String {
          PTXAS ?= {}\n\
          FATBINARY ?= {}\n\
          SMS = {}\n\
-         FATBINS = {}\n\n\
+         FATBINS = {}\n\
+         OBJECTS = runner.o{}\n\n\
          all: runner librunner.so\n\n\
          kernels/leaf%.fatbin: kernels/leaf%.ptx\n\
          \tfor sm in $(SMS); do $(PTXAS) -O3 -arch=sm_$$sm $< -o kernels/leaf$*.sm_$$sm.cubin || exit 1; done\n\
          \t$(FATBINARY) --create=$@ -64 $(foreach sm,$(SMS),--image3=kind=elf,sm=$(sm),file=kernels/leaf$*.sm_$(sm).cubin)\n\n\
          runner.o: runner.c pacman_runner.h $(FATBINS)\n\
          \t$(CC) $(CFLAGS) -ffp-contract=off -fPIC -c runner.c -o runner.o\n\n\
-         librunner.so: runner.o\n\
-         \t$(CC) -shared -o librunner.so runner.o -ldl\n\n\
-         runner: main.c runner.o pacman_runner.h\n\
-         \t$(CC) $(CFLAGS) -o runner main.c runner.o -ldl\n",
+         {}\
+         librunner.so: $(OBJECTS)\n\
+         \t$(CC) -pthread -shared -o librunner.so $(OBJECTS) -ldl\n\n\
+         runner: main.c $(OBJECTS) pacman_runner.h\n\
+         \t$(CC) $(CFLAGS) -pthread -o runner main.c $(OBJECTS) -ldl\n",
         cuda_tool("PTXAS", "ptxas"),
         cuda_tool("FATBINARY", "fatbinary"),
         sms.join(" "),
-        fatbins.join(" ")
+        fatbins.join(" "),
+        objects,
+        cpu
     )
 }
 
@@ -2113,6 +2301,7 @@ pub fn write_cuda(
     modules: &[String],
     sms: &[u32],
     f32: bool,
+    fallback: Option<(&Kernels, f64)>,
 ) -> Result<()> {
     let write = |name: &str, bytes: &[u8]| -> Result<()> {
         let path = dir.join(name);
@@ -2125,10 +2314,21 @@ pub fn write_cuda(
     for (k, m) in modules.iter().enumerate() {
         write(&format!("kernels/leaf{}.ptx", k), m.as_bytes())?;
     }
-    write("runner.c", runner_cuda_c(spec, f32).as_bytes())?;
+    let hybrid = fallback.map(|(kernels, fraction)| (fraction, kernels.lanes));
+    write("runner.c", runner_cuda_c(spec, f32, hybrid).as_bytes())?;
     write("pacman_runner.h", RUNNER_H.as_bytes())?;
     write("main.c", MAIN_C.as_bytes())?;
-    write("Makefile", makefile_cuda(modules.len(), sms).as_bytes())?;
+    let cpu_kernels = fallback.map(|(kernels, _)| kernels.objects.len());
+    write(
+        "Makefile",
+        makefile_cuda(modules.len(), sms, cpu_kernels).as_bytes(),
+    )?;
+    if let Some((kernels, _)) = fallback {
+        for (k, o) in kernels.objects.iter().enumerate() {
+            write(&format!("kernels/k{}.o", k), o)?;
+        }
+        write("cpu.c", hybrid_cpu_c(spec, kernels).as_bytes())?;
+    }
     Ok(())
 }
 
@@ -2153,7 +2353,16 @@ fn run(dir: &Path, program: &str, args: &[String]) -> Result<()> {
 /// Builds the CUDA runner in `dir` as its `Makefile` does: `ptxas` for every leaf and SM
 /// (`jobs` at a time, the largest modules first), `fatbinary` per leaf, then `runner.c` with
 /// the C compiler `cc` into `librunner.so` and `runner`.
-pub fn build_cuda(dir: &Path, cc: &str, leaves: usize, sms: &[u32], jobs: usize) -> Result<()> {
+/// Builds the CUDA runner in `dir` as its `Makefile` does; `cpu_kernels`: a hybrid runner's
+/// CPU kernel objects (`cpu.c`, `kernels/k<k>.o`).
+pub fn build_cuda(
+    dir: &Path,
+    cc: &str,
+    leaves: usize,
+    sms: &[u32],
+    jobs: usize,
+    cpu_kernels: Option<usize>,
+) -> Result<()> {
     let ptxas = cuda_tool("PTXAS", "ptxas");
     let fatbinary = cuda_tool("FATBINARY", "fatbinary");
     let mut work: Vec<(u64, usize, u32)> = Vec::new();
@@ -2204,25 +2413,48 @@ pub fn build_cuda(dir: &Path, cc: &str, leaves: usize, sms: &[u32], jobs: usize)
         }
         run(dir, &fatbinary, &args)?;
     }
-    let steps: Vec<Vec<String>> = vec![
-        [
-            "-O1",
-            "-ffp-contract=off",
-            "-fPIC",
-            "-c",
-            "runner.c",
-            "-o",
-            "runner.o",
-        ]
+    let mut objects = vec!["runner.o".to_string()];
+    let mut steps: Vec<Vec<String>> = vec![[
+        "-O1",
+        "-ffp-contract=off",
+        "-fPIC",
+        "-c",
+        "runner.c",
+        "-o",
+        "runner.o",
+    ]
+    .map(String::from)
+    .to_vec()];
+    if let Some(n) = cpu_kernels {
+        steps.push(
+            [
+                "-O1",
+                "-ffp-contract=off",
+                "-pthread",
+                "-fPIC",
+                "-c",
+                "cpu.c",
+                "-o",
+                "cpu.o",
+            ]
+            .map(String::from)
+            .to_vec(),
+        );
+        objects.push("cpu.o".into());
+        objects.extend((0..n).map(|k| format!("kernels/k{}.o", k)));
+    }
+    let library = ["-pthread", "-shared", "-o", "librunner.so"]
         .map(String::from)
-        .to_vec(),
-        ["-shared", "-o", "librunner.so", "runner.o", "-ldl"]
-            .map(String::from)
-            .to_vec(),
-        ["-O1", "-o", "runner", "main.c", "runner.o", "-ldl"]
-            .map(String::from)
-            .to_vec(),
-    ];
+        .into_iter()
+        .chain(objects.iter().cloned())
+        .chain(["-ldl".to_string()]);
+    steps.push(library.collect());
+    let program = ["-O1", "-pthread", "-o", "runner", "main.c"]
+        .map(String::from)
+        .into_iter()
+        .chain(objects.iter().cloned())
+        .chain(["-ldl".to_string()]);
+    steps.push(program.collect());
     for args in steps {
         run(dir, cc, &args)?;
     }
@@ -2631,11 +2863,11 @@ int main(int argc, char **argv) {
             modules[1]
         );
         let sms = [local_sm().unwrap_or(80)];
-        write_cuda(&dir, &spec, &modules, &sms, true).unwrap();
+        write_cuda(&dir, &spec, &modules, &sms, true, None).unwrap();
         assert!(std::fs::read_to_string(dir.join("runner.c"))
             .unwrap()
             .contains("#define F32 1"));
-        build_cuda(&dir, "cc", modules.len(), &sms, 2).unwrap();
+        build_cuda(&dir, "cc", modules.len(), &sms, 2, None).unwrap();
 
         let json = dir.join("t.e0.r0.json");
         std::fs::write(&json, RECORDING).unwrap();
@@ -2744,8 +2976,8 @@ int main(int argc, char **argv) {
             modules[1]
         );
         let sms = [local_sm().unwrap_or(80)];
-        write_cuda(&dir, &spec, &modules, &sms, false).unwrap();
-        build_cuda(&dir, "cc", modules.len(), &sms, 2).unwrap();
+        write_cuda(&dir, &spec, &modules, &sms, false, None).unwrap();
+        build_cuda(&dir, "cc", modules.len(), &sms, 2, None).unwrap();
 
         // the library's argument checks come before the GPU
         std::fs::write(dir.join("dltest.c"), DLTEST_C).unwrap();
@@ -3094,11 +3326,159 @@ int main(int argc, char **argv) {
             let sub = dir.join(if f32 { "f32" } else { "f64" });
             std::fs::create_dir_all(sub.join("out")).unwrap();
             let modules = ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, f32, &[]).unwrap();
-            write_cuda(&sub, &spec, &modules, &sms, f32).unwrap();
-            build_cuda(&sub, "cc", modules.len(), &sms, 2).unwrap();
+            write_cuda(&sub, &spec, &modules, &sms, f32, None).unwrap();
+            build_cuda(&sub, "cc", modules.len(), &sms, 2, None).unwrap();
             if reduce_check(&sub).is_none() {
                 break;
             }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// A hybrid runner (f32 leaves on the GPU, reruns on the CPU in f64) of the amplitude
+    /// execution against the CPU runner and the f32 CUDA runner, with point 2 out of f32's range:
+    /// with no fallback only the non-finite point is rerun, with all of it every value is the
+    /// CPU runner's bit for bit, and with 34% the 4 largest of the 8 others are rerun too.
+    #[test]
+    fn hybrid_runner_reruns_on_the_cpu() {
+        let ptxas = cuda_tool("PTXAS", "ptxas");
+        let fatbinary = cuda_tool("FATBINARY", "fatbinary");
+        let have = |tool: &str| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !have_cc() || !have(&ptxas) || !have(&fatbinary) {
+            eprintln!("no C compiler or CUDA toolkit: the hybrid runner is not built");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pacman-hybrid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (a, b) = (
+            plane_application(PRODUCT_PLUS_ONE),
+            plane_application(SQUARE_MINUS),
+        );
+        let spec = amplitude_spec();
+        let members: HashMap<&str, &[u8]> = [
+            (spec.calls[0].member.as_str(), &a[..]),
+            (spec.calls[1].member.as_str(), &b[..]),
+        ]
+        .into_iter()
+        .collect();
+        let sms = [local_sm().unwrap_or(80)];
+        let kernels = objects(&spec, &members, 1, &[]).unwrap();
+        let modules = ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, true, &[]).unwrap();
+        for name in ["cpu", "f32", "hybrid"] {
+            let sub = dir.join(name);
+            std::fs::create_dir_all(sub.join("out")).unwrap();
+            match name {
+                "cpu" => {
+                    write(&sub, &spec, &kernels).unwrap();
+                    build(&sub, "cc", kernels.objects.len()).unwrap();
+                }
+                "f32" => {
+                    write_cuda(&sub, &spec, &modules, &sms, true, None).unwrap();
+                    build_cuda(&sub, "cc", modules.len(), &sms, 2, None).unwrap();
+                }
+                _ => {
+                    write_cuda(&sub, &spec, &modules, &sms, true, Some((&kernels, 0.34))).unwrap();
+                    build_cuda(
+                        &sub,
+                        "cc",
+                        modules.len(),
+                        &sms,
+                        2,
+                        Some(kernels.objects.len()),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+
+        let groups: String = GROUPS
+            .iter()
+            .map(|(w, ks)| {
+                let ks: Vec<String> = ks.iter().map(|k| k.to_string()).collect();
+                format!("{} {}\n", w, ks.join(" "))
+            })
+            .collect();
+        std::fs::write(dir.join("groups.txt"), groups).unwrap();
+        let json = dir.join("t.e0.r0.json");
+        std::fs::write(&json, AMPLITUDE_RECORDING).unwrap();
+        let mut pre = vec![7.0; 12 * 9];
+        for p in [0, 1, 3, 4, 10] {
+            for i in 0..9 {
+                pre[p * 9 + i] = ((p * 9 + i) as f64 * 0.37).sin();
+            }
+        }
+        // point 2: z0 z1 = 1e50 overflows f32, not f64
+        pre[2] = 1e25;
+        pre[9 + 2] = 1e25;
+        pre[11 * 9..12 * 9].fill(0.0);
+        let bytes: Vec<u8> = pre.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(json.with_extension("pre"), &bytes).unwrap();
+
+        // the values of a run of `name` (`fallback`: PACMAN_RUNNER_FALLBACK); None: no GPU
+        let values = |name: &str, fallback: Option<&str>, whole: bool| -> Option<Vec<f64>> {
+            let sub = dir.join(name);
+            let mut command = Command::new(sub.join("runner"));
+            command.args(["--reduce", "../groups.txt"]);
+            if whole {
+                command.arg("--whole");
+            }
+            command.arg("out").arg(&json).current_dir(&sub);
+            match fallback {
+                Some(f) => command.env("PACMAN_RUNNER_FALLBACK", f),
+                None => command.env_remove("PACMAN_RUNNER_FALLBACK"),
+            };
+            let out = command.output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !out.status.success()
+                && (stderr.contains("libcuda")
+                    || stderr.contains("cuInit")
+                    || stderr.contains("cuDeviceGet"))
+                && std::env::var_os("SJB2PTX_REQUIRE_GPU").is_none()
+            {
+                eprintln!("skipped: no usable GPU ({})", stderr.trim());
+                return None;
+            }
+            assert!(out.status.success(), "{}: {}", name, stderr);
+            Some(recording::read_f64s(&sub.join("out/t.e0.r0.reduced"), 9).unwrap())
+        };
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+
+        let cpu = values("cpu", None, true).unwrap();
+        assert!(cpu.iter().all(|x| x.is_finite()));
+        let Some(f32) = values("f32", None, true) else {
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        };
+        assert!(!f32[2].is_finite(), "{:?}", f32);
+        assert!((0..9).filter(|&i| i != 2).all(|i| f32[i] != cpu[i]));
+
+        // no fallback: only the non-finite point
+        let none = values("hybrid", Some("0"), true).unwrap();
+        for i in 0..9 {
+            let want = if i == 2 { cpu[i] } else { f32[i] };
+            assert_eq!(none[i].to_bits(), want.to_bits(), "point {}", i);
+        }
+        // all points, at once and per tile: the CPU runner's values
+        assert_eq!(
+            bits(&values("hybrid", Some("100%"), true).unwrap()),
+            bits(&cpu)
+        );
+        assert_eq!(
+            bits(&values("hybrid", Some("1"), false).unwrap()),
+            bits(&cpu)
+        );
+        // the default, 34%: ceil(0.34 x 9) = 4 of the finite points, the largest f32 values
+        let mut finite: Vec<usize> = (0..9).filter(|&i| i != 2).collect();
+        finite.sort_by(|&i, &j| f32[j].partial_cmp(&f32[i]).unwrap());
+        let rerun: Vec<usize> = finite[..4].iter().copied().chain([2]).collect();
+        let part = values("hybrid", None, true).unwrap();
+        for i in 0..9 {
+            let want = if rerun.contains(&i) { cpu[i] } else { f32[i] };
+            assert_eq!(part[i].to_bits(), want.to_bits(), "point {}", i);
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

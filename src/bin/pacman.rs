@@ -111,6 +111,10 @@ Options:
       --jobs N         runner: ptxas runs at a time (default: the CPUs)
       --f32            runner: f32 CUDA kernels (with --cuda): the f64 planes
                        are rounded to f32 on the GPU and the results widened
+      --fallback PCT   runner: a hybrid runner (with --cuda --f32): its reductions
+                       rerun the PCT largest points (e.g. 1%, or 0.01) and every
+                       non-finite one on the CPU in f64 (scalar kernels, or
+                       --simd/--simd512); PACMAN_RUNNER_FALLBACK overrides PCT
       --set KEY=VALUE  runner: an option of the kernels' configuration (symjit's
                        `set_option`, e.g. stable_math=true), set before they
                        are compiled; may be repeated
@@ -147,6 +151,8 @@ struct Runner {
     f32: bool,
     /// `--set KEY=VALUE`: options of the kernels' configuration
     settings: Vec<(String, String)>,
+    /// `--fallback PCT`: a hybrid runner rerunning this fraction of the points on the CPU
+    fallback: Option<f64>,
     jobs: usize,
 }
 
@@ -204,6 +210,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
     let mut cuda: Option<Vec<u32>> = None;
     let mut f32 = false;
     let mut settings = Vec::new();
+    let mut fallback: Option<f64> = None;
     let mut jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
 
     let mut it = args[1..].iter();
@@ -273,6 +280,26 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
                 cuda.get_or_insert_with(Vec::new);
             }
             ("runner", "--f32") => f32 = true,
+            ("runner", "--fallback") => {
+                let v = value(arg)?;
+                let (number, scale) = match v.strip_suffix('%') {
+                    Some(n) => (n, 0.01),
+                    None => (v.as_str(), 1.0),
+                };
+                fallback = Some(
+                    number
+                        .parse::<f64>()
+                        .ok()
+                        .map(|f| f * scale)
+                        .filter(|f| (0.0..=1.0).contains(f))
+                        .ok_or_else(|| {
+                            format!(
+                                "`--fallback` takes a percentage or a fraction (1% or 0.01), not `{}`",
+                                v
+                            )
+                        })?,
+                );
+            }
             ("runner", "--set") => {
                 let kv = value(arg)?;
                 match kv.split_once('=') {
@@ -355,8 +382,13 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
         "runner" if inputs.len() == 1 && execution.is_none() => {
             Err("`runner` needs a recording or `--execution`".into())
         }
-        "runner" if lanes > 1 && cuda.is_some() => {
-            Err("`--simd` and `--simd512` are for CPU runners, not with `--cuda` or `--sm`".into())
+        "runner" if lanes > 1 && cuda.is_some() && fallback.is_none() => Err(
+            "`--simd` and `--simd512` are for CPU runners, not with `--cuda` or `--sm` (unless \
+             `--fallback`: its CPU kernels)"
+                .into(),
+        ),
+        "runner" if fallback.is_some() && !f32 => {
+            Err("`--fallback` is for f32 CUDA runners: add `--cuda --f32`".into())
         }
         "runner" if f32 && cuda.is_none() => {
             Err("`--f32` is for CUDA runners: add `--cuda` or `--sm`".into())
@@ -373,6 +405,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             cuda,
             f32,
             settings,
+            fallback,
             jobs,
         })),
         _ => Err(format!(
@@ -942,7 +975,17 @@ fn cuda_runner(
         args.f32,
         &args.settings,
     )?;
-    symjit_utils::runner::write_cuda(dir, spec, &modules, &sms, args.f32)?;
+    let kernels = match args.fallback {
+        Some(_) => Some(symjit_utils::runner::objects(
+            spec,
+            members,
+            args.lanes,
+            &args.settings,
+        )?),
+        None => None,
+    };
+    let fallback = kernels.as_ref().zip(args.fallback);
+    symjit_utils::runner::write_cuda(dir, spec, &modules, &sms, args.f32, fallback)?;
     eprintln!(
         "pacman: wrote the CUDA runner of {} of {} to {}: {} leaves, {} bytes of PTX in {:.2} s",
         spec.execution,
@@ -954,7 +997,14 @@ fn cuda_runner(
     );
     if args.build {
         let start = std::time::Instant::now();
-        symjit_utils::runner::build_cuda(dir, &args.cc, modules.len(), &sms, args.jobs)?;
+        symjit_utils::runner::build_cuda(
+            dir,
+            &args.cc,
+            modules.len(),
+            &sms,
+            args.jobs,
+            kernels.as_ref().map(|k| k.objects.len()),
+        )?;
         let sms: Vec<String> = sms.iter().map(|sm| format!("sm_{}", sm)).collect();
         eprintln!(
             "pacman: built {0}/runner and {0}/librunner.so for {1} in {2:.1} s",
