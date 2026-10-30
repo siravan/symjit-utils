@@ -2461,6 +2461,29 @@ pub fn build_cuda(
     Ok(())
 }
 
+/// The recurrence runner (`pacman recurrence-runner`): one CUDA kernel that runs any RustiCol
+/// recurrence plan given as row words.
+pub const RECURRENCE_RUNNER_CU: &str = include_str!("recurrence_runner.cu");
+
+/// Writes `recurrence_runner.cu` into `dir` and builds `librecurrence.so` from it with `nvcc`
+/// (`NVCC`) for the GPUs `sms`. Without FMA contraction, the kernel's results equal RustiCol's
+/// scalar ones bit for bit.
+pub fn build_recurrence(dir: &Path, sms: &[u32]) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
+    std::fs::write(dir.join("recurrence_runner.cu"), RECURRENCE_RUNNER_CU)
+        .with_context(|| format!("cannot write into `{}`", dir.display()))?;
+    let nvcc = cuda_tool("NVCC", "nvcc");
+    let mut args: Vec<String> = ["-O3", "-fmad=false", "-Xcompiler", "-fPIC", "-shared"]
+        .map(String::from)
+        .to_vec();
+    args.extend(["-cudart".into(), "static".into()]);
+    for sm in sms {
+        args.push(format!("-gencode=arch=compute_{0},code=sm_{0}", sm));
+    }
+    args.extend(["-o", "librecurrence.so", "recurrence_runner.cu"].map(String::from));
+    run(dir, &nvcc, &args)
+}
+
 /// The compute capability of the local GPU as an SM number (`nvidia-smi`), if there is one.
 pub fn local_sm() -> Option<u32> {
     let out = Command::new("nvidia-smi")
@@ -3480,6 +3503,236 @@ int main(int argc, char **argv) {
             let want = if rerun.contains(&i) { cpu[i] } else { f32[i] };
             assert_eq!(part[i].to_bits(), want.to_bits(), "point {}", i);
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A synthetic recurrence plan on the recurrence runner: every op (clears, the five
+    /// contributions with initializing and accumulating rows on interleaved destinations, the
+    /// three propagators, identity finalization, closures), once per `PACMAN_RECURRENCE_KERNEL`.
+    /// `acc` and `cache` equal `v1` bit for bit; `df64` (the default) and `df64cache` agree with
+    /// it to 1e-9. Under each kernel, the amplitudes zeroed on the device and kept there reduce
+    /// (`pacman_recurrence_v1_reduce`) to the host's reduction of the copied-back ones, bit for
+    /// bit; the first calls pass the struct of before the reduction. Skipped without nvcc or a C compiler, and its GPU steps without a usable GPU
+    /// unless `SJB2PTX_REQUIRE_GPU` is set.
+    const RECTEST_C: &str = r#"
+#include <dlfcn.h>
+#include <math.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    uint32_t abi_version, struct_size;
+    const uint64_t *words;
+    uint64_t words_key;
+    uint32_t word_count;
+    uint8_t width[8];
+    double *current_re, *current_im, *amplitude_re, *amplitude_im;
+    const double *momenta, *scale_re, *scale_im, *factor_re, *factor_im;
+    const uint32_t *upload_current, *upload_amplitude, *download_amplitude, *download_current;
+    uint32_t current_planes, amplitude_planes, momentum_planes, scale_count, factor_count;
+    uint32_t upload_current_runs, upload_amplitude_runs, download_amplitude_runs,
+        download_current_runs;
+    uint32_t stride, points;
+    const uint32_t *zero_amplitude;
+    uint32_t zero_amplitude_runs, flags;
+} call_t;
+
+typedef struct {
+    uint32_t abi_version, struct_size;
+    const uint32_t *planes;
+    const double *weights;
+    double *output;
+    uint32_t count, points;
+} reduce_t;
+
+enum { P = 12, A = 9, F = 6, X = 3, S = 3, K = 4 };
+static uint64_t words[64];
+static uint32_t nwords;
+static uint64_t w_;
+static int at_;
+static void put(uint64_t v, int bits) { w_ |= v << at_; at_ += bits; }
+static void begin(int op) { w_ = 0; at_ = 0; put(op, 4); }
+static void end(void) { words[nwords++] = w_; }
+static void clear(int base, int count) { begin(1); put(base, P); put(count, P); end(); }
+static void contrib(int op, int init, int slot, int p0, int p1, int dst, int f0, int f1, int x) {
+    begin(op); put(init, 1); put(slot, S); put(p0, P); put(p1, P); put(dst, P);
+    put(f0, F); put(f1, F); put(x, X); end();
+}
+static void prop(int op, int base, int form, int x) { begin(op); put(base, P); put(form, F); put(x, X); end(); }
+static void identity(int base, int count, int x) { begin(10); put(base, P); put(count, K); put(x, X); end(); }
+static void closure(int p0, int p1, int amp, int x, int first, int count) {
+    begin(11); put(p0, P); put(p1, P); put(amp, A); put(x, X); put(first, X); put(count, K); end();
+}
+
+int main(int argc, char **argv) {
+    void *lib = dlopen(argv[1], RTLD_NOW);
+    if (!lib) { fprintf(stderr, "%s\n", dlerror()); return 1; }
+    int (*run)(const call_t *) = (int (*)(const call_t *))dlsym(lib, "pacman_recurrence_v1_run");
+    int (*reduce)(const reduce_t *) = (int (*)(const reduce_t *))dlsym(lib, "pacman_recurrence_v1_reduce");
+    if (!run || !reduce) return 1;
+    /* sources: Weyl 0, 2; vectors 4, 8, 12; tensor 16 (22 planes); stage 1 at 32..43, stage 2 at 44..49 */
+    clear(32, 12);
+    contrib(2, 1, 0, 0, 4, 32, 0, 0, 1);
+    contrib(4, 1, 1, 16, 4, 34, 0, 0, 2);
+    contrib(5, 1, 2, 4, 8, 38, 0, 0, 0);
+    contrib(3, 0, 1, 2, 8, 32, 0, 0, 3);
+    contrib(6, 0, 0, 4, 8, 34, 0, 1, 4);
+    contrib(5, 0, 1, 8, 12, 38, 0, 0, 5);
+    contrib(2, 0, 2, 0, 12, 32, 0, 0, 0);
+    contrib(4, 0, 0, 16, 12, 34, 0, 0, 1);
+    prop(7, 32, 2, 1);
+    prop(9, 34, 3, 2);
+    identity(38, 6, 3);
+    clear(44, 6);
+    contrib(3, 1, 0, 32, 34, 44, 0, 0, 1);
+    contrib(4, 1, 1, 38, 34, 46, 0, 0, 2);
+    contrib(2, 0, 2, 0, 34, 44, 0, 0, 3);
+    contrib(6, 0, 1, 34, 4, 46, 1, 2, 4);
+    prop(8, 44, 1, 5);
+    closure(44, 0, 0, 0, 2, 2);
+    closure(46, 8, 1, 1, 3, 2);
+    closure(32, 2, 2, 2, 0, 2);
+    enum { POINTS = 300, STRIDE = 320, CP = 50, AP = 3, MP = 16 };
+    static double cre[CP * STRIDE], cim[CP * STRIDE], are[AP * STRIDE], aim[AP * STRIDE], mom[MP * STRIDE];
+    for (int k = 0; k < CP * STRIDE; k++) {
+        cre[k] = sin(0.37 * k + 0.1);
+        cim[k] = cos(0.53 * k + 0.2);
+    }
+    for (int f = 0; f < 4; f++)
+        for (int i = 0; i < STRIDE; i++)
+            for (int mu = 0; mu < 4; mu++)
+                mom[(f * 4 + mu) * STRIDE + i] = mu == 0 ? 2.5 + 0.4 * sin(0.7 * i + f) : sin(0.3 * i + mu + 2 * f);
+    double sre[3] = {0.5, -1.25, 0.75}, sim[3] = {0.25, 0.5, -0.125};
+    double fre[6] = {1.0, -0.5, 0.25, 2.0, -1.0, 0.75}, fim[6] = {0.0, 0.5, -0.75, 0.0, 0.25, -0.5};
+    uint32_t up_c[2] = {0, 22}, up_a[2] = {0, AP}, down_a[2] = {0, AP};
+    call_t c;
+    memset(&c, 0, sizeof c);
+    c.abi_version = 1;
+    c.struct_size = (uint32_t)offsetof(call_t, zero_amplitude); /* the struct before the reduction */
+    c.words = words;
+    c.words_key = 7;
+    c.word_count = nwords;
+    uint8_t width[8] = {P, A, F, X, S, K, 0, 0};
+    memcpy(c.width, width, 8);
+    c.current_re = cre; c.current_im = cim; c.amplitude_re = are; c.amplitude_im = aim;
+    c.momenta = mom; c.scale_re = sre; c.scale_im = sim; c.factor_re = fre; c.factor_im = fim;
+    c.upload_current = up_c; c.upload_amplitude = up_a; c.download_amplitude = down_a;
+    c.current_planes = CP; c.amplitude_planes = AP; c.momentum_planes = MP; c.scale_count = 3;
+    c.factor_count = 6; c.upload_current_runs = 1; c.upload_amplitude_runs = 1;
+    c.download_amplitude_runs = 1; c.stride = STRIDE; c.points = POINTS;
+    /* twice: the second call reuses the cached program and the device arena */
+    for (int r = 0; r < 2; r++) {
+        memset(are, 0, sizeof are);
+        memset(aim, 0, sizeof aim);
+        int status = run(&c);
+        if (status == 3) return 77; /* device error: no usable GPU */
+        if (status != 0) { fprintf(stderr, "status %d\n", status); return 1; }
+    }
+    /* the amplitudes cleared on the device and kept there, then reduced: as the host reduces them */
+    static double want[POINTS], got[POINTS];
+    uint32_t planes[4] = {2, 0, 1, 0};
+    double weights[4] = {0.75, 1.5, -0.25, 2.0};
+    for (int i = 0; i < POINTS; i++) {
+        want[i] = got[i] = 0.125 * i;
+        for (int k = 0; k < 4; k++) {
+            double re = are[planes[k] * STRIDE + i], im = aim[planes[k] * STRIDE + i];
+            want[i] += weights[k] * fma(re, re, im * im);
+        }
+    }
+    static double are2[AP * STRIDE], aim2[AP * STRIDE];
+    for (int k = 0; k < AP * STRIDE; k++) are2[k] = aim2[k] = 1e300; /* must not be uploaded */
+    call_t k2 = c;
+    k2.struct_size = sizeof k2;
+    k2.amplitude_re = are2;
+    k2.amplitude_im = aim2;
+    k2.upload_amplitude_runs = 0;
+    k2.zero_amplitude = up_a;
+    k2.zero_amplitude_runs = 1;
+    k2.flags = 1;
+    if (run(&k2) != 0) return 1;
+    for (int k = 0; k < AP * STRIDE; k++)
+        if (are2[k] != 1e300 || aim2[k] != 1e300) { fprintf(stderr, "kept amplitudes were copied back\n"); return 1; }
+    reduce_t r = {1, sizeof r, planes, weights, got, 4, POINTS};
+    if (reduce(&r) != 0) { fprintf(stderr, "reduce failed\n"); return 1; }
+    for (int i = 0; i < POINTS; i++)
+        if (memcmp(&want[i], &got[i], 8)) {
+            fprintf(stderr, "reduction, point %d: %.17g for %.17g\n", i, got[i], want[i]);
+            return 1;
+        }
+    for (int p = 0; p < AP; p++)
+        for (int i = 0; i < POINTS; i++) printf("%.17g %.17g\n", are[p * STRIDE + i], aim[p * STRIDE + i]);
+    return 0;
+}
+"#;
+
+    #[test]
+    fn recurrence_runner_variants_agree() {
+        let nvcc = cuda_tool("NVCC", "nvcc");
+        let have_nvcc = Command::new(&nvcc)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !have_cc() || !have_nvcc {
+            eprintln!("no C compiler or nvcc: the recurrence runner is not built");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pacman-recurrence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sm = local_sm().unwrap_or(crate::ptx::DEFAULT_SM.max(80));
+        build_recurrence(&dir, &[sm]).unwrap();
+        std::fs::write(dir.join("rectest.c"), RECTEST_C).unwrap();
+        let cc = Command::new("cc")
+            .args(["-O1", "-ffp-contract=off", "-o", "rectest", "rectest.c", "-ldl", "-lm"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(cc.status.success(), "{}", String::from_utf8_lossy(&cc.stderr));
+        let lib = dir.join("librecurrence.so");
+        let mut results: Vec<(&str, Vec<f64>)> = Vec::new();
+        for kernel in ["v1", "acc", "cache", "df64", "df64cache", ""] {
+            let mut cmd = Command::new(dir.join("rectest"));
+            cmd.arg(&lib).current_dir(&dir);
+            if kernel.is_empty() {
+                cmd.env_remove("PACMAN_RECURRENCE_KERNEL");
+            } else {
+                cmd.env("PACMAN_RECURRENCE_KERNEL", kernel);
+            }
+            let out = cmd.output().unwrap();
+            if out.status.code() == Some(77) && std::env::var_os("SJB2PTX_REQUIRE_GPU").is_none() {
+                eprintln!("skipped: no usable GPU");
+                std::fs::remove_dir_all(&dir).unwrap();
+                return;
+            }
+            assert!(out.status.success(), "{}: {}", kernel, String::from_utf8_lossy(&out.stderr));
+            let values: Vec<f64> = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .map(|v| v.parse().unwrap())
+                .collect();
+            assert_eq!(values.len(), 3 * 300 * 2, "{}", kernel);
+            results.push((if kernel.is_empty() { "default" } else { kernel }, values));
+        }
+        let want = &results[0].1;
+        assert!(want.iter().all(|v| v.is_finite()) && want.iter().any(|v| *v != 0.0));
+        let scale = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        for (kernel, got) in &results[1..] {
+            for (k, (g, w)) in got.iter().zip(want).enumerate() {
+                if matches!(*kernel, "acc" | "cache") {
+                    assert_eq!(g.to_bits(), w.to_bits(), "{} value {}: {} for {}", kernel, k, g, w);
+                } else {
+                    assert!((g - w).abs() <= 1e-9 * scale, "{} value {}: {} for {}", kernel, k, g, w);
+                }
+            }
+        }
+        // the default is df64: it equals df64's values exactly
+        let df64 = &results.iter().find(|r| r.0 == "df64").unwrap().1;
+        let default = &results.iter().find(|r| r.0 == "default").unwrap().1;
+        assert!(df64.iter().zip(default).all(|(a, b)| a.to_bits() == b.to_bits()));
+        // and it is not the f64 arithmetic
+        assert!(df64.iter().zip(want).any(|(a, b)| a.to_bits() != b.to_bits()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
