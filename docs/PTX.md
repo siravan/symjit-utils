@@ -21,6 +21,7 @@ cc prog.c model_cuda.c -ldl              # a C program running it: no CUDA toolk
 | `--header <FILE>` | The C header (default: the module with the extension `.h`). |
 | `--no-header` | Do not write the header. |
 | `--driver` | Also write the C driver `<name>_cuda.c` and `<name>_cuda.h` next to the module (below). |
+| `--f32` | Single precision (below, "Numbers"); not with `--driver`. |
 
 The function may have been compiled for any machine (`ty="native"`, `"arm"`, `"riscv"`,
 `"bytecode"`) and opt level: sjb2ptx compiles its saved MIR and lets ptxas allocate the registers.
@@ -127,6 +128,14 @@ complexifier (as `fast_complex=False` does on the CPU), and returns the bits of 
 kernel with `fast_complex=False`. Results differ in the last bit from the `fast_complex=True`
 kernels, which use a different formula, and from the CPU's SIMD kernels, whose complex formulas
 also differ from the scalar kernel's.
+
+With `--f32` (`PtxOptions::f32`) every value is an f32 instead: `in`, `out` and `params` are
+arrays of floats (slot `k` at `4 k` bytes), the registers are `.b32`, the operations the same
+correctly rounded `.rn` ones in single precision, masks and sign-bit operations on 32 bits, and
+constants rounded to the nearest f32. Math functions are computed in f64 by the same library: the
+arguments are widened and the result rounded to f32. The C header says "floats"; `--driver` is
+f64 only. There is no CPU f32 kernel to compare with: f32 results are compared with the f64 ones
+within single-precision rounding.
 
 ## Math functions
 

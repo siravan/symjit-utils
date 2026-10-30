@@ -109,6 +109,11 @@ Options:
       --sm LIST        runner: the GPUs' SM numbers, e.g. 80,90,120 (implies
                        --cuda; default: the local GPU's, from nvidia-smi)
       --jobs N         runner: ptxas runs at a time (default: the CPUs)
+      --f32            runner: f32 CUDA kernels (with --cuda): the f64 planes
+                       are rounded to f32 on the GPU and the results widened
+      --set KEY=VALUE  runner: an option of the kernels' configuration (symjit's
+                       `set_option`, e.g. stable_math=true), set before they
+                       are compiled; may be repeated
   -h, --help           print this help
   -V, --version        print the version";
 
@@ -138,6 +143,10 @@ struct Runner {
     lanes: u32,
     /// a CUDA runner, for these SMs (empty: the local GPU's)
     cuda: Option<Vec<u32>>,
+    /// `--f32`: single-precision CUDA kernels
+    f32: bool,
+    /// `--set KEY=VALUE`: options of the kernels' configuration
+    settings: Vec<(String, String)>,
     jobs: usize,
 }
 
@@ -193,6 +202,8 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
     let mut build = true;
     let mut lanes = 1;
     let mut cuda: Option<Vec<u32>> = None;
+    let mut f32 = false;
+    let mut settings = Vec::new();
     let mut jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
 
     let mut it = args[1..].iter();
@@ -260,6 +271,14 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             }
             ("runner", "--cuda") => {
                 cuda.get_or_insert_with(Vec::new);
+            }
+            ("runner", "--f32") => f32 = true,
+            ("runner", "--set") => {
+                let kv = value(arg)?;
+                match kv.split_once('=') {
+                    Some((k, v)) if !k.is_empty() => settings.push((k.to_string(), v.to_string())),
+                    _ => return Err(format!("`--set` takes KEY=VALUE, not `{}`", kv)),
+                }
             }
             ("runner", "--sm") => {
                 let v = value(arg)?;
@@ -339,6 +358,9 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
         "runner" if lanes > 1 && cuda.is_some() => {
             Err("`--simd` and `--simd512` are for CPU runners, not with `--cuda` or `--sm`".into())
         }
+        "runner" if f32 && cuda.is_none() => {
+            Err("`--f32` is for CUDA runners: add `--cuda` or `--sm`".into())
+        }
         "runner" => Ok(Command::Runner(Runner {
             artifact: inputs[0].clone().into(),
             recording: inputs.get(1).map(PathBuf::from),
@@ -349,6 +371,8 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             build,
             lanes,
             cuda,
+            f32,
+            settings,
             jobs,
         })),
         _ => Err(format!(
@@ -911,8 +935,14 @@ fn cuda_runner(
     sms.sort_unstable();
     sms.dedup();
     let start = std::time::Instant::now();
-    let modules = symjit_utils::runner::ptx_modules(spec, members, symjit_utils::ptx::DEFAULT_SM)?;
-    symjit_utils::runner::write_cuda(dir, spec, &modules, &sms)?;
+    let modules = symjit_utils::runner::ptx_modules(
+        spec,
+        members,
+        symjit_utils::ptx::DEFAULT_SM,
+        args.f32,
+        &args.settings,
+    )?;
+    symjit_utils::runner::write_cuda(dir, spec, &modules, &sms, args.f32)?;
     eprintln!(
         "pacman: wrote the CUDA runner of {} of {} to {}: {} leaves, {} bytes of PTX in {:.2} s",
         spec.execution,
@@ -1016,7 +1046,7 @@ fn runner(args: &Runner) -> Result<()> {
         return cuda_runner(args, &spec, &members, &dir, sms);
     }
     let start = std::time::Instant::now();
-    let kernels = symjit_utils::runner::objects(&spec, &members, args.lanes)?;
+    let kernels = symjit_utils::runner::objects(&spec, &members, args.lanes, &args.settings)?;
     symjit_utils::runner::write(&dir, &spec, &kernels)?;
     let objects = &kernels.objects;
     let code: usize = objects.iter().map(Vec::len).sum();

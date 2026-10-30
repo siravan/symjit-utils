@@ -28,6 +28,8 @@ Options:
   --header <FILE>      the C header (default: the module with the extension .h)
   --no-header          do not write the C header
   --driver             also write the C driver NAME_cuda.c and NAME_cuda.h
+  --f32                single precision: f32 values, inputs and outputs (math
+                       functions are evaluated in f64); not with --driver
   -h, --help           print this help
   -V, --version        print the version";
 
@@ -44,6 +46,7 @@ struct Args {
     header: Option<PathBuf>,
     no_header: bool,
     driver: bool,
+    f32: bool,
 }
 
 enum Command {
@@ -62,6 +65,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         header: None,
         no_header: false,
         driver: false,
+        f32: false,
     };
     let mut input: Option<PathBuf> = None;
     let mut args = args.peekable();
@@ -95,6 +99,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
             "--header" => a.header = Some(value(&arg)?.into()),
             "--no-header" => a.no_header = true,
             "--driver" => a.driver = true,
+            "--f32" => a.f32 = true,
             _ if arg.starts_with('-') && arg.len() > 1 => {
                 return Err(format!("unknown option `{}`", arg))
             }
@@ -105,6 +110,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
 
     if a.no_header && a.header.is_some() {
         return Err("--no-header and --header exclude each other".into());
+    }
+    if a.f32 && a.driver {
+        return Err("--driver is f64 only: it does not take --f32".into());
     }
     match input {
         Some(input) => {
@@ -174,6 +182,7 @@ fn run(a: &Args) -> Result<()> {
         layout: a.layout,
         sm: a.sm,
         mapping: None,
+        f32: a.f32,
     };
     let ptx = model.ptx(&options)?;
 

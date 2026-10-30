@@ -25,10 +25,22 @@ impl SavedModel {
     /// its MIR is register-allocated for the machine it was compiled for, which matters only
     /// to native code generators (a WebAssembly module keeps registers in locals).
     pub fn read(stream: &mut impl Read) -> Result<SavedModel> {
+        Self::read_with(stream, &[])
+    }
+
+    /// `read`, with `settings` (`Config::set_option` keys and values, e.g. `stable_math`,
+    /// `true`) changing the saved configuration before the complex operations are lowered.
+    pub fn read_with(stream: &mut impl Read, settings: &[(String, String)]) -> Result<SavedModel> {
         // the saved configuration replaces this one, except for its (empty) functions
         let config = Config::new(CompilerType::ByteCode, 0)?;
         let (mut prog, reals, saved) = Application::read_sjb(stream, &config)?;
         check_calls(&saved)?;
+        for (key, value) in settings {
+            prog.builder
+                .config
+                .set_option(key, value)
+                .map_err(|e| anyhow!("{}={}: {}", key, value, e))?;
+        }
 
         let mir = if prog.config().is_complex() {
             let mir = Complexifier::new(&reals, prog.config().clone()).complexify(&saved)?;

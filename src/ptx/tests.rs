@@ -540,6 +540,95 @@ fn math_functions() {
     }
 }
 
+/// `SavedModel::read_with` sets options before the complex operations are lowered: a model
+/// saved without `stable_math` and read with it compiles as one saved with it.
+#[test]
+fn settings_of_a_saved_model() {
+    let mut bytes: Vec<u8> = Vec::new();
+    complex(false, false, 2).save(&mut bytes).unwrap();
+    let on = [("stable_math".to_string(), "true".to_string())];
+    let mut model = SavedModel::read_with(&mut &bytes[..], &on).unwrap();
+    assert!(model.config().stable_math());
+    let options = PtxOptions::new("model");
+    let read = model.ptx(&options).unwrap().text;
+    assert_eq!(
+        read,
+        saved(&complex(true, false, 2)).ptx(&options).unwrap().text
+    );
+    assert_ne!(
+        read,
+        saved(&complex(false, false, 2)).ptx(&options).unwrap().text
+    );
+    let bad = [("no_such_option".to_string(), "true".to_string())];
+    assert!(SavedModel::read_with(&mut &bytes[..], &bad).is_err());
+}
+
+/// f32 kernels (`PtxOptions::f32`): every value instruction is single precision, the arrays
+/// are of floats (4-byte slots), constants are rounded to f32, and the math library (f64) is
+/// called through conversions.
+#[test]
+fn single_precision() {
+    let f32_ptx = |app: &Application, layout: Layout, what: &str| {
+        let mut options = PtxOptions::new("model");
+        options.layout = layout;
+        options.f32 = true;
+        let p = saved(app).ptx(&options).unwrap();
+        ptxas(&p.text, what);
+        p
+    };
+    for opt_level in [0, 2, 3] {
+        let what = format!("f32, opt level {}", opt_level);
+        let app = arithmetic(config(CompilerType::Native, opt_level, true));
+        let p = f32_ptx(&app, Layout::Soa, &what);
+        assert!(!p.text.contains("f64"), "{}:\n{}", what, p.text);
+        for pat in [
+            "shl.b64 %ldi, %ldi, 2;",
+            "shl.b64 %a0, %i, 2;",
+            "ld.global.nc.b32",
+            "div.rn.f32",
+            "sqrt.rn.f32",
+            ".reg .b32 %ret, %tmp, %x<4>;",
+            // 0.75
+            "0f3F400000",
+        ] {
+            assert!(
+                p.text.contains(pat),
+                "{}: no `{}` in\n{}",
+                what,
+                pat,
+                p.text
+            );
+        }
+        assert!(!p.text.contains("0d"), "{}", what);
+    }
+    // AoS: slot k of a point at 4 k bytes
+    let app = arithmetic(config(CompilerType::Native, 2, true));
+    let p = f32_ptx(&app, Layout::Aos, "f32, aos");
+    assert!(p.text.contains("[%pin+4]"), "{}", p.text);
+
+    // a complex model: funclets and masks on 32 bits
+    let p = f32_ptx(&complex(false, false, 2), Layout::Soa, "f32, complex");
+    assert!(p.text.contains("brx.idx %site, $SITES;"));
+    assert!(!p.text.contains("f64"), "{}", p.text);
+
+    // the math library through f64
+    let (x, y) = (var("x"), var("y"));
+    let app = Compiler::with_config(config(CompilerType::Native, 2, true))
+        .compile(&[x.clone(), y.clone()], &[&x.sin() + &x.exp(), x.pow(&y)])
+        .unwrap();
+    let p = f32_ptx(&app, Layout::Soa, "f32, math functions");
+    for pat in [
+        "cvt.f64.f32 %d0, %ret;",
+        "st.param.b64 [arg0], %d0;",
+        "call.uni (ret0), __sj_sin, (arg0);",
+        "call.uni (ret0), __sj_power, (arg0, arg1);",
+        "ld.param.b64 %d0, [ret0];",
+        "cvt.rn.f32.f64 %ret, %d0;",
+    ] {
+        assert!(p.text.contains(pat), "no `{}` in\n{}", pat, p.text);
+    }
+}
+
 #[test]
 fn unsupported_functions() {
     let x = var("x");

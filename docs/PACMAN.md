@@ -55,6 +55,8 @@ r/runner out arena/*.json && pacman replay --scalar --against out artifacts/qq_z
 | `--cuda` | runner | A CUDA runner (below). |
 | `--sm LIST` | runner | The GPUs' SM numbers, e.g. `80,90,120` (implies `--cuda`; default: the local GPU's). |
 | `--jobs N` | runner | `ptxas` runs at a time (default: the CPUs). |
+| `--f32` | runner | f32 CUDA kernels (with `--cuda`; below). |
+| `--set KEY=VALUE` | runner | An option of the kernels' configuration (symjit's `set_option`, e.g. `stable_math=true`), set before they are compiled (CPU and CUDA runners); may be repeated. |
 
 `extract` selects the members whose paths match one of its MEMBER arguments (a path, or a
 pattern: `*` matches any characters, `/` included, `?` one); without them it extracts the kernels.
@@ -555,6 +557,15 @@ equals the CPU runners' result. Totals are bit-equal to stock RustiCol; one heli
 - each call costs about 5 ms of GPU overhead (launches, copies, synchronization).
 
 So the GPU needs RustiCol to pass many points per call (`plans/pacman-ptx/INTEGRATION.md` §2.3).
+
+**f32 runners (`--cuda --f32`).** The leaves are `sjb2ptx --f32` kernels; the interface and
+RustiCol's side are unchanged (f64 planes in and out). `runner.c` (`#define F32 1`) keeps the f64
+device arena and its copies, and adds an f32 arena of the same planes and two conversion kernels
+(`CONVERT_PTX`, compiled by the driver). After the copies in, it rounds the planes read first into
+the f32 arena; after the leaves, it widens the planes to copy back into the f64 arena. The copies
+over PCIe are therefore the f64 runner's. The `runner` executable and the statistics (`, f32`)
+work as before. Results are not bit-equal to the CPU: the test compares the toy execution with the
+scalar replay within 1e-6. Accuracy and speed for Z+6g: `plans/pacman-ptx/F32.md`.
 
 A `pacman` RustiCol build loads runners with `PACMAN_RUNNER=LIB[:LIB...]`.
 Each compiled engine takes the library whose metadata matches it and calls it in place of its leaf

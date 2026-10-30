@@ -113,8 +113,13 @@ pub struct Kernels {
 /// The kernels of `spec` as object files: one per distinct kernel, and for each leaf the index
 /// of its kernel. `members` maps member paths to their bytes. `lanes`: 1 for scalar kernels, 4
 /// or 8 for SIMD kernels (`SavedModel::object_simd`: AVX2, AVX-512) of that many points per
-/// call.
-pub fn objects(spec: &Spec, members: &HashMap<&str, &[u8]>, lanes: u32) -> Result<Kernels> {
+/// call. `settings`: configuration options for the kernels (`SavedModel::read_with`).
+pub fn objects(
+    spec: &Spec,
+    members: &HashMap<&str, &[u8]>,
+    lanes: u32,
+    settings: &[(String, String)],
+) -> Result<Kernels> {
     let mut objects = Vec::new();
     let mut stack = 0;
     let mut index: HashMap<&str, usize> = HashMap::new();
@@ -127,7 +132,7 @@ pub fn objects(spec: &Spec, members: &HashMap<&str, &[u8]>, lanes: u32) -> Resul
         let bytes = members
             .get(call.member.as_str())
             .ok_or_else(|| anyhow!("evaluators.pacbin has no kernel `{}`", call.member))?;
-        let model = SavedModel::read(&mut &bytes[..])
+        let model = SavedModel::read_with(&mut &bytes[..], settings)
             .with_context(|| format!("cannot read `{}`", call.member))?;
         let config = model.config();
         let prog = &model.prog;
@@ -176,20 +181,28 @@ pub fn objects(spec: &Spec, members: &HashMap<&str, &[u8]>, lanes: u32) -> Resul
 
 /// The kernels of `spec` as PTX modules for the CUDA runner: one per leaf (`pacman_leaf<k>`),
 /// with its planes compiled in (inputs then outputs, as the `.mapping` rows), for `.target
-/// sm_<sm>`.
-pub fn ptx_modules(spec: &Spec, members: &HashMap<&str, &[u8]>, sm: u32) -> Result<Vec<String>> {
+/// sm_<sm>`; with `f32`, single-precision kernels on an arena of floats. `settings` as for
+/// `objects`.
+pub fn ptx_modules(
+    spec: &Spec,
+    members: &HashMap<&str, &[u8]>,
+    sm: u32,
+    f32: bool,
+    settings: &[(String, String)],
+) -> Result<Vec<String>> {
     let mut modules = Vec::new();
     for (k, call) in spec.calls.iter().enumerate() {
         let bytes = members
             .get(call.member.as_str())
             .ok_or_else(|| anyhow!("evaluators.pacbin has no kernel `{}`", call.member))?;
-        let mut model = SavedModel::read(&mut &bytes[..])
+        let mut model = SavedModel::read_with(&mut &bytes[..], settings)
             .with_context(|| format!("cannot read `{}`", call.member))?;
         if !model.config().direct_arena() {
             bail!("`{}` is not a plane (direct-arena) kernel", call.member);
         }
         let mut options = crate::ptx::PtxOptions::new(&format!("pacman_leaf{}", k));
         options.sm = sm;
+        options.f32 = f32;
         options.mapping = Some(call.inputs.iter().chain(&call.outputs).copied().collect());
         let ptx = model.ptx(&options).with_context(|| {
             format!("{}: cannot compile `{}` into PTX", call.label, call.member)
@@ -1043,8 +1056,11 @@ pub fn build(dir: &Path, cc: &str, kernels: usize) -> Result<()> {
 }
 
 /// `runner.c` of the CUDA runner: the execution `spec`, the leaves' fatbinaries
-/// (`kernels/leaf<k>.fatbin`, embedded) and `pacman_runner_v1_run` on the GPU.
-pub fn runner_cuda_c(spec: &Spec) -> String {
+/// (`kernels/leaf<k>.fatbin`, embedded) and `pacman_runner_v1_run` on the GPU. With `f32` the
+/// leaves are single precision: the f64 planes RustiCol passes are copied as before into the f64
+/// device arena, converted into an f32 one for the leaves, and the planes copied back are
+/// converted back to f64 first (`CONVERT_PTX`).
+pub fn runner_cuda_c(spec: &Spec, f32: bool) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -1064,7 +1080,22 @@ pub fn runner_cuda_c(spec: &Spec) -> String {
         spec.arena.len(),
         env!("CARGO_PKG_VERSION")
     );
+    let _ = writeln!(
+        s,
+        "/* 1: the leaves are f32 kernels on an f32 copy of the arena */\n#define F32 {}\n",
+        f32 as u8
+    );
     s.push_str(&tables_c(spec));
+    if f32 {
+        s.push_str(
+            "/* the conversions between the f64 and the f32 arenas (PTX, compiled by the driver) */\n",
+        );
+        s.push_str("static const char CONVERT_PTX[] =\n");
+        for line in CONVERT_PTX.lines() {
+            let _ = writeln!(s, "    \"{}\\n\"", line.replace('\t', "\\t"));
+        }
+        s.push_str("    ;\n\n");
+    }
     s.push_str("/* the leaves' kernels: fatbinaries of their cubins, embedded */\n__asm__(\n");
     s.push_str("    \".section .rodata\\n\"\n");
     for k in 0..spec.calls.len() {
@@ -1087,6 +1118,116 @@ pub fn runner_cuda_c(spec: &Spec) -> String {
     s.push_str(RUN_CUDA_C);
     s
 }
+
+/// The f32 runner's conversion kernels, `pacman_to_f32` and `pacman_to_f64`, each
+/// `(src, dst, planes, count, n, ld)`: for the `count` planes listed in `planes` (u32; y: one
+/// plane per block row, strided by the grid) and the points `0 .. n` (x: one thread per point),
+/// `dst[p * ld + i] = src[p * ld + i]`, rounded to nearest into f32 (exact back to f64).
+const CONVERT_PTX: &str = "\
+.version 8.3
+.target sm_70
+.address_size 64
+.visible .entry pacman_to_f32(.param .u64 src, .param .u64 dst, .param .u64 planes,
+    .param .u64 count, .param .u64 n, .param .u64 ld)
+{
+    .reg .pred %p<2>;
+    .reg .u32 %t<4>;
+    .reg .u64 %a<10>;
+    .reg .f64 %d;
+    .reg .f32 %f;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.x;
+    mov.u32 %t2, %tid.x;
+    mul.wide.u32 %a0, %t0, %t1;
+    cvt.u64.u32 %a1, %t2;
+    add.u64 %a0, %a0, %a1;
+    ld.param.u64 %a1, [n];
+    setp.ge.u64 %p0, %a0, %a1;
+    @%p0 bra $Ldone;
+    ld.param.u64 %a2, [src];
+    cvta.to.global.u64 %a2, %a2;
+    ld.param.u64 %a3, [dst];
+    cvta.to.global.u64 %a3, %a3;
+    ld.param.u64 %a4, [planes];
+    cvta.to.global.u64 %a4, %a4;
+    ld.param.u64 %a5, [count];
+    ld.param.u64 %a6, [ld];
+    mov.u32 %t3, %ctaid.y;
+    cvt.u64.u32 %a7, %t3;
+    mov.u32 %t3, %nctaid.y;
+    cvt.u64.u32 %a8, %t3;
+$Lloop:
+    setp.ge.u64 %p1, %a7, %a5;
+    @%p1 bra $Ldone;
+    shl.b64 %a9, %a7, 2;
+    add.u64 %a9, %a9, %a4;
+    ld.global.u32 %t3, [%a9];
+    cvt.u64.u32 %a9, %t3;
+    mul.lo.u64 %a9, %a9, %a6;
+    add.u64 %a9, %a9, %a0;
+    shl.b64 %a1, %a9, 3;
+    add.u64 %a1, %a1, %a2;
+    ld.global.f64 %d, [%a1];
+    cvt.rn.f32.f64 %f, %d;
+    shl.b64 %a1, %a9, 2;
+    add.u64 %a1, %a1, %a3;
+    st.global.f32 [%a1], %f;
+    add.u64 %a7, %a7, %a8;
+    bra.uni $Lloop;
+$Ldone:
+    ret;
+}
+.visible .entry pacman_to_f64(.param .u64 src, .param .u64 dst, .param .u64 planes,
+    .param .u64 count, .param .u64 n, .param .u64 ld)
+{
+    .reg .pred %p<2>;
+    .reg .u32 %t<4>;
+    .reg .u64 %a<10>;
+    .reg .f64 %d;
+    .reg .f32 %f;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.x;
+    mov.u32 %t2, %tid.x;
+    mul.wide.u32 %a0, %t0, %t1;
+    cvt.u64.u32 %a1, %t2;
+    add.u64 %a0, %a0, %a1;
+    ld.param.u64 %a1, [n];
+    setp.ge.u64 %p0, %a0, %a1;
+    @%p0 bra $Ldone;
+    ld.param.u64 %a2, [src];
+    cvta.to.global.u64 %a2, %a2;
+    ld.param.u64 %a3, [dst];
+    cvta.to.global.u64 %a3, %a3;
+    ld.param.u64 %a4, [planes];
+    cvta.to.global.u64 %a4, %a4;
+    ld.param.u64 %a5, [count];
+    ld.param.u64 %a6, [ld];
+    mov.u32 %t3, %ctaid.y;
+    cvt.u64.u32 %a7, %t3;
+    mov.u32 %t3, %nctaid.y;
+    cvt.u64.u32 %a8, %t3;
+$Lloop:
+    setp.ge.u64 %p1, %a7, %a5;
+    @%p1 bra $Ldone;
+    shl.b64 %a9, %a7, 2;
+    add.u64 %a9, %a9, %a4;
+    ld.global.u32 %t3, [%a9];
+    cvt.u64.u32 %a9, %t3;
+    mul.lo.u64 %a9, %a9, %a6;
+    add.u64 %a9, %a9, %a0;
+    shl.b64 %a1, %a9, 2;
+    add.u64 %a1, %a1, %a2;
+    ld.global.f32 %f, [%a1];
+    cvt.f64.f32 %d, %f;
+    shl.b64 %a1, %a9, 3;
+    add.u64 %a1, %a1, %a3;
+    st.global.f64 [%a1], %d;
+    add.u64 %a7, %a7, %a8;
+    bra.uni $Lloop;
+$Ldone:
+    ret;
+}
+";
 
 /// The fixed part of the CUDA runner's `runner.c`.
 const RUN_CUDA_C: &str = r#"/* the CUDA driver API, opened with dlopen (the types and symbols of CUDA 13's cuda.h) */
@@ -1132,6 +1273,11 @@ static struct {
     CUfunction functions[NUM_LEAVES];
     CUdeviceptr arena; /* NUM_PLANES planes of `ld` points */
     size_t ld;
+#if F32
+    CUdeviceptr arena32; /* the f32 arena the leaves run on, NUM_PLANES planes of `ld` points */
+    CUdeviceptr lists;   /* the planes converted in, then those converted out (2 x NUM_PLANES) */
+    CUfunction to_f32, to_f64;
+#endif
     int copy_all; /* PACMAN_RUNNER_COPY_BACK=all or PACMAN_SAVE_ARENA: every written plane */
     /* PACMAN_RUNNER_STREAMS=S (default 8): the independent leaves of a group run on S streams */
     unsigned num_streams;
@@ -1149,6 +1295,7 @@ static struct {
         CUresult (*MemAlloc)(CUdeviceptr *, size_t);
         CUresult (*MemFree)(CUdeviceptr);
         CUresult (*Memcpy2DUnaligned)(const CUDA_MEMCPY2D *);
+        CUresult (*MemcpyHtoD)(CUdeviceptr, const void *, size_t);
         CUresult (*LaunchKernel)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned,
                                  unsigned, unsigned, CUstream, void **, void **);
         CUresult (*GetErrorString)(CUresult, const char **);
@@ -1180,9 +1327,10 @@ static double now(void) {
 __attribute__((destructor)) static void print_stats(void) {
     if (STATS.on && STATS.calls > 0) {
         fprintf(stderr,
-                "pacman runner (%s of %s): %llu calls, %llu points, %llu copies (%.1f MB), "
+                "pacman runner (%s of %s%s): %llu calls, %llu points, %llu copies (%.1f MB), "
                 "%u streams, %llu groups, %.3f s (%.2f us/point)\n",
-                METADATA.execution, METADATA.process, STATS.calls, STATS.points, STATS.copies,
+                METADATA.execution, METADATA.process, F32 ? ", f32" : "", STATS.calls,
+                STATS.points, STATS.copies,
                 STATS.bytes * 1e-6, G.num_streams, STATS.groups, STATS.seconds,
                 STATS.points ? 1e6 * STATS.seconds / STATS.points : 0.0);
     }
@@ -1296,6 +1444,7 @@ static int cuda_open(void) {
         {(void **)&G.cu.MemAlloc, "cuMemAlloc_v2"},
         {(void **)&G.cu.MemFree, "cuMemFree_v2"},
         {(void **)&G.cu.Memcpy2DUnaligned, "cuMemcpy2DUnaligned_v2"},
+        {(void **)&G.cu.MemcpyHtoD, "cuMemcpyHtoD_v2"},
         {(void **)&G.cu.LaunchKernel, "cuLaunchKernel"},
         {(void **)&G.cu.GetErrorString, "cuGetErrorString"},
         {(void **)&G.cu.StreamCreate, "cuStreamCreate"},
@@ -1322,6 +1471,15 @@ static int cuda_open(void) {
         CU(G.cu.ModuleLoadData(&module, LEAF_FATBINS[k]), "cuModuleLoadData (no kernel for this GPU?)");
         CU(G.cu.ModuleGetFunction(&G.functions[k], module, name), "cuModuleGetFunction");
     }
+#if F32
+    {
+        CUmodule module;
+        CU(G.cu.ModuleLoadData(&module, CONVERT_PTX), "cuModuleLoadData (the conversions)");
+        CU(G.cu.ModuleGetFunction(&G.to_f32, module, "pacman_to_f32"), "cuModuleGetFunction");
+        CU(G.cu.ModuleGetFunction(&G.to_f64, module, "pacman_to_f64"), "cuModuleGetFunction");
+        CU(G.cu.MemAlloc(&G.lists, 2 * NUM_PLANES * sizeof(uint32_t)), "cuMemAlloc (plane lists)");
+    }
+#endif
     if (G.num_streams > 1) {
         /* non-blocking: ordered against the default stream (the copies) only by the events */
         CU(G.cu.EventCreate(&G.fork, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
@@ -1340,6 +1498,26 @@ fail:
 const pacman_runner_metadata *pacman_runner_v1_metadata(void) {
     return &METADATA;
 }
+
+#if F32
+static uint32_t LISTS[2 * NUM_PLANES];
+
+/* converts the `count` planes listed at `offset` in G.lists from the arena `src` into `dst`
+   (`f`: pacman_to_f32 or pacman_to_f64), points 0 .. `points`, on the default stream */
+static int convert(CUfunction f, CUdeviceptr src, CUdeviceptr dst, uint32_t offset,
+                   uint32_t count, uint32_t points) {
+    if (count == 0) return 0;
+    CUdeviceptr list = G.lists + (CUdeviceptr)offset * sizeof(uint32_t);
+    unsigned long long num = count, n = points, ld = G.ld;
+    void *args[] = {&src, &dst, &list, &num, &n, &ld};
+    unsigned rows = count < 65535 ? count : 65535;
+    CU(G.cu.LaunchKernel(f, (points + BLOCK - 1) / BLOCK, rows, 1, BLOCK, 1, 1, 0, NULL, args, NULL),
+       "cuLaunchKernel (a conversion)");
+    return 0;
+fail:
+    return -1;
+}
+#endif
 
 /* starts a new group of leaves (no plane marked) */
 static void new_group(void) {
@@ -1469,6 +1647,13 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
             G.arena = 0;
             G.ld = 0;
         }
+#if F32
+        if (G.arena32 != 0) {
+            G.cu.MemFree(G.arena32);
+            G.arena32 = 0;
+        }
+        CU(G.cu.MemAlloc(&G.arena32, (size_t)NUM_PLANES * ld * sizeof(float)), "cuMemAlloc (the f32 arena)");
+#endif
         CU(G.cu.MemAlloc(&G.arena, (size_t)NUM_PLANES * ld * sizeof(double)), "cuMemAlloc (the arena)");
         G.ld = ld;
     }
@@ -1476,12 +1661,32 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
         goto fail;
     }
     unsigned long long n = point_count, stride = G.ld;
+#if F32
+    /* the planes copied in, rounded into the f32 arena, and those to copy back */
+    uint32_t num_in = 0, num_out = 0;
+    for (uint32_t p = 0; p < NUM_PLANES; p++) {
+        if (FLAGS[p] & READ_FIRST) LISTS[num_in++] = p;
+        if (FLAGS[p] & COPY_BACK) LISTS[NUM_PLANES + num_out++] = p;
+    }
+    CU(G.cu.MemcpyHtoD(G.lists, LISTS, sizeof LISTS), "cuMemcpyHtoD (plane lists)");
+    if (convert(G.to_f32, G.arena, G.arena32, 0, num_in, point_count) != 0) {
+        goto fail;
+    }
+    CUdeviceptr arena = G.arena32;
+#else
     CUdeviceptr arena = G.arena;
+#endif
     void *args[] = {&arena, &arena, &arena, &n, &stride, &stride};
     unsigned grid = (point_count + BLOCK - 1) / BLOCK;
     if (launch(leaves, count, grid, args) != 0) {
         goto fail;
     }
+#if F32
+    /* on the default stream, which the leaves' streams joined */
+    if (convert(G.to_f64, G.arena32, G.arena, NUM_PLANES, num_out, point_count) != 0) {
+        goto fail;
+    }
+#endif
     /* synchronous: it waits for the kernels (the default stream joins the streams) */
     if (copy_planes(planes, point_start, point_count, FLAGS, COPY_BACK, 0) != 0) {
         goto fail;
@@ -1544,7 +1749,13 @@ pub fn cuda_tool(var: &str, name: &str) -> String {
 
 /// Writes the CUDA runner of `spec` into `dir`: `kernels/leaf<k>.ptx`, `runner.c`,
 /// `pacman_runner.h`, `main.c`, `Makefile`.
-pub fn write_cuda(dir: &Path, spec: &Spec, modules: &[String], sms: &[u32]) -> Result<()> {
+pub fn write_cuda(
+    dir: &Path,
+    spec: &Spec,
+    modules: &[String],
+    sms: &[u32],
+    f32: bool,
+) -> Result<()> {
     let write = |name: &str, bytes: &[u8]| -> Result<()> {
         let path = dir.join(name);
         if let Some(parent) = path.parent() {
@@ -1556,7 +1767,7 @@ pub fn write_cuda(dir: &Path, spec: &Spec, modules: &[String], sms: &[u32]) -> R
     for (k, m) in modules.iter().enumerate() {
         write(&format!("kernels/leaf{}.ptx", k), m.as_bytes())?;
     }
-    write("runner.c", runner_cuda_c(spec).as_bytes())?;
+    write("runner.c", runner_cuda_c(spec, f32).as_bytes())?;
     write("pacman_runner.h", RUNNER_H.as_bytes())?;
     write("main.c", MAIN_C.as_bytes())?;
     write("Makefile", makefile_cuda(modules.len(), sms).as_bytes())?;
@@ -1808,7 +2019,7 @@ int main(int argc, char **argv) {
         ]
         .into_iter()
         .collect();
-        let kernels = objects(&spec, &members, lanes).unwrap();
+        let kernels = objects(&spec, &members, lanes, &[]).unwrap();
         assert!(kernels.stack > 0);
         write(&dir, &spec, &kernels).unwrap();
         build(&dir, "cc", kernels.objects.len()).unwrap();
@@ -1906,7 +2117,7 @@ int main(int argc, char **argv) {
         ]
         .into_iter()
         .collect();
-        let kernels = objects(&spec, &members, 1).unwrap();
+        let kernels = objects(&spec, &members, 1, &[]).unwrap();
         assert_eq!(kernels.of_leaf, vec![0, 1]);
         write(&dir, &spec, &kernels).unwrap();
         build(&dir, "cc", kernels.objects.len()).unwrap();
@@ -2002,6 +2213,129 @@ int main(int argc, char **argv) {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The f32 CUDA runner: its conversion kernels pass ptxas, and on the GPU its arena equals
+    /// the scalar replay within f32 rounding (the toy leaves add a few roundings to the inputs').
+    /// Skipped as `cuda_runner_reproduces_the_scalar_replay`.
+    #[test]
+    fn f32_cuda_runner_is_close_to_the_scalar_replay() {
+        let ptxas = cuda_tool("PTXAS", "ptxas");
+        let fatbinary = cuda_tool("FATBINARY", "fatbinary");
+        let have = |tool: &str| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !have_cc() || !have(&ptxas) || !have(&fatbinary) {
+            eprintln!("no C compiler or CUDA toolkit: the f32 CUDA runner is not built");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pacman-f32-runner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::write(dir.join("convert.ptx"), CONVERT_PTX).unwrap();
+        let out = Command::new(&ptxas)
+            .args(["-arch=sm_80", "convert.ptx", "-o", "convert.cubin"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let (a, b) = (
+            plane_application(PRODUCT_PLUS_ONE),
+            plane_application(SQUARE_MINUS),
+        );
+        let spec = spec();
+        let members: HashMap<&str, &[u8]> = [
+            (spec.calls[0].member.as_str(), &a[..]),
+            (spec.calls[1].member.as_str(), &b[..]),
+        ]
+        .into_iter()
+        .collect();
+        let modules = ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, true, &[]).unwrap();
+        assert!(modules.iter().all(|m| !m.contains("f64")));
+        // f32 planes: the leaf's plane offsets are in floats
+        assert!(
+            modules[1].contains("shl.b64 %ldo, %ldo, 2;"),
+            "{}",
+            modules[1]
+        );
+        let sms = [local_sm().unwrap_or(80)];
+        write_cuda(&dir, &spec, &modules, &sms, true).unwrap();
+        assert!(std::fs::read_to_string(dir.join("runner.c"))
+            .unwrap()
+            .contains("#define F32 1"));
+        build_cuda(&dir, "cc", modules.len(), &sms, 2).unwrap();
+
+        let json = dir.join("t.e0.r0.json");
+        std::fs::write(&json, RECORDING).unwrap();
+        let mut pre = vec![7.0; 12 * 9];
+        for p in [0, 1, 5, 6, 10] {
+            for i in 0..9 {
+                pre[p * 9 + i] = ((p * 9 + i) as f64 * 0.37).sin();
+            }
+        }
+        pre[11 * 9..12 * 9].fill(0.0);
+        let bytes: Vec<u8> = pre.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(json.with_extension("pre"), &bytes).unwrap();
+        std::fs::write(json.with_extension("post"), &bytes).unwrap();
+        let rec = Recording::read(&json).unwrap();
+        let kernels = [
+            CpuKernel::load("a", &a).unwrap(),
+            CpuKernel::load("b", &b).unwrap(),
+        ];
+        let ks: Vec<&CpuKernel> = kernels.iter().collect();
+        let scalar = replay::Options {
+            scalar: true,
+            ..replay::Options::default()
+        };
+        let want = replay::replay(&rec, &spec.calls, &ks, &scalar)
+            .unwrap()
+            .arena;
+
+        let out = Command::new(dir.join("runner"))
+            .args(["--whole", "out"])
+            .arg(&json)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success()
+            && (stderr.contains("libcuda")
+                || stderr.contains("cuInit")
+                || stderr.contains("cuDeviceGet"))
+            && std::env::var_os("SJB2PTX_REQUIRE_GPU").is_none()
+        {
+            eprintln!("skipped: no usable GPU ({})", stderr.trim());
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        assert!(out.status.success(), "{}", stderr);
+        let got = recording::read_f64s(&dir.join("out/t.e0.r0.arena"), 12 * 9).unwrap();
+        let mut rounded = 0;
+        for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+            if w.is_nan() {
+                assert!(g.is_nan(), "value {}: {} for NaN", k, g);
+                continue;
+            }
+            assert!(
+                (g - w).abs() <= 1e-6 * w.abs().max(1.0),
+                "value {}: {} for {}",
+                k,
+                g,
+                w
+            );
+            rounded += (g != w) as usize;
+        }
+        // the leaves' outputs went through f32
+        assert!(rounded > 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The CUDA runner of the same execution equals the scalar replay bit for bit, per tile
     /// and on all points; the library refuses bad arguments before it opens the GPU. Skipped
     /// without the CUDA toolkit (ptxas, fatbinary) or a C compiler, and its GPU steps without a
@@ -2034,7 +2368,7 @@ int main(int argc, char **argv) {
         ]
         .into_iter()
         .collect();
-        let modules = ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM).unwrap();
+        let modules = ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, false, &[]).unwrap();
         assert_eq!(modules.len(), 2);
         // the leaf's planes are compiled in: leaf 1 writes plane 3 (re) and 8 (im)
         assert!(modules[1].contains(".visible .entry pacman_leaf1("));
@@ -2044,7 +2378,7 @@ int main(int argc, char **argv) {
             modules[1]
         );
         let sms = [local_sm().unwrap_or(80)];
-        write_cuda(&dir, &spec, &modules, &sms).unwrap();
+        write_cuda(&dir, &spec, &modules, &sms, false).unwrap();
         build_cuda(&dir, "cc", modules.len(), &sms, 2).unwrap();
 
         // the library's argument checks come before the GPU
@@ -2146,14 +2480,17 @@ int main(int argc, char **argv) {
         spec.calls.truncate(1);
         let member = spec.calls[0].member.clone();
         let members: HashMap<&str, &[u8]> = [(member.as_str(), &a[..])].into_iter().collect();
-        assert!(ptx_modules(&spec, &members, 70).is_ok());
+        assert!(ptx_modules(&spec, &members, 70, false, &[]).is_ok());
         for (outputs, message) in [
             (vec![2, 2], "writes plane 2 twice"),
             (vec![2, 5], "reads and writes plane 5"),
             (vec![2], "the plane mapping has 5 planes"),
         ] {
             spec.calls[0].outputs = outputs;
-            let err = format!("{:#}", ptx_modules(&spec, &members, 70).unwrap_err());
+            let err = format!(
+                "{:#}",
+                ptx_modules(&spec, &members, 70, false, &[]).unwrap_err()
+            );
             assert!(err.contains(message), "{}", err);
         }
     }
@@ -2166,14 +2503,14 @@ int main(int argc, char **argv) {
         spec.calls[0].outputs.push(4);
         let member = spec.calls[0].member.clone();
         let members: HashMap<&str, &[u8]> = [(member.as_str(), &a[..])].into_iter().collect();
-        let err = format!("{:#}", objects(&spec, &members, 1).unwrap_err());
+        let err = format!("{:#}", objects(&spec, &members, 1, &[]).unwrap_err());
         assert!(
             err.contains("a table of 4 input and 3 output planes"),
             "{}",
             err
         );
         spec.calls[0].member = "missing".into();
-        assert!(objects(&spec, &members, 1).is_err());
+        assert!(objects(&spec, &members, 1, &[]).is_err());
     }
 
     #[test]
