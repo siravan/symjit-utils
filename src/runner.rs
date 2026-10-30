@@ -3510,11 +3510,14 @@ int main(int argc, char **argv) {
     /// contributions with initializing and accumulating rows on interleaved destinations, the
     /// three propagators, identity finalization, closures), once per `PACMAN_RECURRENCE_KERNEL`.
     /// `acc` and `cache` equal `v1` bit for bit; `df64` (the default) and `df64cache` agree with
-    /// it to 1e-9. Skipped without nvcc or a C compiler, and its GPU steps without a usable GPU
+    /// it to 1e-9. Under each kernel, the amplitudes zeroed on the device and kept there reduce
+    /// (`pacman_recurrence_v1_reduce`) to the host's reduction of the copied-back ones, bit for
+    /// bit; the first calls pass the struct of before the reduction. Skipped without nvcc or a C compiler, and its GPU steps without a usable GPU
     /// unless `SJB2PTX_REQUIRE_GPU` is set.
     const RECTEST_C: &str = r#"
 #include <dlfcn.h>
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3533,7 +3536,17 @@ typedef struct {
     uint32_t upload_current_runs, upload_amplitude_runs, download_amplitude_runs,
         download_current_runs;
     uint32_t stride, points;
+    const uint32_t *zero_amplitude;
+    uint32_t zero_amplitude_runs, flags;
 } call_t;
+
+typedef struct {
+    uint32_t abi_version, struct_size;
+    const uint32_t *planes;
+    const double *weights;
+    double *output;
+    uint32_t count, points;
+} reduce_t;
 
 enum { P = 12, A = 9, F = 6, X = 3, S = 3, K = 4 };
 static uint64_t words[64];
@@ -3558,7 +3571,8 @@ int main(int argc, char **argv) {
     void *lib = dlopen(argv[1], RTLD_NOW);
     if (!lib) { fprintf(stderr, "%s\n", dlerror()); return 1; }
     int (*run)(const call_t *) = (int (*)(const call_t *))dlsym(lib, "pacman_recurrence_v1_run");
-    if (!run) return 1;
+    int (*reduce)(const reduce_t *) = (int (*)(const reduce_t *))dlsym(lib, "pacman_recurrence_v1_reduce");
+    if (!run || !reduce) return 1;
     /* sources: Weyl 0, 2; vectors 4, 8, 12; tensor 16 (22 planes); stage 1 at 32..43, stage 2 at 44..49 */
     clear(32, 12);
     contrib(2, 1, 0, 0, 4, 32, 0, 0, 1);
@@ -3597,7 +3611,7 @@ int main(int argc, char **argv) {
     call_t c;
     memset(&c, 0, sizeof c);
     c.abi_version = 1;
-    c.struct_size = sizeof c;
+    c.struct_size = (uint32_t)offsetof(call_t, zero_amplitude); /* the struct before the reduction */
     c.words = words;
     c.words_key = 7;
     c.word_count = nwords;
@@ -3617,6 +3631,37 @@ int main(int argc, char **argv) {
         if (status == 3) return 77; /* device error: no usable GPU */
         if (status != 0) { fprintf(stderr, "status %d\n", status); return 1; }
     }
+    /* the amplitudes cleared on the device and kept there, then reduced: as the host reduces them */
+    static double want[POINTS], got[POINTS];
+    uint32_t planes[4] = {2, 0, 1, 0};
+    double weights[4] = {0.75, 1.5, -0.25, 2.0};
+    for (int i = 0; i < POINTS; i++) {
+        want[i] = got[i] = 0.125 * i;
+        for (int k = 0; k < 4; k++) {
+            double re = are[planes[k] * STRIDE + i], im = aim[planes[k] * STRIDE + i];
+            want[i] += weights[k] * fma(re, re, im * im);
+        }
+    }
+    static double are2[AP * STRIDE], aim2[AP * STRIDE];
+    for (int k = 0; k < AP * STRIDE; k++) are2[k] = aim2[k] = 1e300; /* must not be uploaded */
+    call_t k2 = c;
+    k2.struct_size = sizeof k2;
+    k2.amplitude_re = are2;
+    k2.amplitude_im = aim2;
+    k2.upload_amplitude_runs = 0;
+    k2.zero_amplitude = up_a;
+    k2.zero_amplitude_runs = 1;
+    k2.flags = 1;
+    if (run(&k2) != 0) return 1;
+    for (int k = 0; k < AP * STRIDE; k++)
+        if (are2[k] != 1e300 || aim2[k] != 1e300) { fprintf(stderr, "kept amplitudes were copied back\n"); return 1; }
+    reduce_t r = {1, sizeof r, planes, weights, got, 4, POINTS};
+    if (reduce(&r) != 0) { fprintf(stderr, "reduce failed\n"); return 1; }
+    for (int i = 0; i < POINTS; i++)
+        if (memcmp(&want[i], &got[i], 8)) {
+            fprintf(stderr, "reduction, point %d: %.17g for %.17g\n", i, got[i], want[i]);
+            return 1;
+        }
     for (int p = 0; p < AP; p++)
         for (int i = 0; i < POINTS; i++) printf("%.17g %.17g\n", are[p * STRIDE + i], aim[p * STRIDE + i]);
     return 0;
@@ -3641,7 +3686,7 @@ int main(int argc, char **argv) {
         build_recurrence(&dir, &[sm]).unwrap();
         std::fs::write(dir.join("rectest.c"), RECTEST_C).unwrap();
         let cc = Command::new("cc")
-            .args(["-O1", "-o", "rectest", "rectest.c", "-ldl", "-lm"])
+            .args(["-O1", "-ffp-contract=off", "-o", "rectest", "rectest.c", "-ldl", "-lm"])
             .current_dir(&dir)
             .output()
             .unwrap();

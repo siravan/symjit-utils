@@ -32,6 +32,7 @@
 //        recurrence_runner.cu
 
 #include <cuda_runtime.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,7 +68,27 @@ typedef struct {
     uint32_t upload_current_runs, upload_amplitude_runs, download_amplitude_runs,
         download_current_runs;
     uint32_t stride, points;
+    // since the reduction: a caller may pass a struct that ends here (the fields below are 0)
+    const uint32_t *zero_amplitude;  // amplitude runs set to zero on the device, not uploaded
+    uint32_t zero_amplitude_runs;
+    uint32_t flags;                  // PACMAN_RECURRENCE_KEEP_AMPLITUDES
 } pacman_recurrence_call;
+
+// the download_amplitude runs stay on the device (not copied back) for pacman_recurrence_v1_reduce
+#define PACMAN_RECURRENCE_KEEP_AMPLITUDES 1u
+
+// After a run with PACMAN_RECURRENCE_KEEP_AMPLITUDES: for each point i < points,
+//   output[i] += weights[k] * fma(re, re, im * im)   for k = 0 .. count-1 in order,
+// with (re, im) the run's amplitude plane planes[k] at point i: RustiCol's LC diagonal reduction
+// (`accumulate_lc_diagonal_amplitude`), operation for operation. `output` is the caller's tile.
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    const uint32_t *planes;
+    const double *weights;
+    double *output;
+    uint32_t count, points;
+} pacman_recurrence_reduce;
 
 enum {
     PACMAN_RECURRENCE_OK = 0,
@@ -76,6 +97,7 @@ enum {
 };
 
 extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *call);
+extern "C" int pacman_recurrence_v1_reduce(const pacman_recurrence_reduce *reduce);
 
 // ---- device code ---------------------------------------------------------------------------
 
@@ -738,8 +760,15 @@ struct Device {
     std::unordered_map<uint64_t, std::pair<uint64_t *, uint32_t>> words;
     uint64_t *scratch_words = nullptr;
     size_t scratch_capacity = 0;
+    // the last run with PACMAN_RECURRENCE_KEEP_AMPLITUDES (for a reduction)
+    bool kept = false, kept_df64 = false;
+    size_t kept_stride = 0, kept_points = 0, kept_planes = 0;
+    // reduction buffers
+    uint32_t *rplanes = nullptr;
+    double *rweights = nullptr, *routput = nullptr;
+    size_t rcount_capacity = 0, routput_capacity = 0;
     // statistics (PACMAN_RUNNER_STATS=1)
-    uint64_t calls = 0, points = 0, copies = 0, bytes = 0;
+    uint64_t calls = 0, points = 0, copies = 0, bytes = 0, reductions = 0;
     double seconds = 0;
     bool stats = false;
 };
@@ -1206,10 +1235,11 @@ bool convert_runs(bool to_df, double *re, double *im, const uint32_t *runs, uint
 void print_stats() {
     if (!device.stats || device.calls == 0) return;
     fprintf(stderr,
-            "pacman recurrence runner: %llu calls, %llu points, %llu copies (%.1f MB), %.3f s "
-            "(%.2f us/point)\n",
+            "pacman recurrence runner: %llu calls, %llu points, %llu reductions, %llu copies (%.1f MB), "
+            "%.3f s (%.2f us/point)\n",
             (unsigned long long)device.calls, (unsigned long long)device.points,
-            (unsigned long long)device.copies, device.bytes / 1e6, device.seconds,
+            (unsigned long long)device.reductions, (unsigned long long)device.copies, device.bytes / 1e6,
+            device.seconds,
             device.points ? device.seconds * 1e6 / device.points : 0.0);
 }
 
@@ -1221,7 +1251,7 @@ double now() {
 
 }  // namespace
 
-extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *call) {
+static void initialize() {
     static bool initialized = false;
     if (!initialized) {
         initialized = true;
@@ -1229,10 +1259,23 @@ extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *call) {
         device.stats = s && *s && strcmp(s, "0") != 0;
         atexit(print_stats);
     }
-    if (!call || call->abi_version != PACMAN_RECURRENCE_ABI ||
-        call->struct_size != sizeof(pacman_recurrence_call) || call->points == 0 ||
-        call->points > call->stride || !call->words)
+}
+
+extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *in) {
+    initialize();
+    const size_t v1_size = offsetof(pacman_recurrence_call, zero_amplitude);
+    if (!in || in->abi_version != PACMAN_RECURRENCE_ABI ||
+        (in->struct_size != sizeof(pacman_recurrence_call) && in->struct_size != v1_size))
         return PACMAN_RECURRENCE_INVALID;
+    pacman_recurrence_call full;
+    memset(&full, 0, sizeof full);
+    memcpy(&full, in, in->struct_size);
+    const pacman_recurrence_call *call = &full;
+    if (call->points == 0 || call->points > call->stride || !call->words ||
+        (call->zero_amplitude_runs && !call->zero_amplitude))
+        return PACMAN_RECURRENCE_INVALID;
+    device.kept = false;
+    bool keep = call->flags & PACMAN_RECURRENCE_KEEP_AMPLITUDES;
     double start = device.stats ? now() : 0;
     size_t stride = call->stride;
     size_t current_doubles = (size_t)call->current_planes * stride;
@@ -1299,6 +1342,16 @@ extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *call) {
                    call->upload_amplitude, call->upload_amplitude_runs, call->amplitude_planes,
                    stride, call->points, true))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
+    // amplitudes the caller has cleared: zero on the device (zero is zero in df64 too)
+    for (uint32_t r = 0; r < call->zero_amplitude_runs; r++) {
+        uint32_t first = call->zero_amplitude[2 * r], n = call->zero_amplitude[2 * r + 1];
+        if (first > call->amplitude_planes || n > call->amplitude_planes - first)
+            return PACMAN_RECURRENCE_INVALID;
+        size_t pitch = stride * sizeof(double), width = (size_t)call->points * sizeof(double);
+        if (failed(cudaMemset2D(device.are + (size_t)first * stride, pitch, 0, width, n), "zero") ||
+            failed(cudaMemset2D(device.aim + (size_t)first * stride, pitch, 0, width, n), "zero"))
+            return PACMAN_RECURRENCE_DEVICE_ERROR;
+    }
 
     Arena a;
     a.cre = device.cre;
@@ -1327,27 +1380,109 @@ extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *call) {
     if (!prepared) return PACMAN_RECURRENCE_DEVICE_ERROR;
     if (!launch(*prepared, dwords, call->word_count, w, a, call->points))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
+    uint32_t amplitude_runs = keep ? 0 : call->download_amplitude_runs;
     if (df64 && (!convert_runs(false, device.are, device.aim, call->download_amplitude,
-                               call->download_amplitude_runs, stride, call->points) ||
+                               amplitude_runs, stride, call->points) ||
                  !convert_runs(false, device.cre, device.cim, call->download_current,
                                call->download_current_runs, stride, call->points)))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
     if (failed(cudaDeviceSynchronize(), "kernel")) return PACMAN_RECURRENCE_DEVICE_ERROR;
 
     if (!copy_runs(device.are, device.aim, call->amplitude_re, call->amplitude_im,
-                   call->download_amplitude, call->download_amplitude_runs,
+                   call->download_amplitude, amplitude_runs,
                    call->amplitude_planes, stride, call->points, false) ||
         !copy_runs(device.cre, device.cim, call->current_re, call->current_im,
                    call->download_current, call->download_current_runs, call->current_planes,
                    stride, call->points, false))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
     if (df64 && (!convert_runs(true, device.are, device.aim, call->download_amplitude,
-                               call->download_amplitude_runs, stride, call->points) ||
+                               amplitude_runs, stride, call->points) ||
                  !convert_runs(true, device.cre, device.cim, call->download_current,
                                call->download_current_runs, stride, call->points)))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
+    if (keep) {
+        device.kept = true;
+        device.kept_df64 = df64;
+        device.kept_stride = stride;
+        device.kept_points = call->points;
+        device.kept_planes = call->amplitude_planes;
+    }
     device.calls++;
     device.points += call->points;
+    if (device.stats) device.seconds += now() - start;
+    return PACMAN_RECURRENCE_OK;
+}
+
+// ---- the LC diagonal reduction on the device --------------------------------------------------
+
+// a df64 value as the double it stands for: as `to_f64` converts it, so the reduction of a df64 run
+// equals the host's reduction of its copied-back amplitudes bit for bit
+__device__ __forceinline__ double as_double(double x) { return x; }
+__device__ __forceinline__ double as_double(D x) { return __dadd_rn((double)x.hi, (double)x.lo); }
+
+template <class R>
+__global__ void reduce_kernel(const double *are, const double *aim, size_t ld, const uint32_t *planes,
+                              const double *weights, uint32_t count, double *output, uint32_t points) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= points) return;
+    double acc = output[i];
+    for (uint32_t k = 0; k < count; k++) {
+        size_t at = (size_t)__ldg(planes + k) * ld + i;
+        double re = as_double(ldr<R>(are, at)), im = as_double(ldr<R>(aim, at));
+        // weight * real.mul_add(real, imaginary * imaginary), then +=
+        acc = __dadd_rn(acc, __dmul_rn(__ldg(weights + k), __fma_rn(re, re, __dmul_rn(im, im))));
+    }
+    output[i] = acc;
+}
+
+extern "C" int pacman_recurrence_v1_reduce(const pacman_recurrence_reduce *r) {
+    initialize();
+    if (!r || r->abi_version != PACMAN_RECURRENCE_ABI || r->struct_size != sizeof(pacman_recurrence_reduce) ||
+        (r->count && (!r->planes || !r->weights)) || !r->output)
+        return PACMAN_RECURRENCE_INVALID;
+    if (!device.kept || r->points != device.kept_points) return PACMAN_RECURRENCE_INVALID;
+    for (uint32_t k = 0; k < r->count; k++)
+        if (r->planes[k] >= device.kept_planes) return PACMAN_RECURRENCE_INVALID;
+    double start = device.stats ? now() : 0;
+    if (r->count > device.rcount_capacity) {
+        if (device.rplanes) cudaFree(device.rplanes);
+        if (device.rweights) cudaFree(device.rweights);
+        device.rplanes = nullptr;
+        device.rweights = nullptr;
+        device.rcount_capacity = 0;
+        if (failed(cudaMalloc((void **)&device.rplanes, r->count * sizeof(uint32_t)), "reduction") ||
+            failed(cudaMalloc((void **)&device.rweights, r->count * sizeof(double)), "reduction"))
+            return PACMAN_RECURRENCE_DEVICE_ERROR;
+        device.rcount_capacity = r->count;
+    }
+    if (r->points > device.routput_capacity) {
+        if (device.routput) cudaFree(device.routput);
+        device.routput = nullptr;
+        device.routput_capacity = 0;
+        if (failed(cudaMalloc((void **)&device.routput, r->points * sizeof(double)), "reduction"))
+            return PACMAN_RECURRENCE_DEVICE_ERROR;
+        device.routput_capacity = r->points;
+    }
+    size_t bytes = r->points * sizeof(double);
+    if ((r->count && (failed(cudaMemcpy(device.rplanes, r->planes, r->count * sizeof(uint32_t),
+                                        cudaMemcpyHostToDevice), "reduction") ||
+                      failed(cudaMemcpy(device.rweights, r->weights, r->count * sizeof(double),
+                                        cudaMemcpyHostToDevice), "reduction"))) ||
+        failed(cudaMemcpy(device.routput, r->output, bytes, cudaMemcpyHostToDevice), "reduction"))
+        return PACMAN_RECURRENCE_DEVICE_ERROR;
+    unsigned block = 128, grid = (r->points + block - 1) / block;
+    if (device.kept_df64)
+        reduce_kernel<D><<<grid, block>>>(device.are, device.aim, device.kept_stride, device.rplanes,
+                                          device.rweights, r->count, device.routput, r->points);
+    else
+        reduce_kernel<double><<<grid, block>>>(device.are, device.aim, device.kept_stride, device.rplanes,
+                                               device.rweights, r->count, device.routput, r->points);
+    if (failed(cudaGetLastError(), "reduction") ||
+        failed(cudaMemcpy(r->output, device.routput, bytes, cudaMemcpyDeviceToHost), "reduction"))
+        return PACMAN_RECURRENCE_DEVICE_ERROR;
+    device.copies += 2;
+    device.bytes += 2 * bytes;
+    device.reductions++;
     if (device.stats) device.seconds += now() - start;
     return PACMAN_RECURRENCE_OK;
 }
