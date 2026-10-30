@@ -2461,6 +2461,29 @@ pub fn build_cuda(
     Ok(())
 }
 
+/// The recurrence runner (`pacman recurrence-runner`): one CUDA kernel that runs any RustiCol
+/// recurrence plan given as row words.
+pub const RECURRENCE_RUNNER_CU: &str = include_str!("recurrence_runner.cu");
+
+/// Writes `recurrence_runner.cu` into `dir` and builds `librecurrence.so` from it with `nvcc`
+/// (`NVCC`) for the GPUs `sms`. Without FMA contraction, the kernel's results equal RustiCol's
+/// scalar ones bit for bit.
+pub fn build_recurrence(dir: &Path, sms: &[u32]) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create `{}`", dir.display()))?;
+    std::fs::write(dir.join("recurrence_runner.cu"), RECURRENCE_RUNNER_CU)
+        .with_context(|| format!("cannot write into `{}`", dir.display()))?;
+    let nvcc = cuda_tool("NVCC", "nvcc");
+    let mut args: Vec<String> = ["-O3", "-fmad=false", "-Xcompiler", "-fPIC", "-shared"]
+        .map(String::from)
+        .to_vec();
+    args.extend(["-cudart".into(), "static".into()]);
+    for sm in sms {
+        args.push(format!("-gencode=arch=compute_{0},code=sm_{0}", sm));
+    }
+    args.extend(["-o", "librecurrence.so", "recurrence_runner.cu"].map(String::from));
+    run(dir, &nvcc, &args)
+}
+
 /// The compute capability of the local GPU as an SM number (`nvidia-smi`), if there is one.
 pub fn local_sm() -> Option<u32> {
     let out = Command::new("nvidia-smi")

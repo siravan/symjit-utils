@@ -25,6 +25,7 @@ Usage: pacman info [OPTIONS] <FILE.pacbin>...
        pacman bindings [OPTIONS] <ARTIFACT|execution.json>
        pacman replay [OPTIONS] <ARTIFACT> <RECORDING.json|DIR>...
        pacman runner [OPTIONS] <ARTIFACT> [RECORDING.json]
+       pacman recurrence-runner [-o DIR] [--sm LIST]
 
 Reads the evaluator containers of pyAmpliCol artifacts (`evaluators.pacbin`,
 pacbin-v1) with the checks pyAmpliCol makes, digests included. Their kernels
@@ -63,6 +64,10 @@ Commands:
             exports the interface of `pacman_runner.h` (pacman-runner-v1);
             the execution is a recording's, or `--execution` (with
             `--process` where several processes have it)
+  recurrence-runner
+            builds `librecurrence.so`: one CUDA kernel that runs whole
+            RustiCol recurrence plans, given as row words (RustiCol's
+            `PACMAN_RECURRENCE_RUNNER`); the same library serves every process
 
 Options:
       --compile        info: compile every kernel for this machine (never run)
@@ -106,8 +111,9 @@ Options:
       --cuda           runner: a CUDA runner (the kernels as PTX, compiled by
                        ptxas for the GPUs of --sm; needs the CUDA toolkit to
                        build, only the NVIDIA driver to run)
-      --sm LIST        runner: the GPUs' SM numbers, e.g. 80,90,120 (implies
-                       --cuda; default: the local GPU's, from nvidia-smi)
+      --sm LIST        runner, recurrence-runner: the GPUs' SM numbers, e.g.
+                       80,90,120 (for runner it implies --cuda; default: the
+                       local GPU's, from nvidia-smi)
       --jobs N         runner: ptxas runs at a time (default: the CPUs)
       --f32            runner: f32 CUDA kernels (with --cuda): the f64 planes
                        are rounded to f32 on the GPU and the results widened
@@ -131,6 +137,8 @@ enum Command {
     Bindings(PathBuf, bindings::Options),
     Replay(Replay),
     Runner(Runner),
+    /// the output directory and the SMs (empty: the local GPU's)
+    RecurrenceRunner(PathBuf, Vec<u32>),
 }
 
 struct Runner {
@@ -184,7 +192,11 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
         return Ok(Command::Version);
     }
     let Some(command) = args.first() else {
-        return Err("no command (info, list, extract, plan, bindings, replay or runner)".into());
+        return Err(
+            "no command (info, list, extract, plan, bindings, replay, runner or \
+             recurrence-runner)"
+                .into(),
+        );
     };
 
     let mut inputs: Vec<String> = Vec::new();
@@ -264,7 +276,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             ("replay", "-v" | "--verbose") => verbose = true,
             ("replay", "--dump") => dump = Some(value(arg)?.into()),
             ("replay", "--against") => against = Some(value(arg)?.into()),
-            ("runner", "-o" | "--output") => output = Some(value(arg)?),
+            ("runner" | "recurrence-runner", "-o" | "--output") => output = Some(value(arg)?),
             ("runner", "--execution") => execution = Some(value(arg)?),
             ("runner", "--process") => process = Some(value(arg)?),
             ("runner", "--cc") => cc = value(arg)?,
@@ -307,7 +319,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
                     _ => return Err(format!("`--set` takes KEY=VALUE, not `{}`", kv)),
                 }
             }
-            ("runner", "--sm") => {
+            ("runner" | "recurrence-runner", "--sm") => {
                 let v = value(arg)?;
                 let list = cuda.get_or_insert_with(Vec::new);
                 for sm in v.split(',') {
@@ -408,8 +420,16 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             fallback,
             jobs,
         })),
+        "recurrence-runner" if !inputs.is_empty() => {
+            Err("`recurrence-runner` takes no arguments besides its options".into())
+        }
+        "recurrence-runner" => Ok(Command::RecurrenceRunner(
+            output.unwrap_or_else(|| "recurrence-runner".into()).into(),
+            cuda.unwrap_or_default(),
+        )),
         _ => Err(format!(
-            "unknown command `{}` (info, list, extract, plan, bindings, replay or runner)",
+            "unknown command `{}` (info, list, extract, plan, bindings, replay, runner or \
+             recurrence-runner)",
             command
         )),
     }
@@ -1016,6 +1036,28 @@ fn cuda_runner(
     Ok(())
 }
 
+/// `pacman recurrence-runner`.
+fn recurrence_runner(dir: &Path, sms: &[u32]) -> Result<()> {
+    let mut sms = sms.to_vec();
+    if sms.is_empty() {
+        sms.push(symjit_utils::runner::local_sm().ok_or_else(|| {
+            anyhow!("no local GPU found (nvidia-smi): name the GPUs with `--sm`, e.g. --sm 80,90")
+        })?);
+    }
+    sms.sort_unstable();
+    sms.dedup();
+    let start = std::time::Instant::now();
+    symjit_utils::runner::build_recurrence(dir, &sms)?;
+    let sms: Vec<String> = sms.iter().map(|sm| format!("sm_{}", sm)).collect();
+    eprintln!(
+        "pacman: built {}/librecurrence.so for {} in {:.1} s",
+        dir.display(),
+        sms.join(", "),
+        start.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 /// `pacman runner`.
 fn runner(args: &Runner) -> Result<()> {
     let (processes, pacbin) = bindings::load(&args.artifact)?;
@@ -1190,6 +1232,7 @@ fn main() -> ExitCode {
             };
         }
         Command::Runner(args) => runner(&args),
+        Command::RecurrenceRunner(dir, sms) => recurrence_runner(&dir, &sms),
         Command::Bindings(input, options) => {
             bindings(&input, &options).or_else(|err| match err.downcast_ref::<std::io::Error>() {
                 Some(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
