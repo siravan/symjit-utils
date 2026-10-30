@@ -24,7 +24,9 @@
 //                                 X first component factor, K count
 //
 // The arithmetic is RustiCol's (`recurrence_intrinsic_direct.rs`, `recurrence_closure_direct.rs`)
-// operation for operation; built with -fmad=false, the results equal RustiCol's bit for bit.
+// operation for operation; built with -fmad=false, the f64 kernels (`v1`, `acc`, `cache`) equal
+// RustiCol's bit for bit. The default kernel, `df64`, emulates f64 with pairs of f32 (for GPUs whose
+// FP64 is slow, e.g. RTX); see `Options` below for PACMAN_RECURRENCE_KERNEL and its variants.
 //
 // Build: nvcc -O3 -fmad=false -Xcompiler -fPIC -shared -cudart static -o librecurrence.so
 //        recurrence_runner.cu
@@ -1047,14 +1049,14 @@ bool copy_runs(double *dre, double *dim, double *hre, double *him, const uint32_
     return true;
 }
 
-// the kernel variant: PACMAN_RECURRENCE_KERNEL=v1|acc|cache|df64|df64cache (v1 and acc and
-// cache are RustiCol's arithmetic bit for bit; df64 and df64cache run acc and cache in df64 on a
-// df64 copy of the arena), PACMAN_RECURRENCE_SLOTS (cache, 32), PACMAN_RECURRENCE_BLOCK (threads
+// the kernel variant: PACMAN_RECURRENCE_KERNEL=df64 (the default)|df64cache|v1|acc|cache (v1,
+// acc and cache are RustiCol's arithmetic bit for bit; df64 and df64cache run acc and cache in
+// df64 on a df64 copy of the arena, for GPUs whose FP64 is slow), PACMAN_RECURRENCE_SLOTS (cache, 32), PACMAN_RECURRENCE_BLOCK (threads
 // per block; 128, cache 64), PACMAN_RECURRENCE_SORT=0 (do not sort the contribution rows by
 // destination)
 struct Options {
-    Variant variant = V1;
-    bool df64 = false;
+    Variant variant = ACC;
+    bool df64 = true;
     int slots = 32, block = 0;
 };
 
@@ -1069,12 +1071,13 @@ Options options() {
     if (read) return o;
     read = true;
     const char *k = getenv("PACMAN_RECURRENCE_KERNEL");
-    if (k && !strcmp(k, "acc")) o.variant = ACC;
-    else if (k && !strcmp(k, "cache")) o.variant = CACHE;
+    if (k && !strcmp(k, "v1")) { o.variant = V1; o.df64 = false; }
+    else if (k && !strcmp(k, "acc")) { o.variant = ACC; o.df64 = false; }
+    else if (k && !strcmp(k, "cache")) { o.variant = CACHE; o.df64 = false; }
     else if (k && !strcmp(k, "df64")) { o.variant = ACC; o.df64 = true; }
     else if (k && !strcmp(k, "df64cache")) { o.variant = CACHE; o.df64 = true; }
-    else if (k && *k && strcmp(k, "v1"))
-        fprintf(stderr, "pacman recurrence runner: unknown PACMAN_RECURRENCE_KERNEL=%s, using v1\\n", k);
+    else if (k && *k && strcmp(k, "df64"))
+        fprintf(stderr, "pacman recurrence runner: unknown PACMAN_RECURRENCE_KERNEL=%s, using df64\n", k);
     if (const char *v = getenv("PACMAN_RECURRENCE_SLOTS")) o.slots = std::max(16, std::min(255, atoi(v)));
     if (const char *v = getenv("PACMAN_RECURRENCE_BLOCK")) o.block = std::max(32, std::min(1024, atoi(v)));
     if (o.block == 0) o.block = o.variant == CACHE ? (o.df64 ? 128 : 64) : 128;
