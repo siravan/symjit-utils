@@ -375,6 +375,7 @@ pub fn runner_c(spec: &Spec, kernels: &Kernels) -> String {
         "#define LANES {}\n#define KERNEL_STACK {}u /* the largest stack a kernel reserves */\n",
         kernels.lanes, kernels.stack
     );
+    s.push_str(REDUCE_C);
     s.push_str(RUN_C);
     s
 }
@@ -625,6 +626,63 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
     return run_points(planes, leaves, count, point_start, point_start + point_count, point_count);
 #endif
 }
+
+int pacman_runner_v1_run_reduce(double *const *planes, uint32_t num_planes,
+                                const uint32_t *leaves, uint32_t num_leaves, uint32_t point_start,
+                                uint32_t point_count, const pacman_runner_reduction *reduction,
+                                double *out) {
+    if (!reduction_ok(reduction, out)) {
+        return PACMAN_RUNNER_BAD_ARGUMENTS;
+    }
+    int status = pacman_runner_v1_run(planes, num_planes, leaves, num_leaves, point_start,
+                                      point_count);
+    if (status == PACMAN_RUNNER_OK) {
+        reduce_host(planes, reduction, point_start, point_count, out);
+    }
+    return status;
+}
+"#;
+
+/// The reduction's checks and the reduction on the host (`pacman_runner_v1_run_reduce`), in
+/// both runners' `runner.c`; compiled with `-ffp-contract=off`.
+const REDUCE_C: &str = r#"/* whether `r` is a well-formed reduction of this arena's amplitudes */
+static int reduction_ok(const pacman_runner_reduction *r, const double *out) {
+    if (r == NULL || out == NULL || r->struct_size != sizeof *r ||
+        (r->num_groups > 0 && (r->offsets == NULL || r->weights == NULL))) {
+        return 0;
+    }
+    if (r->num_groups == 0) return 1;
+    if (r->offsets[0] != 0) return 0;
+    for (uint32_t g = 0; g < r->num_groups; g++) {
+        if (r->offsets[g + 1] < r->offsets[g]) return 0;
+    }
+    uint32_t terms = r->offsets[r->num_groups];
+    if (terms > 0 && r->indices == NULL) return 0;
+    for (uint32_t k = 0; k < terms; k++) {
+        if (r->indices[k] >= METADATA.regions[PACMAN_AMPLITUDE_RE][1]) return 0;
+    }
+    return 1;
+}
+
+/* the reduction of the host planes, points start .. start + count, into out[0 .. count) */
+static void reduce_host(double *const *planes, const pacman_runner_reduction *r, uint32_t start,
+                        uint32_t count, double *out) {
+    double *const *re_planes = planes + METADATA.regions[PACMAN_AMPLITUDE_RE][0];
+    double *const *im_planes = planes + METADATA.regions[PACMAN_AMPLITUDE_IM][0];
+    for (uint32_t i = 0; i < count; i++) out[i] = 0.0;
+    for (uint32_t g = 0; g < r->num_groups; g++) {
+        double weight = r->weights[g];
+        for (uint32_t i = 0; i < count; i++) {
+            double re = 0.0, im = 0.0;
+            for (uint32_t k = r->offsets[g]; k < r->offsets[g + 1]; k++) {
+                re += re_planes[r->indices[k]][start + i];
+                im += im_planes[r->indices[k]][start + i];
+            }
+            out[i] += weight * (re * re + im * im);
+        }
+    }
+}
+
 "#;
 
 /// `pacman_runner.h`: the interface.
@@ -687,6 +745,36 @@ const pacman_runner_metadata *pacman_runner_v1_metadata(void);
 int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint32_t *leaves,
                          uint32_t num_leaves, uint32_t point_start, uint32_t point_count);
 
+/* The reduction of the amplitudes into one value per point that RustiCol applies after the
+   leaves (`reduce_planes_f64_into_selected_slice` with coherent groups, or without groups: a
+   group per amplitude). For point i:
+
+       value = 0.0
+       for each group g in order:
+           re = 0.0, im = 0.0
+           for k in offsets[g] .. offsets[g + 1]: re += Re A[indices[k]], im += Im A[indices[k]]
+           value += weights[g] * (re * re + im * im)
+
+   with the operations in this order and rounded one by one (no fused multiply-add), so that the
+   value equals RustiCol's bit for bit. A is the amplitude region: Re A[j] is arena plane
+   regions[PACMAN_AMPLITUDE_RE][0] + j, Im A[j] plane regions[PACMAN_AMPLITUDE_IM][0] + j. */
+typedef struct {
+    uint32_t struct_size;     /* sizeof(pacman_runner_reduction) */
+    uint32_t num_groups;
+    const uint32_t *offsets;  /* num_groups + 1, offsets[0] = 0, nondecreasing */
+    const uint32_t *indices;  /* offsets[num_groups] amplitude indices */
+    const double *weights;    /* num_groups */
+} pacman_runner_reduction;
+
+/* Runs the leaves as pacman_runner_v1_run, then the reduction: out[i] for point point_start + i
+   (point_count values). The amplitude planes are left as they are in `planes` (a CUDA runner
+   does not copy them back, unless PACMAN_RUNNER_COPY_BACK=all or PACMAN_SAVE_ARENA is set).
+   Optional: runners of pacman 0.3.0 lack it (look it up with dlsym). */
+int pacman_runner_v1_run_reduce(double *const *planes, uint32_t num_planes,
+                                const uint32_t *leaves, uint32_t num_leaves, uint32_t point_start,
+                                uint32_t point_count, const pacman_runner_reduction *reduction,
+                                double *out);
+
 #ifdef __cplusplus
 }
 #endif
@@ -699,11 +787,13 @@ pub const MAIN_C: &str = r#"/* main.c: runs arena recordings of RustiCol (NAME.j
    writes the arena after the run as OUTDIR/NAME.arena (the layout of NAME.post), for
    `pacman replay --against OUTDIR`. Generated by pacman.
 
-       runner [--whole] [--no-poison] OUTDIR RECORDING.json...
+       runner [--whole] [--no-poison] [--reduce FILE] OUTDIR RECORDING.json...
 
    The schedule (the recording's leaves) runs per recorded tile, or on all points at once
    (--whole). Planes the schedule writes before it reads them are first filled with NaNs
-   (0x7ff8deadbeef0000 | plane), unless --no-poison. */
+   (0x7ff8deadbeef0000 | plane), unless --no-poison. With --reduce, the calls are
+   pacman_runner_v1_run_reduce with the reduction of FILE (a line per group: its weight, then its
+   amplitude indices), and the values (one double per point) go to OUTDIR/NAME.reduced too. */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -802,7 +892,53 @@ static double seconds(void) {
     return t.tv_sec + 1e-9 * t.tv_nsec;
 }
 
-static int run_recording(const char *json_path, const char *outdir, int whole, int poison) {
+/* --reduce FILE: the reduction */
+static pacman_runner_reduction REDUCTION;
+
+static int read_reduction(const char *path) {
+    size_t size;
+    char *text = read_file(path, &size);
+    if (text == NULL) {
+        return 0;
+    }
+    size_t groups = 0, terms = 0, cap = 16;
+    uint32_t *offsets = malloc((cap + 1) * sizeof *offsets), *indices = malloc(cap * sizeof *indices);
+    double *weights = malloc(cap * sizeof *weights);
+    offsets[0] = 0;
+    for (char *line = strtok(text, "\n"); line != NULL; line = strtok(NULL, "\n")) {
+        char *p = line, *end;
+        double w = strtod(p, &end);
+        if (end == p) continue; /* a blank line */
+        if (groups == cap || terms + 64 > cap) {
+            cap = 2 * cap + 64;
+            offsets = realloc(offsets, (cap + 1) * sizeof *offsets);
+            indices = realloc(indices, cap * sizeof *indices);
+            weights = realloc(weights, cap * sizeof *weights);
+        }
+        weights[groups] = w;
+        for (p = end;;) {
+            unsigned long k = strtoul(p, &end, 10);
+            if (end == p) break;
+            if (terms == cap) {
+                cap *= 2;
+                indices = realloc(indices, cap * sizeof *indices);
+            }
+            indices[terms++] = (uint32_t)k;
+            p = end;
+        }
+        offsets[++groups] = (uint32_t)terms;
+    }
+    free(text);
+    REDUCTION.struct_size = sizeof REDUCTION;
+    REDUCTION.num_groups = (uint32_t)groups;
+    REDUCTION.offsets = offsets;
+    REDUCTION.indices = indices;
+    REDUCTION.weights = weights;
+    return 1;
+}
+
+static int run_recording(const char *json_path, const char *outdir, int whole, int poison,
+                         int reduce) {
     const pacman_runner_metadata *md = pacman_runner_v1_metadata();
     size_t size;
     char *json = read_file(json_path, &size);
@@ -813,7 +949,7 @@ static int run_recording(const char *json_path, const char *outdir, int whole, i
     uint64_t planes = 0, points = 0;
     size_t num_tiles = 0, num_c2p = 0, num_leaves = 0;
     uint32_t *tiles = NULL, *c2p = NULL, *schedule = NULL;
-    double *arena = NULL;
+    double *arena = NULL, *values = NULL;
     double **table = NULL;
     uint8_t *first = NULL;
     char *pre = NULL;
@@ -898,6 +1034,7 @@ static int run_recording(const char *json_path, const char *outdir, int whole, i
 
     /* run, per tile or once */
     table = malloc(planes * sizeof *table);
+    values = calloc(points > 0 ? points : 1, sizeof *values);
     double start = seconds();
     uint64_t offset = 0;
     size_t calls = whole ? 1 : num_tiles;
@@ -908,8 +1045,11 @@ static int run_recording(const char *json_path, const char *outdir, int whole, i
             goto done;
         }
         for (uint64_t p = 0; p < planes; p++) table[p] = arena + p * points + offset;
-        int s = pacman_runner_v1_run(table, (uint32_t)planes, schedule, (uint32_t)num_leaves, 0,
-                                     (uint32_t)n);
+        int s = reduce ? pacman_runner_v1_run_reduce(table, (uint32_t)planes, schedule,
+                                                     (uint32_t)num_leaves, 0, (uint32_t)n,
+                                                     &REDUCTION, values + offset)
+                       : pacman_runner_v1_run(table, (uint32_t)planes, schedule,
+                                              (uint32_t)num_leaves, 0, (uint32_t)n);
         if (s != PACMAN_RUNNER_OK) {
             fprintf(stderr, "runner: %s: tile %zu: status %d\n", json_path, t, s);
             goto done;
@@ -930,6 +1070,16 @@ static int run_recording(const char *json_path, const char *outdir, int whole, i
         goto done;
     }
     fclose(f);
+    if (reduce) {
+        snprintf(path, sizeof path, "%s/%.*s.reduced", outdir, (int)name, base);
+        f = fopen(path, "wb");
+        if (f == NULL || fwrite(values, sizeof(double), points, f) != points) {
+            fprintf(stderr, "runner: cannot write %s\n", path);
+            if (f != NULL) fclose(f);
+            goto done;
+        }
+        fclose(f);
+    }
     printf("%.*s: %zu leaves on %llu points in %zu call%s, %u planes poisoned: %.1f us, "
            "%.3f us/point -> %s\n",
            (int)name, base, num_leaves, (unsigned long long)points, calls, calls == 1 ? "" : "s",
@@ -943,12 +1093,13 @@ done:
     free(c2p);
     free(schedule);
     free(table);
+    free(values);
     free(first);
     return status;
 }
 
 int main(int argc, char **argv) {
-    int whole = 0, poison = 1, i = 1;
+    int whole = 0, poison = 1, reduce = 0, i = 1;
     /* a CUDA runner: the arenas written must be complete, currents included */
     setenv("PACMAN_RUNNER_COPY_BACK", "all", 1);
     for (; i < argc && argv[i][0] == '-'; i++) {
@@ -956,6 +1107,9 @@ int main(int argc, char **argv) {
             whole = 1;
         } else if (strcmp(argv[i], "--no-poison") == 0) {
             poison = 0;
+        } else if (strcmp(argv[i], "--reduce") == 0 && i + 1 < argc) {
+            if (!read_reduction(argv[++i])) return 2;
+            reduce = 1;
         } else {
             fprintf(stderr, "runner: unknown option %s\n", argv[i]);
             return 2;
@@ -964,14 +1118,14 @@ int main(int argc, char **argv) {
     if (argc - i < 2) {
         const pacman_runner_metadata *md = pacman_runner_v1_metadata();
         fprintf(stderr,
-                "usage: %s [--whole] [--no-poison] OUTDIR RECORDING.json...\n"
+                "usage: %s [--whole] [--no-poison] [--reduce FILE] OUTDIR RECORDING.json...\n"
                 "runs recordings of the execution %s of %s (%u leaves, %u planes)\n",
                 argv[0], md->execution, md->process, md->num_leaves, md->num_planes);
         return 2;
     }
     int status = 0;
     for (int k = i + 1; k < argc; k++) {
-        status |= run_recording(argv[k], argv[i], whole, poison);
+        status |= run_recording(argv[k], argv[i], whole, poison, reduce);
     }
     return status;
 }
@@ -987,7 +1141,7 @@ pub fn makefile(kernels: usize) -> String {
          KERNELS = {}\n\n\
          all: runner librunner.so\n\n\
          runner.o: runner.c pacman_runner.h\n\
-         \t$(CC) $(CFLAGS) -pthread -fPIC -c runner.c -o runner.o\n\n\
+         \t$(CC) $(CFLAGS) -ffp-contract=off -pthread -fPIC -c runner.c -o runner.o\n\n\
          librunner.so: runner.o $(KERNELS)\n\
          \t$(CC) -pthread -shared -o librunner.so runner.o $(KERNELS)\n\n\
          runner: main.c runner.o $(KERNELS) pacman_runner.h\n\
@@ -1022,7 +1176,14 @@ pub fn build(dir: &Path, cc: &str, kernels: usize) -> Result<()> {
     let objects: Vec<String> = (0..kernels).map(|k| format!("kernels/k{}.o", k)).collect();
     let steps: Vec<Vec<String>> = vec![
         [
-            "-O1", "-pthread", "-fPIC", "-c", "runner.c", "-o", "runner.o",
+            "-O1",
+            "-ffp-contract=off",
+            "-pthread",
+            "-fPIC",
+            "-c",
+            "runner.c",
+            "-o",
+            "runner.o",
         ]
         .map(String::from)
         .to_vec(),
@@ -1096,6 +1257,13 @@ pub fn runner_cuda_c(spec: &Spec, f32: bool) -> String {
         }
         s.push_str("    ;\n\n");
     }
+    s.push_str(
+        "/* the reduction (PTX, compiled by the driver) */\nstatic const char REDUCE_PTX[] =\n",
+    );
+    for line in REDUCE_PTX.lines() {
+        let _ = writeln!(s, "    \"{}\\n\"", line.replace('\t', "\\t"));
+    }
+    s.push_str("    ;\n\n");
     s.push_str("/* the leaves' kernels: fatbinaries of their cubins, embedded */\n__asm__(\n");
     s.push_str("    \".section .rodata\\n\"\n");
     for k in 0..spec.calls.len() {
@@ -1115,6 +1283,7 @@ pub fn runner_cuda_c(spec: &Spec, f32: bool) -> String {
         let _ = writeln!(s, "    pacman_leaf{}_fatbin,", k);
     }
     s.push_str("};\n\n");
+    s.push_str(REDUCE_C);
     s.push_str(RUN_CUDA_C);
     s
 }
@@ -1229,6 +1398,99 @@ $Ldone:
 }
 ";
 
+/// The CUDA runner's reduction kernel, `pacman_reduce(arena, ld, n, re0, im0, groups, offsets,
+/// indices, weights, out)`: one thread per point `i < n`, the loop of `pacman_runner.h` over the
+/// f64 arena (plane `p` of point `i` at `arena[p * ld + i]`; `re0`/`im0` the first real and
+/// imaginary amplitude planes), `out[i]` the value. `.rn` on every operation: ptxas fuses none.
+const REDUCE_PTX: &str = "\
+.version 8.3
+.target sm_70
+.address_size 64
+.visible .entry pacman_reduce(.param .u64 arena, .param .u64 ld, .param .u64 n,
+    .param .u64 re0, .param .u64 im0, .param .u64 groups, .param .u64 offsets,
+    .param .u64 indices, .param .u64 weights, .param .u64 out)
+{
+    .reg .pred %p<2>;
+    .reg .u32 %t<4>;
+    .reg .u64 %a<18>;
+    .reg .f64 %d<8>;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.x;
+    mov.u32 %t2, %tid.x;
+    mul.wide.u32 %a0, %t0, %t1;
+    cvt.u64.u32 %a1, %t2;
+    add.u64 %a0, %a0, %a1;
+    ld.param.u64 %a1, [n];
+    setp.ge.u64 %p0, %a0, %a1;
+    @%p0 bra $Ldone;
+    ld.param.u64 %a2, [arena];
+    cvta.to.global.u64 %a2, %a2;
+    ld.param.u64 %a3, [ld];
+    shl.b64 %a3, %a3, 3;
+    shl.b64 %a1, %a0, 3;
+    add.u64 %a2, %a2, %a1;
+    ld.param.u64 %a4, [re0];
+    ld.param.u64 %a5, [im0];
+    ld.param.u64 %a6, [groups];
+    ld.param.u64 %a7, [offsets];
+    cvta.to.global.u64 %a7, %a7;
+    ld.param.u64 %a8, [indices];
+    cvta.to.global.u64 %a8, %a8;
+    ld.param.u64 %a9, [weights];
+    cvta.to.global.u64 %a9, %a9;
+    mov.f64 %d0, 0d0000000000000000;
+    mov.u64 %a10, 0;
+$Lgroup:
+    setp.ge.u64 %p0, %a10, %a6;
+    @%p0 bra $Lstore;
+    shl.b64 %a11, %a10, 2;
+    add.u64 %a11, %a11, %a7;
+    ld.global.u32 %t0, [%a11];
+    ld.global.u32 %t1, [%a11+4];
+    cvt.u64.u32 %a12, %t0;
+    cvt.u64.u32 %a13, %t1;
+    mov.f64 %d1, 0d0000000000000000;
+    mov.f64 %d2, 0d0000000000000000;
+$Lterm:
+    setp.ge.u64 %p1, %a12, %a13;
+    @%p1 bra $Lsquare;
+    shl.b64 %a14, %a12, 2;
+    add.u64 %a14, %a14, %a8;
+    ld.global.u32 %t2, [%a14];
+    cvt.u64.u32 %a15, %t2;
+    add.u64 %a16, %a15, %a4;
+    mul.lo.u64 %a16, %a16, %a3;
+    add.u64 %a16, %a16, %a2;
+    ld.global.f64 %d3, [%a16];
+    add.u64 %a17, %a15, %a5;
+    mul.lo.u64 %a17, %a17, %a3;
+    add.u64 %a17, %a17, %a2;
+    ld.global.f64 %d4, [%a17];
+    add.rn.f64 %d1, %d1, %d3;
+    add.rn.f64 %d2, %d2, %d4;
+    add.u64 %a12, %a12, 1;
+    bra.uni $Lterm;
+$Lsquare:
+    mul.rn.f64 %d5, %d1, %d1;
+    mul.rn.f64 %d6, %d2, %d2;
+    add.rn.f64 %d5, %d5, %d6;
+    shl.b64 %a11, %a10, 3;
+    add.u64 %a11, %a11, %a9;
+    ld.global.f64 %d7, [%a11];
+    mul.rn.f64 %d5, %d7, %d5;
+    add.rn.f64 %d0, %d0, %d5;
+    add.u64 %a10, %a10, 1;
+    bra.uni $Lgroup;
+$Lstore:
+    ld.param.u64 %a11, [out];
+    cvta.to.global.u64 %a11, %a11;
+    add.u64 %a11, %a11, %a1;
+    st.global.f64 [%a11], %d0;
+$Ldone:
+    ret;
+}
+";
+
 /// The fixed part of the CUDA runner's `runner.c`.
 const RUN_CUDA_C: &str = r#"/* the CUDA driver API, opened with dlopen (the types and symbols of CUDA 13's cuda.h) */
 typedef int CUresult;
@@ -1278,6 +1540,12 @@ static struct {
     CUdeviceptr lists;   /* the planes converted in, then those converted out (2 x NUM_PLANES) */
     CUfunction to_f32, to_f64;
 #endif
+    /* the reduction: its kernel, its tables on the device (offsets, indices, weights) as last
+       uploaded and their host copy, and the values (`ld` doubles) */
+    CUfunction reduce;
+    CUdeviceptr tables, values;
+    size_t tables_size;
+    unsigned char *tables_host;
     int copy_all; /* PACMAN_RUNNER_COPY_BACK=all or PACMAN_SAVE_ARENA: every written plane */
     /* PACMAN_RUNNER_STREAMS=S (default 8): the independent leaves of a group run on S streams */
     unsigned num_streams;
@@ -1296,6 +1564,7 @@ static struct {
         CUresult (*MemFree)(CUdeviceptr);
         CUresult (*Memcpy2DUnaligned)(const CUDA_MEMCPY2D *);
         CUresult (*MemcpyHtoD)(CUdeviceptr, const void *, size_t);
+        CUresult (*MemcpyDtoH)(void *, CUdeviceptr, size_t);
         CUresult (*LaunchKernel)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned,
                                  unsigned, unsigned, CUstream, void **, void **);
         CUresult (*GetErrorString)(CUresult, const char **);
@@ -1314,7 +1583,7 @@ static uint32_t GROUP;
 /* PACMAN_RUNNER_STATS=1: calls, points, copies and time, printed when the library is unloaded */
 static struct {
     int on;
-    unsigned long long calls, points, copies, bytes, groups;
+    unsigned long long calls, points, copies, bytes, groups, reduced;
     double seconds;
 } STATS;
 
@@ -1327,10 +1596,10 @@ static double now(void) {
 __attribute__((destructor)) static void print_stats(void) {
     if (STATS.on && STATS.calls > 0) {
         fprintf(stderr,
-                "pacman runner (%s of %s%s): %llu calls, %llu points, %llu copies (%.1f MB), "
-                "%u streams, %llu groups, %.3f s (%.2f us/point)\n",
+                "pacman runner (%s of %s%s): %llu calls, %llu points (%llu reduced on the GPU), "
+                "%llu copies (%.1f MB), %u streams, %llu groups, %.3f s (%.2f us/point)\n",
                 METADATA.execution, METADATA.process, F32 ? ", f32" : "", STATS.calls,
-                STATS.points, STATS.copies,
+                STATS.points, STATS.reduced, STATS.copies,
                 STATS.bytes * 1e-6, G.num_streams, STATS.groups, STATS.seconds,
                 STATS.points ? 1e6 * STATS.seconds / STATS.points : 0.0);
     }
@@ -1445,6 +1714,7 @@ static int cuda_open(void) {
         {(void **)&G.cu.MemFree, "cuMemFree_v2"},
         {(void **)&G.cu.Memcpy2DUnaligned, "cuMemcpy2DUnaligned_v2"},
         {(void **)&G.cu.MemcpyHtoD, "cuMemcpyHtoD_v2"},
+        {(void **)&G.cu.MemcpyDtoH, "cuMemcpyDtoH_v2"},
         {(void **)&G.cu.LaunchKernel, "cuLaunchKernel"},
         {(void **)&G.cu.GetErrorString, "cuGetErrorString"},
         {(void **)&G.cu.StreamCreate, "cuStreamCreate"},
@@ -1470,6 +1740,11 @@ static int cuda_open(void) {
         snprintf(name, sizeof name, "pacman_leaf%u", k);
         CU(G.cu.ModuleLoadData(&module, LEAF_FATBINS[k]), "cuModuleLoadData (no kernel for this GPU?)");
         CU(G.cu.ModuleGetFunction(&G.functions[k], module, name), "cuModuleGetFunction");
+    }
+    {
+        CUmodule module;
+        CU(G.cu.ModuleLoadData(&module, REDUCE_PTX), "cuModuleLoadData (the reduction)");
+        CU(G.cu.ModuleGetFunction(&G.reduce, module, "pacman_reduce"), "cuModuleGetFunction");
     }
 #if F32
     {
@@ -1592,8 +1867,60 @@ fail:
     return -1;
 }
 
-int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint32_t *leaves,
-                         uint32_t num_leaves, uint32_t point_start, uint32_t point_count) {
+/* uploads the tables of `r` unless they equal the last ones, then reduces points 0 .. n of the
+   f64 arena into G.values, on the default stream */
+static int reduce_device(const pacman_runner_reduction *r, uint32_t n) {
+    uint32_t groups = r->num_groups, terms = groups > 0 ? r->offsets[groups] : 0;
+    size_t offsets_size = (groups + 1) * sizeof(uint32_t);
+    size_t indices_at = offsets_size;
+    size_t weights_at = (offsets_size + terms * sizeof(uint32_t) + 7) / 8 * 8;
+    size_t size = weights_at + groups * sizeof(double);
+    unsigned char *host = calloc(size, 1);
+    if (host == NULL) {
+        fprintf(stderr, "pacman runner: out of memory\n");
+        return -1;
+    }
+    if (groups > 0) {
+        memcpy(host, r->offsets, offsets_size);
+        memcpy(host + indices_at, r->indices, terms * sizeof(uint32_t));
+        memcpy(host + weights_at, r->weights, groups * sizeof(double));
+    }
+    if (size != G.tables_size || memcmp(host, G.tables_host, size) != 0) {
+        if (G.tables != 0) G.cu.MemFree(G.tables);
+        G.tables = 0;
+        free(G.tables_host);
+        G.tables_host = NULL;
+        G.tables_size = 0;
+        CU(G.cu.MemAlloc(&G.tables, size), "cuMemAlloc (the reduction's tables)");
+        CU(G.cu.MemcpyHtoD(G.tables, host, size), "cuMemcpyHtoD (the reduction's tables)");
+        G.tables_host = host;
+        G.tables_size = size;
+        host = NULL;
+    }
+    free(host);
+    host = NULL;
+    {
+        CUdeviceptr offsets = G.tables, indices = G.tables + indices_at,
+                    weights = G.tables + weights_at;
+        unsigned long long ld = G.ld, count = n, num_groups = groups,
+                           re0 = METADATA.regions[PACMAN_AMPLITUDE_RE][0],
+                           im0 = METADATA.regions[PACMAN_AMPLITUDE_IM][0];
+        void *args[] = {&G.arena,    &ld,      &count,   &re0,     &im0,
+                        &num_groups, &offsets, &indices, &weights, &G.values};
+        CU(G.cu.LaunchKernel(G.reduce, (n + BLOCK - 1) / BLOCK, 1, 1, BLOCK, 1, 1, 0, NULL, args,
+                             NULL),
+           "cuLaunchKernel (the reduction)");
+    }
+    return 0;
+fail:
+    free(host);
+    return -1;
+}
+
+/* pacman_runner_v1_run, and with `reduction` pacman_runner_v1_run_reduce */
+static int run(double *const *planes, uint32_t num_planes, const uint32_t *leaves,
+               uint32_t num_leaves, uint32_t point_start, uint32_t point_count,
+               const pacman_runner_reduction *reduction, double *out) {
     if (planes == NULL || num_planes != NUM_PLANES || point_count == 0 ||
         point_start > UINT32_MAX - point_count) {
         return PACMAN_RUNNER_BAD_ARGUMENTS;
@@ -1644,7 +1971,9 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
     if (ld > G.ld) {
         if (G.arena != 0) {
             G.cu.MemFree(G.arena);
+            G.cu.MemFree(G.values);
             G.arena = 0;
+            G.values = 0;
             G.ld = 0;
         }
 #if F32
@@ -1655,6 +1984,7 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
         CU(G.cu.MemAlloc(&G.arena32, (size_t)NUM_PLANES * ld * sizeof(float)), "cuMemAlloc (the f32 arena)");
 #endif
         CU(G.cu.MemAlloc(&G.arena, (size_t)NUM_PLANES * ld * sizeof(double)), "cuMemAlloc (the arena)");
+        CU(G.cu.MemAlloc(&G.values, ld * sizeof(double)), "cuMemAlloc (the reduced values)");
         G.ld = ld;
     }
     if (copy_planes(planes, point_start, point_count, FLAGS, READ_FIRST, 1) != 0) {
@@ -1687,8 +2017,21 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
         goto fail;
     }
 #endif
-    /* synchronous: it waits for the kernels (the default stream joins the streams) */
-    if (copy_planes(planes, point_start, point_count, FLAGS, COPY_BACK, 0) != 0) {
+    if (reduction != NULL) {
+        if (reduce_device(reduction, point_count) != 0) {
+            goto fail;
+        }
+        /* synchronous: it waits for the reduction */
+        CU(G.cu.MemcpyDtoH(out, G.values, (size_t)point_count * sizeof(double)),
+           "cuMemcpyDtoH (the reduced values)");
+        STATS.copies++;
+        STATS.bytes += (size_t)point_count * sizeof(double);
+        STATS.reduced += point_count;
+    }
+    /* synchronous: it waits for the kernels (the default stream joins the streams); with a
+       reduction, only for captures (PACMAN_RUNNER_COPY_BACK=all, PACMAN_SAVE_ARENA) */
+    if ((reduction == NULL || G.copy_all) &&
+        copy_planes(planes, point_start, point_count, FLAGS, COPY_BACK, 0) != 0) {
         goto fail;
     }
     G.cu.CtxPopCurrent(&previous);
@@ -1699,6 +2042,21 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
 fail:
     G.cu.CtxPopCurrent(&previous);
     return PACMAN_RUNNER_DEVICE_ERROR;
+}
+
+int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint32_t *leaves,
+                         uint32_t num_leaves, uint32_t point_start, uint32_t point_count) {
+    return run(planes, num_planes, leaves, num_leaves, point_start, point_count, NULL, NULL);
+}
+
+int pacman_runner_v1_run_reduce(double *const *planes, uint32_t num_planes,
+                                const uint32_t *leaves, uint32_t num_leaves, uint32_t point_start,
+                                uint32_t point_count, const pacman_runner_reduction *reduction,
+                                double *out) {
+    if (!reduction_ok(reduction, out)) {
+        return PACMAN_RUNNER_BAD_ARGUMENTS;
+    }
+    return run(planes, num_planes, leaves, num_leaves, point_start, point_count, reduction, out);
 }
 "#;
 
@@ -1722,7 +2080,7 @@ pub fn makefile_cuda(leaves: usize, sms: &[u32]) -> String {
          \tfor sm in $(SMS); do $(PTXAS) -O3 -arch=sm_$$sm $< -o kernels/leaf$*.sm_$$sm.cubin || exit 1; done\n\
          \t$(FATBINARY) --create=$@ -64 $(foreach sm,$(SMS),--image3=kind=elf,sm=$(sm),file=kernels/leaf$*.sm_$(sm).cubin)\n\n\
          runner.o: runner.c pacman_runner.h $(FATBINS)\n\
-         \t$(CC) $(CFLAGS) -fPIC -c runner.c -o runner.o\n\n\
+         \t$(CC) $(CFLAGS) -ffp-contract=off -fPIC -c runner.c -o runner.o\n\n\
          librunner.so: runner.o\n\
          \t$(CC) -shared -o librunner.so runner.o -ldl\n\n\
          runner: main.c runner.o pacman_runner.h\n\
@@ -1847,9 +2205,17 @@ pub fn build_cuda(dir: &Path, cc: &str, leaves: usize, sms: &[u32], jobs: usize)
         run(dir, &fatbinary, &args)?;
     }
     let steps: Vec<Vec<String>> = vec![
-        ["-O1", "-fPIC", "-c", "runner.c", "-o", "runner.o"]
-            .map(String::from)
-            .to_vec(),
+        [
+            "-O1",
+            "-ffp-contract=off",
+            "-fPIC",
+            "-c",
+            "runner.c",
+            "-o",
+            "runner.o",
+        ]
+        .map(String::from)
+        .to_vec(),
         ["-shared", "-o", "librunner.so", "runner.o", "-ldl"]
             .map(String::from)
             .to_vec(),
@@ -2520,5 +2886,220 @@ int main(int argc, char **argv) {
         assert_eq!(c_array(&[1, 2]), "{\n    1u, 2u,\n}");
         let long: Vec<u32> = (0..17).collect();
         assert_eq!(c_array(&long).matches('\n').count(), 3);
+    }
+    /// The toy execution with its outputs in two amplitudes: a writes amplitude 0 (planes 6, 8),
+    /// b reads it and writes amplitude 1 (planes 7, 9).
+    fn amplitude_spec() -> Spec {
+        let mut spec = spec();
+        spec.arena = Arena {
+            currents: 3,
+            amplitudes: 2,
+            momenta: 1,
+            parameters: 0,
+        };
+        spec.canonical_to_physical = vec![0, 1, u32::MAX];
+        let (a, b) = (spec.calls[0].clone(), spec.calls[1].clone());
+        spec.calls = vec![
+            LeafCall::new(a.member, a.label, vec![0, 3, 1, 4], vec![6, 8]),
+            LeafCall::new(
+                b.member,
+                "amplitude:0".into(),
+                vec![6, 8, 10, 11],
+                vec![7, 9],
+            ),
+        ];
+        spec
+    }
+
+    const AMPLITUDE_RECORDING: &str = r#"{"format": "pacman-arena-v1", "dtype": "f64-le",
+        "layout": "plane-major", "name": "t.e0.r0", "process": "t", "engine": 0, "recording": 0,
+        "method": "all", "num_planes": 12, "num_points": 9, "current_planes": 3,
+        "amplitude_planes": 2, "momentum_planes": 1, "model_parameters": 0,
+        "regions": [
+          {"name": "current_re", "first": 0, "count": 3},
+          {"name": "current_im", "first": 3, "count": 3},
+          {"name": "amplitude_re", "first": 6, "count": 2},
+          {"name": "amplitude_im", "first": 8, "count": 2},
+          {"name": "momenta", "first": 10, "count": 1},
+          {"name": "zero", "first": 11, "count": 1},
+          {"name": "parameters", "first": 12, "count": 0}],
+        "canonical_to_physical": [0, 1, 4294967295], "unmapped_physical": 4294967295,
+        "source_planes": [0, 1], "tiles": [5, 4],
+        "schedule": [
+          {"stage": 0, "label": "s1", "amplitude": false,
+           "leaves": [{"leaf": 0, "application_path": "evaluators/a.plane.symjit"}]},
+          {"stage": 1, "label": "s2", "amplitude": true,
+           "leaves": [{"leaf": 0, "application_path": "evaluators/b.plane.symjit"}]}]}"#;
+
+    /// The groups of the reduction tests: (weight, amplitude indices); the last one is empty.
+    const GROUPS: &[(f64, &[u32])] = &[(0.75, &[0, 1]), (2.0, &[1]), (-1.5, &[0]), (0.5, &[])];
+
+    /// RustiCol's reduction (`reduce_planes_f64_into_selected_slice`, coherent groups) of the
+    /// amplitude planes 6, 7 (re) and 8, 9 (im) of a plane-major arena of `points` points.
+    fn reduce_reference(arena: &[f64], points: usize) -> Vec<f64> {
+        let mut values = vec![0.0; points];
+        for &(weight, indices) in GROUPS {
+            for (i, value) in values.iter_mut().enumerate() {
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for &k in indices {
+                    re += arena[(6 + k as usize) * points + i];
+                    im += arena[(8 + k as usize) * points + i];
+                }
+                *value += weight * (re * re + im * im);
+            }
+        }
+        values
+    }
+
+    /// Runs the runner in `dir` with `--reduce` on the amplitude recording, per tile and whole:
+    /// the values equal `reduce_reference` of the arena it wrote, bit for bit; an amplitude
+    /// index out of range is refused. `None` if the runner could not open the GPU.
+    fn reduce_check(dir: &Path) -> Option<()> {
+        let groups: String = GROUPS
+            .iter()
+            .map(|(w, ks)| {
+                let ks: Vec<String> = ks.iter().map(|k| k.to_string()).collect();
+                format!("{} {}\n", w, ks.join(" "))
+            })
+            .collect();
+        std::fs::write(dir.join("groups.txt"), groups).unwrap();
+        std::fs::write(dir.join("bad.txt"), "1 0\n1 2\n").unwrap();
+        let json = dir.join("t.e0.r0.json");
+        std::fs::write(&json, AMPLITUDE_RECORDING).unwrap();
+        let mut pre = vec![7.0; 12 * 9];
+        for p in [0, 1, 3, 4, 10] {
+            for i in 0..9 {
+                pre[p * 9 + i] = ((p * 9 + i) as f64 * 0.37).sin();
+            }
+        }
+        pre[11 * 9..12 * 9].fill(0.0);
+        let bytes: Vec<u8> = pre.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(json.with_extension("pre"), &bytes).unwrap();
+        for whole in [false, true] {
+            let mut args = vec!["--reduce", "groups.txt"];
+            if whole {
+                args.push("--whole");
+            }
+            let out = Command::new(dir.join("runner"))
+                .args(&args)
+                .arg("out")
+                .arg(&json)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !out.status.success()
+                && (stderr.contains("libcuda")
+                    || stderr.contains("cuInit")
+                    || stderr.contains("cuDeviceGet"))
+                && std::env::var_os("SJB2PTX_REQUIRE_GPU").is_none()
+            {
+                eprintln!("skipped: no usable GPU ({})", stderr.trim());
+                return None;
+            }
+            assert!(out.status.success(), "{}", stderr);
+            let arena = recording::read_f64s(&dir.join("out/t.e0.r0.arena"), 12 * 9).unwrap();
+            // the leaves ran: the amplitudes are finite
+            assert!(arena[6 * 9..10 * 9].iter().all(|x| x.is_finite()));
+            let got = recording::read_f64s(&dir.join("out/t.e0.r0.reduced"), 9).unwrap();
+            let want = reduce_reference(&arena, 9);
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "point {}: {} for {}", i, g, w);
+            }
+        }
+        let out = Command::new(dir.join("runner"))
+            .args(["--reduce", "bad.txt", "out"])
+            .arg(&json)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("status 1"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(())
+    }
+
+    #[test]
+    fn runner_reduces_as_rusticol() {
+        if !have_cc() {
+            eprintln!("no C compiler (cc): the runner is not built");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pacman-reduce-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        let (a, b) = (
+            plane_application(PRODUCT_PLUS_ONE),
+            plane_application(SQUARE_MINUS),
+        );
+        let spec = amplitude_spec();
+        let members: HashMap<&str, &[u8]> = [
+            (spec.calls[0].member.as_str(), &a[..]),
+            (spec.calls[1].member.as_str(), &b[..]),
+        ]
+        .into_iter()
+        .collect();
+        let kernels = objects(&spec, &members, 1, &[]).unwrap();
+        write(&dir, &spec, &kernels).unwrap();
+        build(&dir, "cc", kernels.objects.len()).unwrap();
+        reduce_check(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cuda_runners_reduce_as_rusticol() {
+        let ptxas = cuda_tool("PTXAS", "ptxas");
+        let fatbinary = cuda_tool("FATBINARY", "fatbinary");
+        let have = |tool: &str| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !have_cc() || !have(&ptxas) || !have(&fatbinary) {
+            eprintln!("no C compiler or CUDA toolkit: the CUDA runner is not built");
+            return;
+        }
+        // the reduction kernel assembles for the oldest target the runners support
+        let dir = std::env::temp_dir().join(format!("pacman-cuda-reduce-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("reduce.ptx"), REDUCE_PTX).unwrap();
+        let out = Command::new(&ptxas)
+            .args(["-arch=sm_80", "reduce.ptx", "-o", "reduce.cubin"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (a, b) = (
+            plane_application(PRODUCT_PLUS_ONE),
+            plane_application(SQUARE_MINUS),
+        );
+        let spec = amplitude_spec();
+        let members: HashMap<&str, &[u8]> = [
+            (spec.calls[0].member.as_str(), &a[..]),
+            (spec.calls[1].member.as_str(), &b[..]),
+        ]
+        .into_iter()
+        .collect();
+        let sms = [local_sm().unwrap_or(80)];
+        for f32 in [false, true] {
+            let sub = dir.join(if f32 { "f32" } else { "f64" });
+            std::fs::create_dir_all(sub.join("out")).unwrap();
+            let modules = ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, f32, &[]).unwrap();
+            write_cuda(&sub, &spec, &modules, &sms, f32).unwrap();
+            build_cuda(&sub, "cc", modules.len(), &sms, 2).unwrap();
+            if reduce_check(&sub).is_none() {
+                break;
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

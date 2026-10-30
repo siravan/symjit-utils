@@ -385,8 +385,8 @@ The files (`src/runner.rs`):
 | `kernels/k<k>.o` | each distinct leaf kernel through sjb2obj's code generator (`SavedModel::object`, in process): the **scalar** kernel `int pacman_kernel_<k>(double *mem, const symjit_slice *planes, size_t i, const double *params)`; pyAmpliCol's kernels call no library function, so the objects have no relocations |
 | `runner.c` | per leaf its arena planes (the `.mapping` rows: inputs, then outputs), the leaf order, the leaves' kernel paths, the current map compiled in (`bindings`' map; with a recording, it must equal RustiCol's `canonical_to_physical`), the metadata and `pacman_runner_v1_run` |
 | `pacman_runner.h` | the interface |
-| `main.c` | `runner [--whole] [--no-poison] OUTDIR RECORDING.json...` |
-| `Makefile` | the build `pacman` runs (`cc -O1`; `-shared` for the library) |
+| `main.c` | `runner [--whole] [--no-poison] [--reduce FILE] OUTDIR RECORDING.json...` |
+| `Makefile` | the build `pacman` runs (`cc -O1 -ffp-contract=off`; `-shared` for the library) |
 
 The interface:
 - `pacman_runner_v1_metadata()`: version, size, plane and leaf counts, the regions, process,
@@ -400,11 +400,23 @@ The interface:
   - points `point_start..+point_count` of each plane; each leaf runs its scalar kernel once per
     point;
   - status 0, 1 for bad arguments, 2 if a kernel returns nonzero.
+- `pacman_runner_v1_run_reduce(..., reduction, out)` (optional: runners before 2026-10-29 lack
+  it): runs the leaves as `pacman_runner_v1_run`, then reduces the amplitudes into one value per
+  point, `out[i]` for point `point_start + i`. The reduction (`pacman_runner_reduction`) is
+  RustiCol's selected sum without the normalization: per group, in order, a weight and amplitude
+  indices; the value is the sum of `weight * (re * re + im * im)` over the groups, with `re`, `im`
+  the sums of the group's amplitudes from 0.0. Every operation is rounded in this order, without
+  FMA (`-ffp-contract=off`; `.rn` in PTX), so the value equals RustiCol's bit for bit. A CPU runner
+  reduces the host planes; a CUDA runner reduces on the GPU (below) and does not copy the
+  amplitudes back. Status 1 for a malformed reduction (struct size, offsets, an index outside
+  the amplitude region).
 
 `runner` checks that a recording belongs to its arena (plane count and current map), takes the
 schedule from the recording's `application_path`s, and poisons the planes written first in that
 schedule as `replay` does. It runs per recorded tile (or once, `--whole`) and writes
-`OUTDIR/NAME.arena`. `pacman replay --scalar --against OUTDIR` then compares it with the scalar
+`OUTDIR/NAME.arena`. With `--reduce FILE` (a line per group: the weight, then the amplitude
+indices) it calls `pacman_runner_v1_run_reduce` and also writes the values, one double per point,
+to `OUTDIR/NAME.reduced`. `pacman replay --scalar --against OUTDIR` then compares it with the scalar
 replay. Against `.post` it can only agree within the `--scalar` bounds above, since RustiCol runs
 the SIMD kernels.
 
@@ -557,6 +569,25 @@ equals the CPU runners' result. Totals are bit-equal to stock RustiCol; one heli
 - each call costs about 5 ms of GPU overhead (launches, copies, synchronization).
 
 So the GPU needs RustiCol to pass many points per call (`plans/pacman-ptx/INTEGRATION.md` §2.3).
+
+**Reductions on the GPU (`pacman_runner_v1_run_reduce`).** One thread per point runs the
+reduction (`REDUCE_PTX`, compiled by the driver) over the f64 device arena after the leaves (in an
+f32 runner, after the amplitudes are widened). The group tables are uploaded when they differ from
+the last call's. Only the values come back (8 bytes per point), unless
+`PACMAN_RUNNER_COPY_BACK=all` or `PACMAN_SAVE_ARENA` is set. The statistics count the points reduced
+on the GPU. Tests: `runner::tests::runner_reduces_as_rusticol` and
+`cuda_runners_reduce_as_rusticol` (f64 and f32), bit for bit against RustiCol's formula on the
+arena the runner wrote.
+
+RustiCol (`rusticol-pacman-4-reduce.patch`) uses it in the selected-sum path
+(`reduce_planes_f64_into_selected_slice`: `profile`, and `evaluate` of one colour flow) when the
+artifact has no colour contraction; `PACMAN_RUNNER_REDUCE=0` keeps the reduction in RustiCol.
+Results (2026-10-29, RTX 5060, Z+6g one flow, `profile`):
+- the values equal RustiCol's reduction bit for bit, for the f64 and f32 CUDA runners and the CPU
+  runner (`evaluate --color-flow 1`, 1,000 points);
+- copies per point fall from 8.3 KB to 2.2 KB;
+- at 16,384 points per call, end to end 4.70 → 4.12 µs/point (f64) and 1.96 → 1.34 (f32), the runner
+  3.74 → 3.43 and 1.08 → 0.77.
 
 **f32 runners (`--cuda --f32`).** The leaves are `sjb2ptx --f32` kernels; the interface and
 RustiCol's side are unchanged (f64 planes in and out). `runner.c` (`#define F32 1`) keeps the f64
