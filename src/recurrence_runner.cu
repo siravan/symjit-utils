@@ -701,6 +701,24 @@ __global__ void to_df64(double *p, size_t count) {
     }
 }
 
+__global__ void to_df64_planes(double *p, size_t planes, size_t stride, size_t points) {
+    for (size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; k < planes * points; k += (size_t)gridDim.x * blockDim.x) {
+        size_t at = k / points * stride + k % points;
+        double x = p[at];
+        float hi = __double2float_rn(x);
+        float lo = __double2float_rn(x - (double)hi);
+        reinterpret_cast<float2 *>(p)[at] = make_float2(hi, lo);
+    }
+}
+
+__global__ void to_f64_planes(double *p, size_t planes, size_t stride, size_t points) {
+    for (size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; k < planes * points; k += (size_t)gridDim.x * blockDim.x) {
+        size_t at = k / points * stride + k % points;
+        float2 v = reinterpret_cast<float2 *>(p)[at];
+        p[at] = (double)v.x + (double)v.y;
+    }
+}
+
 __global__ void to_f64(double *p, size_t count) {
     for (size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; k < count; k += (size_t)gridDim.x * blockDim.x) {
         float2 v = reinterpret_cast<float2 *>(p)[k];
@@ -1029,22 +1047,29 @@ bool grow(double **p, size_t *capacity, size_t doubles, const char *what) {
 }
 
 // copy the plane runs of re and im between host and device
+// `n` planes of `stride` doubles from `src` to `dst`: only their first `points` values (the tile
+// can be much longer than the call's points)
+bool copy_planes(void *dst, const void *src, size_t n, size_t stride, size_t points, cudaMemcpyKind kind) {
+    size_t pitch = stride * sizeof(double);
+    if (failed(cudaMemcpy2D(dst, pitch, src, pitch, points * sizeof(double), n, kind), "copy")) return false;
+    device.copies++;
+    device.bytes += n * points * sizeof(double);
+    return true;
+}
+
+// copy the plane runs of re and im between host and device
 bool copy_runs(double *dre, double *dim, double *hre, double *him, const uint32_t *runs,
-               uint32_t count, uint32_t planes, size_t stride, bool to_device) {
+               uint32_t count, uint32_t planes, size_t stride, size_t points, bool to_device) {
     for (uint32_t r = 0; r < count; r++) {
         uint32_t first = runs[2 * r], n = runs[2 * r + 1];
         if (first > planes || n > planes - first) return false;
-        size_t offset = (size_t)first * stride, bytes = (size_t)n * stride * sizeof(double);
+        size_t offset = (size_t)first * stride;
         cudaMemcpyKind kind = to_device ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost;
-        if (failed(cudaMemcpy(to_device ? (void *)(dre + offset) : (void *)(hre + offset),
-                              to_device ? (const void *)(hre + offset) : (const void *)(dre + offset),
-                              bytes, kind), "copy") ||
-            failed(cudaMemcpy(to_device ? (void *)(dim + offset) : (void *)(him + offset),
-                              to_device ? (const void *)(him + offset) : (const void *)(dim + offset),
-                              bytes, kind), "copy"))
+        if (to_device ? !copy_planes(dre + offset, hre + offset, n, stride, points, kind) ||
+                            !copy_planes(dim + offset, him + offset, n, stride, points, kind)
+                      : !copy_planes(hre + offset, dre + offset, n, stride, points, kind) ||
+                            !copy_planes(him + offset, dim + offset, n, stride, points, kind))
             return false;
-        device.copies += 2;
-        device.bytes += 2 * bytes;
     }
     return true;
 }
@@ -1157,11 +1182,23 @@ bool convert(void (*f)(double *, size_t), double *p, size_t doubles) {
     return !failed(cudaGetLastError(), "conversion");
 }
 
-bool convert_runs(void (*f)(double *, size_t), double *re, double *im, const uint32_t *runs,
-                  uint32_t count, size_t stride) {
+// the first `points` values of `planes` planes of `stride` doubles
+bool convert_planes(bool to_df, double *p, size_t planes, size_t stride, size_t points) {
+    size_t count = planes * points;
+    if (count == 0) return true;
+    unsigned grid = (unsigned)std::min<size_t>(4096, (count + 255) / 256);
+    if (to_df) to_df64_planes<<<grid, 256>>>(p, planes, stride, points);
+    else to_f64_planes<<<grid, 256>>>(p, planes, stride, points);
+    return !failed(cudaGetLastError(), "conversion");
+}
+
+bool convert_runs(bool to_df, double *re, double *im, const uint32_t *runs, uint32_t count,
+                  size_t stride, size_t points) {
     for (uint32_t r = 0; r < count; r++) {
-        size_t offset = (size_t)runs[2 * r] * stride, doubles = (size_t)runs[2 * r + 1] * stride;
-        if (!convert(f, re + offset, doubles) || !convert(f, im + offset, doubles)) return false;
+        size_t offset = (size_t)runs[2 * r] * stride, n = runs[2 * r + 1];
+        if (!convert_planes(to_df, re + offset, n, stride, points) ||
+            !convert_planes(to_df, im + offset, n, stride, points))
+            return false;
     }
     return true;
 }
@@ -1243,8 +1280,8 @@ extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *call) {
     double *dscale_re = device.small, *dscale_im = dscale_re + call->scale_count;
     double *dfactor_re = dscale_im + call->scale_count, *dfactor_im = dfactor_re + call->factor_count;
     if ((momentum_doubles &&
-         failed(cudaMemcpy(device.mom, call->momenta, momentum_doubles * sizeof(double),
-                           cudaMemcpyHostToDevice), "momenta")) ||
+         !copy_planes(device.mom, call->momenta, call->momentum_planes, stride, call->points,
+                      cudaMemcpyHostToDevice)) ||
         (call->scale_count &&
          (failed(cudaMemcpy(dscale_re, call->scale_re, call->scale_count * sizeof(double),
                             cudaMemcpyHostToDevice), "scales") ||
@@ -1257,10 +1294,10 @@ extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *call) {
                             cudaMemcpyHostToDevice), "factors"))))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
     if (!copy_runs(device.cre, device.cim, call->current_re, call->current_im, call->upload_current,
-                   call->upload_current_runs, call->current_planes, stride, true) ||
+                   call->upload_current_runs, call->current_planes, stride, call->points, true) ||
         !copy_runs(device.are, device.aim, call->amplitude_re, call->amplitude_im,
                    call->upload_amplitude, call->upload_amplitude_runs, call->amplitude_planes,
-                   stride, true))
+                   stride, call->points, true))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
 
     Arena a;
@@ -1279,35 +1316,35 @@ extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *call) {
     // df64: the uploaded planes, the momenta and the constants become df64 in place; the device
     // arena stays df64 between calls (planes copied back are converted to f64 and back again)
     bool df64 = options().df64;
-    if (df64 && (!convert_runs(to_df64, device.cre, device.cim, call->upload_current,
-                               call->upload_current_runs, stride) ||
-                 !convert_runs(to_df64, device.are, device.aim, call->upload_amplitude,
-                               call->upload_amplitude_runs, stride) ||
-                 !convert(to_df64, device.mom, momentum_doubles) || !convert(to_df64, device.small, small)))
+    if (df64 && (!convert_runs(true, device.cre, device.cim, call->upload_current,
+                               call->upload_current_runs, stride, call->points) ||
+                 !convert_runs(true, device.are, device.aim, call->upload_amplitude,
+                               call->upload_amplitude_runs, stride, call->points) ||
+                 !convert_planes(true, device.mom, call->momentum_planes, stride, call->points) || !convert(to_df64, device.small, small)))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
     bool live_out = call->download_current_runs > 0;
     const Prepared *prepared = prepare(call, live_out);
     if (!prepared) return PACMAN_RECURRENCE_DEVICE_ERROR;
     if (!launch(*prepared, dwords, call->word_count, w, a, call->points))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
-    if (df64 && (!convert_runs(to_f64, device.are, device.aim, call->download_amplitude,
-                               call->download_amplitude_runs, stride) ||
-                 !convert_runs(to_f64, device.cre, device.cim, call->download_current,
-                               call->download_current_runs, stride)))
+    if (df64 && (!convert_runs(false, device.are, device.aim, call->download_amplitude,
+                               call->download_amplitude_runs, stride, call->points) ||
+                 !convert_runs(false, device.cre, device.cim, call->download_current,
+                               call->download_current_runs, stride, call->points)))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
     if (failed(cudaDeviceSynchronize(), "kernel")) return PACMAN_RECURRENCE_DEVICE_ERROR;
 
     if (!copy_runs(device.are, device.aim, call->amplitude_re, call->amplitude_im,
                    call->download_amplitude, call->download_amplitude_runs,
-                   call->amplitude_planes, stride, false) ||
+                   call->amplitude_planes, stride, call->points, false) ||
         !copy_runs(device.cre, device.cim, call->current_re, call->current_im,
                    call->download_current, call->download_current_runs, call->current_planes,
-                   stride, false))
+                   stride, call->points, false))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
-    if (df64 && (!convert_runs(to_df64, device.are, device.aim, call->download_amplitude,
-                               call->download_amplitude_runs, stride) ||
-                 !convert_runs(to_df64, device.cre, device.cim, call->download_current,
-                               call->download_current_runs, stride)))
+    if (df64 && (!convert_runs(true, device.are, device.aim, call->download_amplitude,
+                               call->download_amplitude_runs, stride, call->points) ||
+                 !convert_runs(true, device.cre, device.cim, call->download_current,
+                               call->download_current_runs, stride, call->points)))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
     device.calls++;
     device.points += call->points;
