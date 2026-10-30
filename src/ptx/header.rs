@@ -15,10 +15,18 @@ pub fn header(
     let n = &options.name;
     let up = n.to_uppercase();
     let guard = format!("{}_PTX_H", up);
-    let values = if complex {
-        "Counts are in doubles: complex values are (re, im) pairs of consecutive slots."
+    let (unit, values) = if options.f32 {
+        ("floats", "All values are floats (f32).")
     } else {
-        "All values are doubles."
+        ("doubles", "All values are doubles.")
+    };
+    let values = if complex {
+        format!(
+            "Counts are in {}: complex values are (re, im) pairs of consecutive slots.",
+            unit
+        )
+    } else {
+        values.to_string()
     };
     let inputs = if shape.row_first {
         "the model's parameters (a Symbolica model: different for each point)"

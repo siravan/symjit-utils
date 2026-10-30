@@ -22,6 +22,10 @@
 // fused operations (so ptxas contracts nothing), unordered `gt`/`geq`, masks of all bits.
 // Funclets run on the kernel's registers: a call sets %site and jumps, `ret` is a `brx.idx`
 // through the table of return sites.
+//
+// With `PtxOptions::f32` every value is an f32 instead (`.b32` registers, `in`, `out` and
+// `params` arrays of floats, constants rounded to f32): `emit` retypes the value instructions,
+// and the math library, which is f64, is called through conversions.
 
 mod driver;
 mod header;
@@ -50,7 +54,6 @@ pub const BLOCK_SIZE: u32 = 128;
 
 const SIGN_BIT: &str = "0x8000000000000000";
 const NOT_SIGN_BIT: &str = "0x7FFFFFFFFFFFFFFF";
-const ZERO: &str = "0d0000000000000000";
 
 /// Where slot `k` of point `i` is in `in` and `out`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +85,8 @@ pub struct PtxOptions {
     /// `ld_in` = `ld_out` its leading dimension (SoA plane kernels only; outputs distinct and
     /// disjoint from the inputs, which keeps `ld.global.nc` legal)
     pub mapping: Option<Vec<u32>>,
+    /// single precision (see the top of this file)
+    pub f32: bool,
 }
 
 impl PtxOptions {
@@ -91,6 +96,7 @@ impl PtxOptions {
             layout: Layout::Soa,
             sm: DEFAULT_SM,
             mapping: None,
+            f32: false,
         }
     }
 }
@@ -287,8 +293,73 @@ impl PtxGenerator {
         self.emit("trap;".to_string());
     }
 
+    /// A value instruction, written for f64 (`.f64`, `.b64`); retyped for f32.
     fn emit(&mut self, line: String) {
+        let line = if self.options.f32 {
+            line.replace(".f64", ".f32").replace(".b64", ".b32")
+        } else {
+            line
+        };
         self.body.push(Item::Line(line));
+    }
+
+    /// The value type (`f64` or `f32`) and its bit type.
+    fn ft(&self) -> &'static str {
+        if self.options.f32 {
+            "f32"
+        } else {
+            "f64"
+        }
+    }
+
+    fn bt(&self) -> &'static str {
+        if self.options.f32 {
+            "b32"
+        } else {
+            "b64"
+        }
+    }
+
+    /// The size of a value in bytes and its log2.
+    fn size(&self) -> usize {
+        if self.options.f32 {
+            4
+        } else {
+            8
+        }
+    }
+
+    fn shift(&self) -> u32 {
+        if self.options.f32 {
+            2
+        } else {
+            3
+        }
+    }
+
+    /// A constant as a PTX immediate of the value type (rounded to nearest for f32).
+    fn fconst(&self, v: f64) -> String {
+        if self.options.f32 {
+            format!("0f{:08X}", (v as f32).to_bits())
+        } else {
+            format!("0d{:016X}", v.to_bits())
+        }
+    }
+
+    fn sign_bit(&self) -> &'static str {
+        if self.options.f32 {
+            "0x80000000"
+        } else {
+            SIGN_BIT
+        }
+    }
+
+    fn not_sign_bit(&self) -> &'static str {
+        if self.options.f32 {
+            "0x7FFFFFFF"
+        } else {
+            NOT_SIGN_BIT
+        }
     }
 
     fn reg(&mut self, r: Reg) -> String {
@@ -344,33 +415,59 @@ impl PtxGenerator {
         if !self.calls.iter().any(|c| c == op) {
             self.calls.push(op.to_string());
         }
-        self.emit("{".into());
+        // the library is f64: with f32 values, the arguments and results are converted
+        let f32 = self.options.f32;
+        let mut lines = vec!["{".to_string()];
+        if f32 {
+            lines.push("\t.reg .b64 %d<4>;".into());
+        }
         let mut params = Vec::new();
         for (k, a) in args.iter().enumerate() {
-            self.emit(format!("\t.param .b64 arg{};", k));
-            self.emit(format!("\tst.param.b64 [arg{}], {};", k, a));
+            let a = if f32 {
+                lines.push(format!("\tcvt.f64.f32 %d{}, {};", k, a));
+                format!("%d{}", k)
+            } else {
+                a.clone()
+            };
+            lines.push(format!("\t.param .b64 arg{};", k));
+            lines.push(format!("\tst.param.b64 [arg{}], {};", k, a));
             params.push(format!("arg{}", k));
         }
         if complex {
-            self.emit("\t.param .align 8 .b8 ret0[16];".into());
+            lines.push("\t.param .align 8 .b8 ret0[16];".into());
         } else {
-            self.emit("\t.param .b64 ret0;".into());
+            lines.push("\t.param .b64 ret0;".into());
         }
-        self.emit(format!(
+        lines.push(format!(
             "\tcall.uni (ret0), __sj_{}, ({});",
             op,
             params.join(", ")
         ));
-        self.emit("\tld.param.b64 %ret, [ret0];".into());
-        if complex {
-            self.emit("\tld.param.b64 %tmp, [ret0+8];".into());
+        let results: &[(&str, usize)] = if complex {
+            &[("%ret", 0), ("%tmp", 8)]
+        } else {
+            &[("%ret", 0)]
+        };
+        for (k, (reg, offset)) in results.iter().enumerate() {
+            let at = if *offset == 0 {
+                "[ret0]".to_string()
+            } else {
+                format!("[ret0+{}]", offset)
+            };
+            if f32 {
+                lines.push(format!("\tld.param.b64 %d{}, {};", k, at));
+                lines.push(format!("\tcvt.rn.f32.f64 {}, %d{};", reg, k));
+            } else {
+                lines.push(format!("\tld.param.b64 {}, {};", reg, at));
+            }
         }
-        self.emit("}".into());
+        lines.push("}".into());
+        self.body.extend(lines.into_iter().map(Item::Line));
     }
 
     fn set_zero(&mut self, dst: Reg) {
-        let d = self.reg(dst);
-        self.emit(format!("mov.b64 {}, {};", d, ZERO));
+        let (d, zero) = (self.reg(dst), self.fconst(0.0));
+        self.emit(format!("mov.b64 {}, {};", d, zero));
     }
 
     // comparisons produce masks: all bits set (true) or zero (false)
@@ -439,10 +536,14 @@ impl PtxGenerator {
                     self.emit("add.u64 %a1, %a1, %pin;".into());
                     self.emit(format!("ld.global.nc.b64 {}, [%a1];", dst));
                 }
-                Layout::Aos => self.emit(format!("ld.global.nc.b64 {}, [%pin+{}];", dst, 8 * idx)),
+                Layout::Aos => {
+                    let at = self.size() * idx as usize;
+                    self.emit(format!("ld.global.nc.b64 {}, [%pin+{}];", dst, at))
+                }
             }
         } else {
-            self.emit(format!("ld.global.nc.b64 {}, [%par+{}];", dst, 8 * idx));
+            let at = self.size() * idx as usize;
+            self.emit(format!("ld.global.nc.b64 {}, [%par+{}];", dst, at));
         }
     }
 
@@ -585,7 +686,7 @@ impl PtxGenerator {
                 let _ = writeln!(o, "\tadd.u64 %a1, %a1, {};", base);
                 "[%a1]".to_string()
             }
-            Layout::Aos => format!("[{}+{}]", base, 8 * k),
+            Layout::Aos => format!("[{}+{}]", base, self.size() * k),
         }
     }
 
@@ -627,13 +728,13 @@ impl PtxGenerator {
                 reg, self.options.name, param
             );
             // in bytes
-            let _ = writeln!(o, "\tshl.b64 {}, {}, 3;", reg, reg);
+            let _ = writeln!(o, "\tshl.b64 {}, {}, {};", reg, reg, self.shift());
         }
         // %pin and %pout point to the point's first slot
         for (reg, ld) in [("%pin", "%ldi"), ("%pout", "%ldo")] {
             match layout {
                 Layout::Soa => {
-                    let _ = writeln!(o, "\tshl.b64 %a0, %i, 3;");
+                    let _ = writeln!(o, "\tshl.b64 %a0, %i, {};", self.shift());
                 }
                 Layout::Aos => {
                     let _ = writeln!(o, "\tmul.lo.u64 %a0, %i, {};", ld);
@@ -653,9 +754,9 @@ impl PtxGenerator {
             }
             if k < count_states {
                 let a = self.slot(o, "%pin", "%ldi", k);
-                let _ = writeln!(o, "\tld.global.nc.b64 %m{}, {};", k, a);
+                let _ = writeln!(o, "\tld.global.nc.{} %m{}, {};", self.bt(), k, a);
             } else {
-                let _ = writeln!(o, "\tmov.b64 %m{}, {};", k, ZERO);
+                let _ = writeln!(o, "\tmov.{} %m{}, {};", self.bt(), k, self.fconst(0.0));
             }
         }
     }
@@ -667,7 +768,7 @@ impl PtxGenerator {
             let k = first + j;
             if !place.direct_out[k] {
                 let a = self.slot(o, "%pout", "%ldo", j);
-                let _ = writeln!(o, "\tst.global.b64 {}, %m{};", a, k);
+                let _ = writeln!(o, "\tst.global.{} {}, %m{};", self.bt(), a, k);
             }
         }
         let _ = writeln!(o, "$Lexit:");
@@ -694,6 +795,7 @@ impl PtxGenerator {
         let mut stray_ret = false;
 
         let first = self.first_out();
+        let bt = self.bt();
         for (at, item) in self.body.iter().enumerate() {
             match item {
                 Item::Line(line) => {
@@ -703,19 +805,19 @@ impl PtxGenerator {
                     let k = *idx as usize;
                     if place.direct_in[k] {
                         let a = self.slot(&mut o, "%pin", "%ldi", k);
-                        let _ = writeln!(o, "\tld.global.nc.b64 {}, {};", dst, a);
+                        let _ = writeln!(o, "\tld.global.nc.{} {}, {};", bt, dst, a);
                     } else if *dst != format!("%m{}", k) {
-                        let _ = writeln!(o, "\tmov.b64 {}, %m{};", dst, k);
+                        let _ = writeln!(o, "\tmov.{} {}, %m{};", bt, dst, k);
                     }
                 }
                 Item::LoadStack(dst, idx) => {
-                    let _ = writeln!(o, "\tmov.b64 {}, %s{};", dst, idx);
+                    let _ = writeln!(o, "\tmov.{} {}, %s{};", bt, dst, idx);
                 }
                 Item::SaveStack(src, idx) => {
-                    let _ = writeln!(o, "\tmov.b64 %s{}, {};", idx, src);
+                    let _ = writeln!(o, "\tmov.{} %s{}, {};", bt, idx, src);
                     for &k in place.forward.get(&at).into_iter().flatten() {
                         let a = self.slot(&mut o, "%pout", "%ldo", k - first);
-                        let _ = writeln!(o, "\tst.global.b64 {}, {};", a, src);
+                        let _ = writeln!(o, "\tst.global.{} {}, {};", bt, a, src);
                     }
                 }
                 Item::SaveMem(src, idx) => {
@@ -725,14 +827,14 @@ impl PtxGenerator {
                             continue;
                         }
                         let a = self.slot(&mut o, "%pout", "%ldo", k - first);
-                        let _ = writeln!(o, "\tst.global.b64 {}, {};", a, src);
+                        let _ = writeln!(o, "\tst.global.{} {}, {};", bt, a, src);
                     } else if *src != format!("%m{}", k) {
-                        let _ = writeln!(o, "\tmov.b64 %m{}, {};", k, src);
+                        let _ = writeln!(o, "\tmov.{} %m{}, {};", bt, k, src);
                     }
                 }
                 Item::Const(reg, idx) => match self.consts.get(*idx as usize) {
                     Some(v) => {
-                        let _ = writeln!(o, "\tmov.b64 {}, 0d{:016X};", reg, v.to_bits());
+                        let _ = writeln!(o, "\tmov.{} {}, {};", bt, reg, self.fconst(*v));
                     }
                     None => {
                         let _ = writeln!(o, "\ttrap; // missing constant {}", idx);
@@ -753,7 +855,7 @@ impl PtxGenerator {
                     if_true,
                 } => {
                     // a true mask (all bits set) is a NaN, as x86's `vucomisd` + `jpe`/`jpo`
-                    let _ = writeln!(o, "\tsetp.nan.f64 %p0, {}, {};", cond, cond);
+                    let _ = writeln!(o, "\tsetp.nan.{} %p0, {}, {};", self.ft(), cond, cond);
                     let _ = writeln!(
                         o,
                         "\t@{}%p0 bra {};",
@@ -810,11 +912,12 @@ impl PtxGenerator {
         );
         let _ = writeln!(
             o,
-            "// {}: {} inputs, {} outputs, {} shared parameters (f64 slots), layout {}",
+            "// {}: {} inputs, {} outputs, {} shared parameters ({} slots), layout {}",
             name,
             self.shape.count_in,
             self.shape.count_out,
             self.shape.count_params,
+            self.ft(),
             self.options.layout.name()
         );
         let _ = writeln!(o, "//");
@@ -842,14 +945,14 @@ impl PtxGenerator {
         let _ = writeln!(o, "\t.reg .u32 %t<3>;");
         let _ = writeln!(o, "\t.reg .u32 %site;");
         let _ = writeln!(o, "\t.reg .u64 %i, %pin, %pout, %par, %ldi, %ldo, %a<2>;");
-        let _ = writeln!(o, "\t.reg .b64 %ret, %tmp, %x<4>;");
+        let _ = writeln!(o, "\t.reg .{} %ret, %tmp, %x<4>;", self.bt());
         for (prefix, count) in [
             ("g", self.count_gen),
             ("s", self.count_stack),
             ("m", self.count_mem),
         ] {
             if count > 0 {
-                let _ = writeln!(o, "\t.reg .b64 %{}<{}>;", prefix, count);
+                let _ = writeln!(o, "\t.reg .{} %{}<{}>;", self.bt(), prefix, count);
             }
         }
         let _ = writeln!(o);
@@ -1008,15 +1111,15 @@ impl Generator for PtxGenerator {
 
     // neg, sign and abs on the sign bit, as x86 (`_minus_zero_` masks)
     fn neg(&mut self, dst: Reg, s1: Reg) {
-        self.bits_imm("xor", dst, s1, SIGN_BIT);
+        self.bits_imm("xor", dst, s1, self.sign_bit());
     }
 
     fn sign(&mut self, dst: Reg, s1: Reg) {
-        self.bits_imm("and", dst, s1, SIGN_BIT);
+        self.bits_imm("and", dst, s1, self.sign_bit());
     }
 
     fn abs(&mut self, dst: Reg, s1: Reg) {
-        self.bits_imm("and", dst, s1, NOT_SIGN_BIT);
+        self.bits_imm("and", dst, s1, self.not_sign_bit());
     }
 
     fn abs2(&mut self, dst: Reg, s1: Reg) {
@@ -1046,8 +1149,8 @@ impl Generator for PtxGenerator {
     }
 
     fn half(&mut self, dst: Reg, s1: Reg) {
-        let (d, a) = (self.reg(dst), self.reg(s1));
-        self.emit(format!("mul.rn.f64 {}, {}, 0d3FE0000000000000;", d, a));
+        let (d, a, half) = (self.reg(dst), self.reg(s1), self.fconst(0.5));
+        self.emit(format!("mul.rn.f64 {}, {}, {};", d, a, half));
     }
 
     // half to even, as x86's `roundsd` mode 0 (the interpreter rounds halves away from zero)
