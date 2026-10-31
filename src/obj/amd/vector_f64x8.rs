@@ -51,6 +51,12 @@ macro_rules! fuseop {
         } else if $dst == $c {
             $self.amd.$f231(ϕ($c), ϕ($a), ϕ($b));
         } else {
+            // `fmov` writes `$dst` before `$b` and `$c` are read; distinct logical registers can
+            // share a physical one (`Reg::Left`/`Reg::Ret`, `Reg::Temp`/`Reg::Right`)
+            assert!(
+                ϕ($dst) == ϕ($a) || (ϕ($dst) != ϕ($b) && ϕ($dst) != ϕ($c)),
+                "fused op: the destination shares a register with a source"
+            );
             $self.fmov($dst, $a);
             $self.amd.$f132(ϕ($dst), ϕ($c), ϕ($b));
         }
@@ -514,10 +520,20 @@ impl Generator for AmdVectorF64x8Generator {
     }
 
     fn recip(&mut self, dst: Reg, s1: Reg) {
+        // distinct logical registers can share a physical one (`Reg::Left`/`Reg::Ret`,
+        // `Reg::Temp`/`Reg::Right`): the constant must not overwrite `s1`
         if dst != s1 {
+            assert!(
+                ϕ(dst) != ϕ(s1),
+                "recip: the destination shares a register with the source"
+            );
             self.load_const_by_name(dst, "_one_");
             self.divide(dst, dst, s1);
         } else if dst != Reg::Temp {
+            assert!(
+                ϕ(s1) != ϕ(Reg::Temp),
+                "recip: the source shares a register with Reg::Temp"
+            );
             self.load_const_by_name(Reg::Temp, "_one_");
             self.divide(dst, Reg::Temp, s1);
         } else {
@@ -569,24 +585,16 @@ impl Generator for AmdVectorF64x8Generator {
     fn times_complex(&mut self, xd: Reg, yd: Reg, x1: Reg, y1: Reg, x2: Reg, y2: Reg) -> bool {
         let xt = Reg::Gen(2);
         let yt = Reg::Gen(3);
+        // Aliasing is decided on the physical registers: distinct logical registers share one
+        // (`Reg::Ret` and `Reg::Left` are register 0, `Reg::Temp` and `Reg::Right` register 1),
+        // e.g. `(%l + %t*im) := (%$ + %t*im) Times (..)` after the peephole optimizer.
+        let sources = [ϕ(x1), ϕ(y1), ϕ(x2), ϕ(y2)];
 
-        if xd != x1 && xd != x2 {
+        if !sources.contains(&ϕ(xd)) && !sources.contains(&ϕ(yd)) {
             self.times(xd, y1, y2);
             self.fused_mul_sub(xd, x1, x2, xd);
             self.times(yd, x1, y2);
             self.fused_mul_add(yd, x2, y1, yd);
-        } else if xd == x1 && xd != x2 {
-            self.times(xt, y1, y2);
-            self.fused_mul_sub(xt, x1, x2, xt);
-            self.times(yd, x2, y1);
-            self.fused_mul_add(yd, x1, y2, yd);
-            self.fmov(xd, xt);
-        } else if xd != x1 && xd == x2 {
-            self.times(xt, y1, y2);
-            self.fused_mul_sub(xt, x1, x2, xt);
-            self.times(yd, x1, y2);
-            self.fused_mul_add(yd, x2, y1, yd);
-            self.fmov(xd, xt);
         } else {
             self.times(xt, y1, y2);
             self.fused_mul_sub(xt, x1, x2, xt);
