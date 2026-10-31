@@ -147,10 +147,19 @@ fn real_model_matches_symjit() {
         value(&r, "Compiled code", "scalar"),
         bytes(app.measure("ker-scalar-size"))
     );
-    assert_eq!(
-        value(&r, "Compiled code", "SIMD"),
-        bytes(app.measure("ker-simd-size"))
-    );
+    if cfg!(target_arch = "riscv64") {
+        // symjit has only the scalar kernel on RISC-V
+        assert_eq!(app.measure("ker-simd-size"), 0);
+        assert_eq!(
+            value(&r, "Compiled code", "SIMD"),
+            "none (only for AVX and ARM64)"
+        );
+    } else {
+        assert_eq!(
+            value(&r, "Compiled code", "SIMD"),
+            bytes(app.measure("ker-simd-size"))
+        );
+    }
     assert!(value(&r, "Compiled code", "fast").starts_with("none"));
 
     // functions: symjit's `log` is the decimal logarithm, `ln` the natural one; C has no `csc`
@@ -286,9 +295,14 @@ fn loops_have_no_simd_kernel() {
     save(&app, &d.join("l.sjb"));
     let r = report(&sjbinfo(&d, &["l.sjb"]));
     assert_ne!(value(&r, "IR (MIR)", "labels"), "0", "{}", r);
+    // a SIMD kernel, unless symjit gives the model none; on RISC-V there is no SIMD kernel at
+    // all (the loop here is a `goto`, which `count_loops` does not count, so that is the reason
+    // reported)
     let simd = value(&r, "Compiled code", "SIMD");
     assert!(
-        simd == "none (the model has loops)" || simd.ends_with(" bytes"),
+        simd == "none (the model has loops)"
+            || simd.ends_with(" bytes")
+            || (cfg!(target_arch = "riscv64") && simd == "none (only for AVX and ARM64)"),
         "{}",
         r
     );

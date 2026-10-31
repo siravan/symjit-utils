@@ -676,12 +676,27 @@ pub(crate) mod tests {
             assert_eq!(stats[0].scalar_calls, 11 - simd * lanes);
         }
 
-        // scalar only: the same values (real arithmetic, so the same bits)
+        // scalar only: the same values. Complex SIMD kernels may differ from the scalar kernel
+        // in the last bit (other formulas): the same bits on x86-64, where they agree here; on
+        // AArch64 (NEON against the scalar complex kernel) within the tolerance above.
         let mut scalar = pre.clone();
         let mut s = vec![CallStats::default(); 2];
         run_tile(&mut scalar, ld, 0, ld, &calls, &kernels, true, &mut s).unwrap();
         assert_eq!(s[0].simd_calls, 0);
-        assert!(recording::compare(&scalar, &arena, ld).is_empty());
+        if cfg!(target_arch = "x86_64") {
+            assert!(recording::compare(&scalar, &arena, ld).is_empty());
+        } else {
+            for (k, (a, b)) in scalar.iter().zip(&arena).enumerate().skip(4 * ld) {
+                assert!(
+                    (a - b).abs() <= 1e-14 * b.abs().max(1.0),
+                    "plane {} point {}: scalar {} against {}",
+                    k / ld,
+                    k % ld,
+                    a,
+                    b
+                );
+            }
+        }
 
         // an aliased table runs scalar only
         let alias = LeafCall::new("a".into(), "x".into(), vec![0, 1, 2, 3], vec![0, 1]);

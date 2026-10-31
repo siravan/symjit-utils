@@ -2719,6 +2719,10 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    #[cfg_attr(
+        target_arch = "riscv64",
+        ignore = "sjb2obj writes x86-64 and AArch64 objects only"
+    )]
     fn runner_reproduces_the_scalar_replay() {
         if !have_cc() {
             eprintln!("no C compiler (cc): the runner is not built");
@@ -3278,6 +3282,10 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    #[cfg_attr(
+        target_arch = "riscv64",
+        ignore = "sjb2obj writes x86-64 and AArch64 objects only"
+    )]
     fn runner_reduces_as_rusticol() {
         if !have_cc() {
             eprintln!("no C compiler (cc): the runner is not built");
