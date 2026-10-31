@@ -24,9 +24,9 @@
 //                                 X first component factor, K count
 //
 // The arithmetic is RustiCol's (`recurrence_intrinsic_direct.rs`, `recurrence_closure_direct.rs`)
-// operation for operation; built with -fmad=false, the f64 kernels (`v1`, `acc`, `cache`) equal
-// RustiCol's bit for bit. The default kernel, `df64`, emulates f64 with pairs of f32 (for GPUs whose
-// FP64 is slow, e.g. RTX); see `Options` below for PACMAN_RECURRENCE_KERNEL and its variants.
+// operation for operation; built with -fmad=false, the `f64` kernel equals RustiCol's bit for bit.
+// The default kernel, `df64`, emulates f64 with pairs of f32 (for GPUs whose FP64 is slow, e.g.
+// RTX); see `Options` below for PACMAN_RECURRENCE_KERNEL.
 //
 // Build: nvcc -O3 -fmad=false -Xcompiler -fPIC -shared -cudart static -o librecurrence.so
 //        recurrence_runner.cu
@@ -192,40 +192,6 @@ struct Arena {
     size_t ld;
 };
 
-struct Widths {
-    int w[W_COUNT];
-};
-
-__device__ __forceinline__ uint32_t take(uint64_t &word, int bits) {
-    uint32_t v = (uint32_t)(word & ((1ull << bits) - 1));
-    word >>= bits;
-    return v;
-}
-
-__device__ __forceinline__ C ld_c(const Arena &a, uint32_t plane, size_t i) {
-    return cx(a.cre[plane * a.ld + i], a.cim[plane * a.ld + i]);
-}
-
-__device__ __forceinline__ double ld_p(const Arena &a, uint32_t form, int mu, size_t i) {
-    return a.mom[(form * 4 + mu) * a.ld + i];
-}
-
-// `add_scaled_current` / `set_scaled_current`: value × scale, stored or added
-__device__ __forceinline__ void st_scaled(const Arena &a, uint32_t plane, size_t i, C value,
-                                          C scale, bool accumulate) {
-    C c = mul(value, scale);
-    double *pr = a.cre + plane * a.ld + i, *pi = a.cim + plane * a.ld + i;
-    if (accumulate) {
-        *pr += c.re;
-        *pi += c.im;
-    } else {
-        *pr = c.re;
-        *pi = c.im;
-    }
-}
-
-__device__ __forceinline__ C factor(const Arena &a, uint32_t id) { return cx(a.fre[id], a.fim[id]); }
-
 template <class R>
 __device__ __forceinline__ R reciprocal_minkowski_norm(R p0, R p1, R p2, R p3) {
     return R(1.0) / (p0 * p0 - p1 * p1 - p2 * p2 - p3 * p3);
@@ -240,7 +206,7 @@ template <class R> __device__ __forceinline__ Cx<R> minkowski_real_dot(const Cx<
                mul_real(l[3], q[3]));
 }
 
-// ---- the executors' arithmetic, shared by every kernel variant: operands in, values out ----
+// ---- the executors' arithmetic, in f64 and df64: operands in, values out ----
 
 // components read from parent0 and parent1 and written, per contribution op (2..6)
 template <int OP> struct Shape {
@@ -344,123 +310,14 @@ __device__ __forceinline__ Cx<R> closure_increment(Cx<R> l, Cx<R> r, R cr, R ci,
               product_re * scale_im + product_im * scale_re);
 }
 
-// ---- v1: the words as RustiCol encodes them, every operand in global memory ----
-
-template <int OP>
-__device__ __forceinline__ void contribution(const Arena &a, const Widths &w, uint64_t word, size_t i) {
-    constexpr int op = OP, c0 = Shape<OP>::c0, c1 = Shape<OP>::c1, cd = Shape<OP>::cd;
-    bool accumulate = !take(word, 1);
-    uint32_t slot = take(word, w.w[W_S]);
-    uint32_t p0 = take(word, w.w[W_P]), p1 = take(word, w.w[W_P]), dst = take(word, w.w[W_P]);
-    uint32_t f0 = take(word, w.w[W_F]), f1 = take(word, w.w[W_F]);
-    uint32_t x = take(word, w.w[W_X]);
-    // `execute_rows`: context scale × row factor
-    C scale = mul(cx(a.sre[slot], a.sim[slot]), factor(a, x));
-    C l[6], r[4], o[6];
-    double q0[4], q1[4];
-#pragma unroll
-    for (int k = 0; k < c0; k++) l[k] = ld_c(a, p0 + k, i);
-#pragma unroll
-    for (int k = 0; k < c1; k++) r[k] = ld_c(a, p1 + k, i);
-    if (op == 6)
-#pragma unroll
-        for (int k = 0; k < 4; k++) {
-            q0[k] = ld_p(a, f0, k, i);
-            q1[k] = ld_p(a, f1, k, i);
-        }
-    contribution_values(op, l, r, q0, q1, o);
-#pragma unroll
-    for (int k = 0; k < cd; k++) st_scaled(a, dst + k, i, o[k], scale, accumulate);
-}
-
-template <int OP>
-__device__ __forceinline__ void propagator(const Arena &a, const Widths &w, uint64_t word, size_t i) {
-    constexpr int op = OP, n = OP == 9 ? 4 : 2;
-    uint32_t base = take(word, w.w[W_P]), form = take(word, w.w[W_F]), x = take(word, w.w[W_X]);
-    double p[4];
-#pragma unroll
-    for (int k = 0; k < 4; k++) p[k] = ld_p(a, form, k, i);
-    C c[4], o[4];
-#pragma unroll
-    for (int k = 0; k < n; k++) c[k] = ld_c(a, base + k, i);
-    propagator_values(op, c, p, factor(a, x), o);
-#pragma unroll
-    for (int k = 0; k < n; k++) {
-        a.cre[(base + k) * a.ld + i] = o[k].re;
-        a.cim[(base + k) * a.ld + i] = o[k].im;
-    }
-}
-
-__global__ void run_plan(const uint64_t *__restrict__ words, uint32_t word_count, Widths w,
-                         Arena a, uint32_t points) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= points) return;
-    for (uint32_t n = 0; n < word_count; n++) {
-        uint64_t word = __ldg(words + n);
-        int op = (int)take(word, 4);
-        switch (op) {
-        case 1: {
-            uint32_t base = take(word, w.w[W_P]), count = take(word, w.w[W_P]);
-            for (uint32_t k = 0; k < count; k++) {
-                a.cre[(base + k) * a.ld + i] = 0.0;
-                a.cim[(base + k) * a.ld + i] = 0.0;
-            }
-            break;
-        }
-        case 2: contribution<2>(a, w, word, i); break;
-        case 3: contribution<3>(a, w, word, i); break;
-        case 4: contribution<4>(a, w, word, i); break;
-        case 5: contribution<5>(a, w, word, i); break;
-        case 6: contribution<6>(a, w, word, i); break;
-        case 7: propagator<7>(a, w, word, i); break;
-        case 8: propagator<8>(a, w, word, i); break;
-        case 9: propagator<9>(a, w, word, i); break;
-        case 10: {
-            // `execute_identity_finalization_rows`: factor × value
-            uint32_t base = take(word, w.w[W_P]), count = take(word, w.w[W_K]),
-                     x = take(word, w.w[W_X]);
-            double fr = a.fre[x], fi = a.fim[x];
-            for (uint32_t k = 0; k < count; k++) {
-                double *pr = a.cre + (base + k) * a.ld + i, *pi = a.cim + (base + k) * a.ld + i;
-                C v = identity_value(fr, fi, cx(*pr, *pi));
-                *pr = v.re;
-                *pi = v.im;
-            }
-            break;
-        }
-        case 11: {
-            // `execute_closure_reduce_rows`
-            uint32_t p0 = take(word, w.w[W_P]), p1 = take(word, w.w[W_P]),
-                     amp = take(word, w.w[W_A]), x = take(word, w.w[W_X]),
-                     first = take(word, w.w[W_X]), count = take(word, w.w[W_K]);
-            double rfr = a.fre[x], rfi = a.fim[x];
-            double *dr = a.are + amp * a.ld + i, *di = a.aim + amp * a.ld + i;
-            for (uint32_t k = 0; k < count; k++) {
-                C v = closure_increment(ld_c(a, p0 + k, i), ld_c(a, p1 + k, i), a.fre[first + k],
-                                        a.fim[first + k], rfr, rfi);
-                *dr += v.re;
-                *di += v.im;
-            }
-            break;
-        }
-        default:
-            return;  // the host validates the words
-        }
-    }
-}
-
 // ---- programs: the words rewritten by the host (`prepare` below), 32 bytes per instruction ----
 //
-// w[0] = kind | op << 8 | flags << 16; the fields follow in w[1..7].
-//   acc kind: the plan's rows with the contribution runs stably sorted by destination (each
-//     destination keeps its order of rows, so its sum is unchanged) and the destination of a run
-//     of rows on one destination kept in registers (F_FIRST loads or starts it, F_LAST stores it).
-//   cache kind: every current component the program touches lives in a shared-memory slot of the
-//     thread while it is used; the host schedules the slots (Belady: evict the value used farthest
-//     ahead; spill an evicted value only if it is read again), with explicit fill (global → slot),
-//     spill (slot → global) and zero instructions. Operands are slot numbers (bytes).
+// w[0] = kind | op << 8 | flags << 16; the fields follow in w[1..7]. The program is the plan's
+// rows with the contribution runs stably sorted by destination (each destination keeps its order
+// of rows, so its sum is unchanged) and the destination of a run of rows on one destination kept
+// in registers (F_FIRST loads or starts it, F_LAST stores it).
 
-enum { K_CLEAR = 1, K_CONTRIB, K_PROP, K_IDENTITY, K_CLOSURE, K_FILL, K_SPILL, K_ZERO };
+enum { K_CLEAR = 1, K_CONTRIB, K_PROP, K_IDENTITY, K_CLOSURE };
 enum { F_INIT = 1, F_FIRST = 2, F_LAST = 4 };
 
 struct IOp {
@@ -476,7 +333,7 @@ __device__ __forceinline__ IOp load_op(const IOp *ops, uint32_t n) {
     return o;
 }
 
-// acc: contributions w[1] scale slot, w[2] p0, w[3] p1, w[4] dst, w[5] f0, w[6] f1, w[7] factor;
+// contributions w[1] scale slot, w[2] p0, w[3] p1, w[4] dst, w[5] f0, w[6] f1, w[7] factor;
 // clear w[1] base, w[2] count; propagator w[1] base, w[2] form, w[3] factor; identity w[1] base,
 // w[2] count, w[3] factor; closure w[1] p0, w[2] p1, w[3] amplitude, w[4] factor, w[5] first,
 // w[6] count.
@@ -486,7 +343,7 @@ __device__ __forceinline__ Cx<R> ld_cr(const Arena &a, uint32_t plane, size_t i)
 }
 
 template <class R, int OP>
-__device__ __forceinline__ void acc_contribution(const Arena &a, const IOp &o, int flags, Cx<R> *acc,
+__device__ __forceinline__ void contribution(const Arena &a, const IOp &o, int flags, Cx<R> *acc,
                                                  size_t i) {
     typedef Cx<R> C;
     constexpr int op = OP, c0 = Shape<OP>::c0, c1 = Shape<OP>::c1, cd = Shape<OP>::cd;
@@ -521,7 +378,7 @@ __device__ __forceinline__ void acc_contribution(const Arena &a, const IOp &o, i
 }
 
 template <class R, int OP>
-__device__ __forceinline__ void acc_propagator(const Arena &a, const IOp &o, size_t i) {
+__device__ __forceinline__ void propagator(const Arena &a, const IOp &o, size_t i) {
     typedef Cx<R> C;
     constexpr int m = OP == 9 ? 4 : 2;
     uint32_t base = o.w[1];
@@ -539,8 +396,10 @@ __device__ __forceinline__ void acc_propagator(const Arena &a, const IOp &o, siz
     }
 }
 
+// R = double: RustiCol's arithmetic; R = D: df64 on a df64 arena (all planes, momenta, scales and
+// factors hold float2 (high, low) in place of their doubles; see `to_df64`, `to_f64_planes`).
 template <class R>
-__global__ void run_acc(const IOp *__restrict__ ops, uint32_t count, Arena a, uint32_t points) {
+__global__ void run_program(const IOp *__restrict__ ops, uint32_t count, Arena a, uint32_t points) {
     typedef Cx<R> C;
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= points) return;
@@ -550,11 +409,11 @@ __global__ void run_acc(const IOp *__restrict__ ops, uint32_t count, Arena a, ui
         int kind = o.w[0] & 0xff, op = (o.w[0] >> 8) & 0xff, flags = o.w[0] >> 16;
         if (kind == K_CONTRIB) {
             switch (op) {
-            case 2: acc_contribution<R, 2>(a, o, flags, acc, i); break;
-            case 3: acc_contribution<R, 3>(a, o, flags, acc, i); break;
-            case 4: acc_contribution<R, 4>(a, o, flags, acc, i); break;
-            case 5: acc_contribution<R, 5>(a, o, flags, acc, i); break;
-            default: acc_contribution<R, 6>(a, o, flags, acc, i); break;
+            case 2: contribution<R, 2>(a, o, flags, acc, i); break;
+            case 3: contribution<R, 3>(a, o, flags, acc, i); break;
+            case 4: contribution<R, 4>(a, o, flags, acc, i); break;
+            case 5: contribution<R, 5>(a, o, flags, acc, i); break;
+            default: contribution<R, 6>(a, o, flags, acc, i); break;
             }
         } else if (kind == K_CLEAR) {
             for (uint32_t k = 0; k < o.w[2]; k++) {
@@ -562,9 +421,9 @@ __global__ void run_acc(const IOp *__restrict__ ops, uint32_t count, Arena a, ui
                 str(a.cim, (o.w[1] + k) * a.ld + i, R(0.0));
             }
         } else if (kind == K_PROP) {
-            if (op == 7) acc_propagator<R, 7>(a, o, i);
-            else if (op == 8) acc_propagator<R, 8>(a, o, i);
-            else acc_propagator<R, 9>(a, o, i);
+            if (op == 7) propagator<R, 7>(a, o, i);
+            else if (op == 8) propagator<R, 8>(a, o, i);
+            else propagator<R, 9>(a, o, i);
         } else if (kind == K_IDENTITY) {
             R fr = ldr<R>(a.fre, o.w[3]), fi = ldr<R>(a.fim, o.w[3]);
             for (uint32_t k = 0; k < o.w[2]; k++) {
@@ -589,131 +448,7 @@ __global__ void run_acc(const IOp *__restrict__ ops, uint32_t count, Arena a, ui
     }
 }
 
-// cache: slots s of the thread at shared[(2 s + part) * blockDim.x + threadIdx.x] (re, im).
-// Operand slots are bytes in w[2..5] (16 of them, in operand order); fills and spills hold up to 7
-// pairs `slot | plane << 8` in w[1..7], zero up to 16 slot bytes in w[2..5], the count in flags
-// >> 3. Contributions: w[1] scale slot, w[6] f0 | f1 << 16, w[7] factor; propagators: w[1] form,
-// w[7] factor; identity: w[1] count, w[7] factor; closure: w[1] amplitude, w[6] first | count
-// << 16, w[7] factor.
-__device__ __forceinline__ uint32_t slot_of(const IOp &o, int k) {
-    return (o.w[2 + (k >> 2)] >> (8 * (k & 3))) & 0xff;
-}
-
-template <class R> struct Slots {
-    double *mine;  // a slot holds re and im: two doubles, or two float2 (df64) in their place
-    uint32_t B;
-    __device__ __forceinline__ Cx<R> get(uint32_t s) const {
-        return cx(ldr<R>(mine, (2 * s) * B), ldr<R>(mine, (2 * s + 1) * B));
-    }
-    __device__ __forceinline__ void put(uint32_t s, Cx<R> v) const {
-        str(mine, (2 * s) * B, v.re);
-        str(mine, (2 * s + 1) * B, v.im);
-    }
-};
-
-template <class R, int OP>
-__device__ __forceinline__ void cache_contribution(const Arena &a, const Slots<R> &m, const IOp &o,
-                                                   int flags, size_t i) {
-    typedef Cx<R> C;
-    constexpr int op = OP, c0 = Shape<OP>::c0, c1 = Shape<OP>::c1, cd = Shape<OP>::cd;
-    C scale = mul(cx(ldr<R>(a.sre, o.w[1]), ldr<R>(a.sim, o.w[1])), cx(ldr<R>(a.fre, o.w[7]), ldr<R>(a.fim, o.w[7])));
-    C l[6], r[4], v[6];
-    R q0[4], q1[4];
-#pragma unroll
-    for (int k = 0; k < c0; k++) l[k] = m.get(slot_of(o, k));
-#pragma unroll
-    for (int k = 0; k < c1; k++) r[k] = m.get(slot_of(o, c0 + k));
-    if (op == 6)
-#pragma unroll
-        for (int k = 0; k < 4; k++) {
-            q0[k] = ldr<R>(a.mom, ((o.w[6] & 0xffff) * 4 + k) * a.ld + i);
-            q1[k] = ldr<R>(a.mom, ((o.w[6] >> 16) * 4 + k) * a.ld + i);
-        }
-    contribution_values(op, l, r, q0, q1, v);
-#pragma unroll
-    for (int k = 0; k < cd; k++) {
-        uint32_t s = slot_of(o, c0 + c1 + k);
-        C c = mul(v[k], scale);
-        m.put(s, (flags & F_INIT) ? c : add(m.get(s), c));
-    }
-}
-
-template <class R, int OP>
-__device__ __forceinline__ void cache_propagator(const Arena &a, const Slots<R> &m, const IOp &o, size_t i) {
-    typedef Cx<R> C;
-    constexpr int nc = OP == 9 ? 4 : 2;
-    R p[4];
-#pragma unroll
-    for (int k = 0; k < 4; k++) p[k] = ldr<R>(a.mom, (o.w[1] * 4 + k) * a.ld + i);
-    C c[4], v[4];
-#pragma unroll
-    for (int k = 0; k < nc; k++) c[k] = m.get(slot_of(o, k));
-    propagator_values(OP, c, p, cx(ldr<R>(a.fre, o.w[7]), ldr<R>(a.fim, o.w[7])), v);
-#pragma unroll
-    for (int k = 0; k < nc; k++) m.put(slot_of(o, k), v[k]);
-}
-
-// R = double: RustiCol's arithmetic; R = D: df64 on a df64 arena (all planes, momenta, scales and
-// factors hold float2 (high, low) in place of their doubles; see `to_df64`, `to_f64`).
-template <class R>
-__global__ void run_cache(const IOp *__restrict__ ops, uint32_t count, Arena a, uint32_t points) {
-    typedef Cx<R> C;
-    extern __shared__ double shared[];
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= points) return;
-    Slots<R> sm{shared + threadIdx.x, blockDim.x};
-    for (uint32_t n = 0; n < count; n++) {
-        IOp o = load_op(ops, n);
-        int kind = o.w[0] & 0xff, op = (o.w[0] >> 8) & 0xff, flags = o.w[0] >> 16;
-        int m = flags >> 3;
-        if (kind == K_FILL) {
-            for (int k = 0; k < m; k++) {
-                uint32_t pair = o.w[1 + k];
-                sm.put(pair & 0xff, ld_cr<R>(a, pair >> 8, i));
-            }
-        } else if (kind == K_SPILL) {
-            for (int k = 0; k < m; k++) {
-                uint32_t pair = o.w[1 + k];
-                C v = sm.get(pair & 0xff);
-                str(a.cre, (size_t)(pair >> 8) * a.ld + i, v.re);
-                str(a.cim, (size_t)(pair >> 8) * a.ld + i, v.im);
-            }
-        } else if (kind == K_ZERO) {
-            for (int k = 0; k < m; k++) sm.put(slot_of(o, k), cx(R(0.0), R(0.0)));
-        } else if (kind == K_CONTRIB) {
-            switch (op) {
-            case 2: cache_contribution<R, 2>(a, sm, o, flags, i); break;
-            case 3: cache_contribution<R, 3>(a, sm, o, flags, i); break;
-            case 4: cache_contribution<R, 4>(a, sm, o, flags, i); break;
-            case 5: cache_contribution<R, 5>(a, sm, o, flags, i); break;
-            default: cache_contribution<R, 6>(a, sm, o, flags, i); break;
-            }
-        } else if (kind == K_PROP) {
-            if (op == 7) cache_propagator<R, 7>(a, sm, o, i);
-            else if (op == 8) cache_propagator<R, 8>(a, sm, o, i);
-            else cache_propagator<R, 9>(a, sm, o, i);
-        } else if (kind == K_IDENTITY) {
-            R fr = ldr<R>(a.fre, o.w[7]), fi = ldr<R>(a.fim, o.w[7]);
-            for (uint32_t k = 0; k < o.w[1]; k++)
-                sm.put(slot_of(o, k), identity_value(fr, fi, sm.get(slot_of(o, k))));
-        } else if (kind == K_CLOSURE) {
-            uint32_t first = o.w[6] & 0xffff, nk = o.w[6] >> 16;
-            R rfr = ldr<R>(a.fre, o.w[7]), rfi = ldr<R>(a.fim, o.w[7]);
-            size_t at = o.w[1] * a.ld + i;
-            R dr = ldr<R>(a.are, at), di = ldr<R>(a.aim, at);
-            for (uint32_t k = 0; k < nk; k++) {
-                C v = closure_increment(sm.get(slot_of(o, k)), sm.get(slot_of(o, nk + k)),
-                                        ldr<R>(a.fre, first + k), ldr<R>(a.fim, first + k), rfr, rfi);
-                dr = dr + v.re;
-                di = di + v.im;
-            }
-            str(a.are, at, dr);
-            str(a.aim, at, di);
-        }
-    }
-}
-
-// in-place conversions of `count` doubles between f64 and df64 (float2 in the same 8 bytes)
+// in-place conversion of `count` doubles to df64 (float2 in the same 8 bytes)
 __global__ void to_df64(double *p, size_t count) {
     for (size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; k < count; k += (size_t)gridDim.x * blockDim.x) {
         double x = p[k];
@@ -741,13 +476,6 @@ __global__ void to_f64_planes(double *p, size_t planes, size_t stride, size_t po
     }
 }
 
-__global__ void to_f64(double *p, size_t count) {
-    for (size_t k = blockIdx.x * (size_t)blockDim.x + threadIdx.x; k < count; k += (size_t)gridDim.x * blockDim.x) {
-        float2 v = reinterpret_cast<float2 *>(p)[k];
-        p[k] = (double)v.x + (double)v.y;
-    }
-}
-
 // ---- host side -----------------------------------------------------------------------------
 
 namespace {
@@ -757,9 +485,6 @@ struct Device {
     double *small = nullptr;  // scales, then factors
     size_t cre_capacity = 0, cim_capacity = 0, are_capacity = 0, aim_capacity = 0,
            momentum_capacity = 0, small_capacity = 0;
-    std::unordered_map<uint64_t, std::pair<uint64_t *, uint32_t>> words;
-    uint64_t *scratch_words = nullptr;
-    size_t scratch_capacity = 0;
     // the last run with PACMAN_RECURRENCE_KEEP_AMPLITUDES (for a reduction)
     bool kept = false, kept_df64 = false;
     size_t kept_stride = 0, kept_points = 0, kept_planes = 0;
@@ -853,7 +578,7 @@ IOp make_op(int kind, int op, int flags) {
     return o;
 }
 
-std::vector<IOp> acc_program(const std::vector<Row> &rows) {
+std::vector<IOp> program(const std::vector<Row> &rows) {
     std::vector<IOp> ops;
     for (size_t n = 0; n < rows.size(); n++) {
         const Row &r = rows[n];
@@ -874,190 +599,11 @@ std::vector<IOp> acc_program(const std::vector<Row> &rows) {
     return ops;
 }
 
-// The components a row touches, in operand order, with their access: 1 read, 2 write, 3 both.
-void accesses(const Row &r, std::vector<std::pair<uint32_t, int>> &out) {
-    out.clear();
-    if (r.op == 1) {
-        for (uint32_t k = 0; k < r.f[1]; k++) out.push_back({r.f[0] + k, 2});
-    } else if (r.op >= 2 && r.op <= 6) {
-        int c0, c1, cd;
-        contribution_shape(r.op, &c0, &c1, &cd);
-        for (int k = 0; k < c0; k++) out.push_back({r.f[2] + k, 1});
-        for (int k = 0; k < c1; k++) out.push_back({r.f[3] + k, 1});
-        for (int k = 0; k < cd; k++) out.push_back({r.f[4] + k, r.f[0] ? 2 : 3});
-    } else if (r.op >= 7 && r.op <= 9) {
-        for (int k = 0; k < (r.op == 9 ? 4 : 2); k++) out.push_back({r.f[0] + k, 3});
-    } else if (r.op == 10) {
-        for (uint32_t k = 0; k < r.f[1]; k++) out.push_back({r.f[0] + k, 3});
-    } else if (r.op == 11) {
-        for (uint32_t k = 0; k < r.f[5]; k++) out.push_back({r.f[0] + k, 1});
-        for (uint32_t k = 0; k < r.f[5]; k++) out.push_back({r.f[1] + k, 1});
-    }
-}
-
-struct CacheStats {
-    uint64_t fills = 0, spills = 0, zeros = 0, accesses = 0;
-};
-
-// The cache program with `slots` slots per thread (16..255). With `live_out`, every value still
-// dirty at the end is spilled (the caller copies currents back).
-std::vector<IOp> cache_program(const std::vector<Row> &rows, int slots, bool live_out,
-                               CacheStats *stats) {
-    const uint32_t NONE = 0xffffffffu;
-    // per component: the rows that touch it, and how
-    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, int>>> uses;
-    std::vector<std::pair<uint32_t, int>> acc;
-    for (uint32_t n = 0; n < rows.size(); n++) {
-        accesses(rows[n], acc);
-        for (auto &x : acc) {
-            auto &u = uses[x.first];
-            if (!u.empty() && u.back().first == n) u.back().second |= x.second;
-            else u.push_back({n, x.second});
-        }
-    }
-    std::unordered_map<uint32_t, size_t> cursor;  // component -> index of its current use
-    auto next_use = [&](uint32_t c, uint32_t after, int *mode) -> uint32_t {
-        auto &u = uses[c];
-        size_t &k = cursor[c];
-        while (k < u.size() && u[k].first <= after) k++;
-        if (k == u.size()) { *mode = 0; return NONE; }
-        *mode = u[k].second;
-        return u[k].first;
-    };
-    std::vector<uint32_t> holder(slots, NONE);  // slot -> component
-    std::vector<uint32_t> next(slots, NONE);    // slot -> its value's next use (row)
-    std::vector<int> next_mode(slots, 0);
-    std::vector<char> dirty(slots, 0);
-    std::unordered_map<uint32_t, int> where;     // component -> slot
-    std::vector<IOp> ops;
-    std::vector<uint32_t> fill_pairs, spill_pairs, zero_slots;
-    auto flush_pairs = [&](int kind, std::vector<uint32_t> &pairs) {
-        for (size_t k = 0; k < pairs.size(); k += 7) {
-            int m = (int)std::min<size_t>(7, pairs.size() - k);
-            IOp o = make_op(kind, 0, m << 3);
-            for (int q = 0; q < m; q++) o.w[1 + q] = pairs[k + q];
-            ops.push_back(o);
-        }
-        pairs.clear();
-    };
-    auto set_slot = [](IOp &o, int k, uint32_t s) { o.w[2 + (k >> 2)] |= s << (8 * (k & 3)); };
-    std::vector<int> row_slots;
-    for (uint32_t n = 0; n < rows.size(); n++) {
-        const Row &r = rows[n];
-        accesses(r, acc);
-        // a clear whose value is overwritten (or never used) before it is read is dropped
-        if (r.op == 1) {
-            bool needed = false;
-            for (auto &x : acc) {
-                int mode;
-                next_use(x.first, n, &mode);
-                if (mode & 1) needed = true;
-            }
-            if (!needed) continue;
-        }
-        row_slots.assign(acc.size(), -1);
-        // pin the row's resident components, then place the missing ones
-        std::vector<char> pinned(slots, 0);
-        for (size_t k = 0; k < acc.size(); k++) {
-            auto it = where.find(acc[k].first);
-            if (it != where.end()) { row_slots[k] = it->second; pinned[it->second] = 1; }
-        }
-        for (size_t k = 0; k < acc.size(); k++) {
-            if (row_slots[k] >= 0) continue;
-            auto it = where.find(acc[k].first);  // a repeated operand placed just now
-            if (it != where.end()) { row_slots[k] = it->second; continue; }
-            int s = -1;
-            for (int q = 0; q < slots && s < 0; q++) if (holder[q] == NONE) s = q;
-            if (s < 0) {  // evict the value used farthest ahead
-                uint32_t far = 0;
-                for (int q = 0; q < slots; q++) {
-                    if (pinned[q]) continue;
-                    uint32_t t = next[q] == NONE ? NONE : next[q];
-                    if (s < 0 || t > far) { s = q; far = t; }
-                }
-                uint32_t c = holder[s];
-                bool live = (next[s] != NONE && (next_mode[s] & 1)) || (next[s] == NONE && live_out);
-                if (dirty[s] && live) {
-                    spill_pairs.push_back((uint32_t)s | c << 8);
-                    if (stats) stats->spills++;
-                }
-                where.erase(c);
-            }
-            holder[s] = acc[k].first;
-            where[acc[k].first] = s;
-            dirty[s] = 0;
-            pinned[s] = 1;
-            row_slots[k] = s;
-            if (acc[k].second & 1) {
-                fill_pairs.push_back((uint32_t)s | acc[k].first << 8);
-                if (stats) stats->fills++;
-            }
-        }
-        flush_pairs(K_SPILL, spill_pairs);
-        flush_pairs(K_FILL, fill_pairs);
-        if (stats) stats->accesses += acc.size();
-        // the row itself
-        if (r.op == 1) {
-            for (size_t k = 0; k < acc.size(); k += 16) {
-                int m = (int)std::min<size_t>(16, acc.size() - k);
-                IOp o = make_op(K_ZERO, 0, m << 3);
-                for (int q = 0; q < m; q++) set_slot(o, q, row_slots[k + q]);
-                ops.push_back(o);
-                if (stats) stats->zeros += m;
-            }
-        } else {
-            IOp o;
-            if (r.op >= 2 && r.op <= 6) {
-                o = make_op(K_CONTRIB, r.op, r.f[0] ? F_INIT : 0);
-                o.w[1] = r.f[1];
-                o.w[6] = r.f[5] | r.f[6] << 16;
-                o.w[7] = r.f[7];
-            } else if (r.op <= 9) {
-                o = make_op(K_PROP, r.op, 0);
-                o.w[1] = r.f[1];
-                o.w[7] = r.f[2];
-            } else if (r.op == 10) {
-                o = make_op(K_IDENTITY, r.op, 0);
-                o.w[1] = r.f[1];
-                o.w[7] = r.f[2];
-            } else {
-                o = make_op(K_CLOSURE, r.op, 0);
-                o.w[1] = r.f[2];
-                o.w[6] = r.f[4] | r.f[5] << 16;
-                o.w[7] = r.f[3];
-            }
-            for (size_t k = 0; k < acc.size(); k++) set_slot(o, (int)k, (uint32_t)row_slots[k]);
-            ops.push_back(o);
-        }
-        for (size_t k = 0; k < acc.size(); k++) {
-            int s = row_slots[k];
-            if (acc[k].second & 2) dirty[s] = 1;
-            int mode;
-            next[s] = next_use(acc[k].first, n, &mode);
-            next_mode[s] = mode;
-        }
-    }
-    if (live_out) {
-        for (int q = 0; q < slots; q++)
-            if (holder[q] != NONE && dirty[q]) {
-                spill_pairs.push_back((uint32_t)q | holder[q] << 8);
-                if (stats) stats->spills++;
-            }
-        flush_pairs(K_SPILL, spill_pairs);
-    }
-    return ops;
-}
-
-// One prepared program: the kernel variant and its instructions on the device.
-enum Variant { V1, ACC, CACHE };
-
+// One prepared program: its instructions on the device.
 struct Prepared {
-    Variant variant;
-    int slots;
     uint32_t count;
     IOp *ops;
 };
-
 
 bool failed(cudaError_t e, const char *step) {
     if (e == cudaSuccess) return false;
@@ -1103,15 +649,13 @@ bool copy_runs(double *dre, double *dim, double *hre, double *him, const uint32_
     return true;
 }
 
-// the kernel variant: PACMAN_RECURRENCE_KERNEL=df64 (the default)|df64cache|v1|acc|cache (v1,
-// acc and cache are RustiCol's arithmetic bit for bit; df64 and df64cache run acc and cache in
-// df64 on a df64 copy of the arena, for GPUs whose FP64 is slow), PACMAN_RECURRENCE_SLOTS (cache, 32), PACMAN_RECURRENCE_BLOCK (threads
-// per block; 128, cache 64), PACMAN_RECURRENCE_SORT=0 (do not sort the contribution rows by
-// destination)
+// the kernel: PACMAN_RECURRENCE_KERNEL=df64 (the default: f32-pair arithmetic on a df64 copy of
+// the arena, for GPUs whose FP64 is slow) | f64 (RustiCol's arithmetic bit for bit),
+// PACMAN_RECURRENCE_BLOCK (threads per block, 128), PACMAN_RECURRENCE_SORT=0 (do not sort the
+// contribution rows by destination)
 struct Options {
-    Variant variant = ACC;
     bool df64 = true;
-    int slots = 32, block = 0;
+    int block = 128;
 };
 
 bool sort_option() {
@@ -1125,81 +669,40 @@ Options options() {
     if (read) return o;
     read = true;
     const char *k = getenv("PACMAN_RECURRENCE_KERNEL");
-    if (k && !strcmp(k, "v1")) { o.variant = V1; o.df64 = false; }
-    else if (k && !strcmp(k, "acc")) { o.variant = ACC; o.df64 = false; }
-    else if (k && !strcmp(k, "cache")) { o.variant = CACHE; o.df64 = false; }
-    else if (k && !strcmp(k, "df64")) { o.variant = ACC; o.df64 = true; }
-    else if (k && !strcmp(k, "df64cache")) { o.variant = CACHE; o.df64 = true; }
+    if (k && !strcmp(k, "f64")) o.df64 = false;
     else if (k && *k && strcmp(k, "df64"))
         fprintf(stderr, "pacman recurrence runner: unknown PACMAN_RECURRENCE_KERNEL=%s, using df64\n", k);
-    if (const char *v = getenv("PACMAN_RECURRENCE_SLOTS")) o.slots = std::max(16, std::min(255, atoi(v)));
     if (const char *v = getenv("PACMAN_RECURRENCE_BLOCK")) o.block = std::max(32, std::min(1024, atoi(v)));
-    if (o.block == 0) o.block = o.variant == CACHE ? (o.df64 ? 128 : 64) : 128;
-    if (o.df64 && !getenv("PACMAN_RECURRENCE_SLOTS")) o.slots = 16;
     return o;
 }
 
-// the program of `call`'s words for the chosen variant, built once per words key (and live_out)
+// the program of `call`'s words, built once per words key
 std::unordered_map<uint64_t, Prepared> prepared_programs;
 
-Prepared build_program(const uint64_t *words, uint32_t count, const uint8_t *width, Variant variant,
-                       int slots, bool live_out, CacheStats *stats) {
-    Prepared p{variant, slots, 0, nullptr};
-    if (variant == V1) return p;
-    std::vector<Row> rows = decode(words, count, width);
-    if (sort_option()) sort_contribution_runs(rows);
-    std::vector<IOp> ops = variant == ACC ? acc_program(rows) : cache_program(rows, slots, live_out, stats);
-    p.count = (uint32_t)ops.size();
-    if (failed(cudaMalloc((void **)&p.ops, std::max<size_t>(1, ops.size()) * sizeof(IOp)), "program") ||
-        failed(cudaMemcpy(p.ops, ops.data(), ops.size() * sizeof(IOp), cudaMemcpyHostToDevice), "program"))
-        p.ops = nullptr;
-    return p;
-}
-
-const Prepared *prepare(const pacman_recurrence_call *call, bool live_out) {
-    static Prepared scratch{V1, 0, 0, nullptr};
-    Options o = options();
-    if (o.variant == V1) {
-        scratch.variant = V1;
-        return &scratch;
-    }
-    uint64_t key = call->words_key ? (call->words_key * 4 + (live_out ? 2 : 0)) : 0;
-    if (key) {
-        auto it = prepared_programs.find(key);
+const Prepared *prepare(const pacman_recurrence_call *call) {
+    static Prepared scratch{0, nullptr};
+    if (call->words_key) {
+        auto it = prepared_programs.find(call->words_key);
         if (it != prepared_programs.end()) return &it->second;
     }
-    Prepared p = build_program(call->words, call->word_count, call->width, o.variant, o.slots,
-                               live_out, nullptr);
-    if (!p.ops) return nullptr;
-    if (key) return &(prepared_programs[key] = p);
+    std::vector<Row> rows = decode(call->words, call->word_count, call->width);
+    if (sort_option()) sort_contribution_runs(rows);
+    std::vector<IOp> ops = program(rows);
+    Prepared p{(uint32_t)ops.size(), nullptr};
+    if (failed(cudaMalloc((void **)&p.ops, std::max<size_t>(1, ops.size()) * sizeof(IOp)), "program") ||
+        failed(cudaMemcpy(p.ops, ops.data(), ops.size() * sizeof(IOp), cudaMemcpyHostToDevice), "program"))
+        return nullptr;
+    if (call->words_key) return &(prepared_programs[call->words_key] = p);
     if (scratch.ops) cudaFree(scratch.ops);
     scratch = p;
     return &scratch;
 }
 
-bool launch(const Prepared &p, const uint64_t *dwords, uint32_t word_count, Widths w, const Arena &a,
-            uint32_t points) {
+bool launch(const Prepared &p, const Arena &a, uint32_t points) {
     Options o = options();
     unsigned block = (unsigned)o.block, grid = (points + block - 1) / block;
-    if (p.variant == V1) {
-        run_plan<<<grid, block>>>(dwords, word_count, w, a, points);
-    } else if (p.variant == ACC) {
-        if (o.df64) run_acc<D><<<grid, block>>>(p.ops, p.count, a, points);
-        else run_acc<double><<<grid, block>>>(p.ops, p.count, a, points);
-    } else {
-        size_t bytes = (size_t)p.slots * 2 * block * sizeof(double);
-        static size_t allowed = 0;
-        if (bytes > allowed) {
-            if (failed(cudaFuncSetAttribute(run_cache<double>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes),
-                       "shared memory") ||
-                failed(cudaFuncSetAttribute(run_cache<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)bytes),
-                       "shared memory"))
-                return false;
-            allowed = bytes;
-        }
-        if (o.df64) run_cache<D><<<grid, block, bytes>>>(p.ops, p.count, a, points);
-        else run_cache<double><<<grid, block, bytes>>>(p.ops, p.count, a, points);
-    }
+    if (o.df64) run_program<D><<<grid, block>>>(p.ops, p.count, a, points);
+    else run_program<double><<<grid, block>>>(p.ops, p.count, a, points);
     return !failed(cudaGetLastError(), "launch");
 }
 
@@ -1293,32 +796,6 @@ extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *in) {
         !grow(&device.small, &device.small_capacity, small ? small : 1, "factors"))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
 
-    // the words: cached under their key, else copied every call
-    const uint64_t *dwords;
-    auto cached = call->words_key ? device.words.find(call->words_key) : device.words.end();
-    if (cached != device.words.end() && cached->second.second == call->word_count) {
-        dwords = cached->second.first;
-    } else {
-        size_t bytes = (size_t)call->word_count * sizeof(uint64_t);
-        uint64_t *target;
-        if (call->words_key) {
-            if (failed(cudaMalloc((void **)&target, bytes ? bytes : 8), "words"))
-                return PACMAN_RECURRENCE_DEVICE_ERROR;
-            device.words[call->words_key] = {target, call->word_count};
-        } else {
-            if (call->word_count > device.scratch_capacity) {
-                if (device.scratch_words) cudaFree(device.scratch_words);
-                if (failed(cudaMalloc((void **)&device.scratch_words, bytes), "words"))
-                    return PACMAN_RECURRENCE_DEVICE_ERROR;
-                device.scratch_capacity = call->word_count;
-            }
-            target = device.scratch_words;
-        }
-        if (failed(cudaMemcpy(target, call->words, bytes, cudaMemcpyHostToDevice), "words"))
-            return PACMAN_RECURRENCE_DEVICE_ERROR;
-        dwords = target;
-    }
-
     // inputs: momenta, scales and factors, the current and amplitude runs named
     double *dscale_re = device.small, *dscale_im = dscale_re + call->scale_count;
     double *dfactor_re = dscale_im + call->scale_count, *dfactor_im = dfactor_re + call->factor_count;
@@ -1364,8 +841,6 @@ extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *in) {
     a.fre = dfactor_re;
     a.fim = dfactor_im;
     a.ld = stride;
-    Widths w;
-    for (int k = 0; k < W_COUNT; k++) w.w[k] = call->width[k];
     // df64: the uploaded planes, the momenta and the constants become df64 in place; the device
     // arena stays df64 between calls (planes copied back are converted to f64 and back again)
     bool df64 = options().df64;
@@ -1375,10 +850,9 @@ extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *in) {
                                call->upload_amplitude_runs, stride, call->points) ||
                  !convert_planes(true, device.mom, call->momentum_planes, stride, call->points) || !convert(to_df64, device.small, small)))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
-    bool live_out = call->download_current_runs > 0;
-    const Prepared *prepared = prepare(call, live_out);
+    const Prepared *prepared = prepare(call);
     if (!prepared) return PACMAN_RECURRENCE_DEVICE_ERROR;
-    if (!launch(*prepared, dwords, call->word_count, w, a, call->points))
+    if (!launch(*prepared, a, call->points))
         return PACMAN_RECURRENCE_DEVICE_ERROR;
     uint32_t amplitude_runs = keep ? 0 : call->download_amplitude_runs;
     if (df64 && (!convert_runs(false, device.are, device.aim, call->download_amplitude,
@@ -1415,7 +889,7 @@ extern "C" int pacman_recurrence_v1_run(const pacman_recurrence_call *in) {
 
 // ---- the LC diagonal reduction on the device --------------------------------------------------
 
-// a df64 value as the double it stands for: as `to_f64` converts it, so the reduction of a df64 run
+// a df64 value as the double it stands for: as `to_f64_planes` converts it, so the reduction of a df64 run
 // equals the host's reduction of its copied-back amplitudes bit for bit
 __device__ __forceinline__ double as_double(double x) { return x; }
 __device__ __forceinline__ double as_double(D x) { return __dadd_rn((double)x.hi, (double)x.lo); }

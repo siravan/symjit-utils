@@ -3509,8 +3509,8 @@ int main(int argc, char **argv) {
     /// A synthetic recurrence plan on the recurrence runner: every op (clears, the five
     /// contributions with initializing and accumulating rows on interleaved destinations, the
     /// three propagators, identity finalization, closures), once per `PACMAN_RECURRENCE_KERNEL`.
-    /// `acc` and `cache` equal `v1` bit for bit; `df64` (the default) and `df64cache` agree with
-    /// it to 1e-9. Under each kernel, the amplitudes zeroed on the device and kept there reduce
+    /// `f64` with the contribution rows unsorted (`PACMAN_RECURRENCE_SORT=0`) equals `f64` bit for
+    /// bit; `df64` (the default) agrees with it to 1e-9. Under each kernel, the amplitudes zeroed on the device and kept there reduce
     /// (`pacman_recurrence_v1_reduce`) to the host's reduction of the copied-back ones, bit for
     /// bit; the first calls pass the struct of before the reduction. Skipped without nvcc or a C compiler, and its GPU steps without a usable GPU
     /// unless `SJB2PTX_REQUIRE_GPU` is set.
@@ -3693,10 +3693,12 @@ int main(int argc, char **argv) {
         assert!(cc.status.success(), "{}", String::from_utf8_lossy(&cc.stderr));
         let lib = dir.join("librecurrence.so");
         let mut results: Vec<(&str, Vec<f64>)> = Vec::new();
-        for kernel in ["v1", "acc", "cache", "df64", "df64cache", ""] {
+        for kernel in ["f64", "f64 unsorted", "df64", ""] {
             let mut cmd = Command::new(dir.join("rectest"));
             cmd.arg(&lib).current_dir(&dir);
-            if kernel.is_empty() {
+            if kernel == "f64 unsorted" {
+                cmd.env("PACMAN_RECURRENCE_KERNEL", "f64").env("PACMAN_RECURRENCE_SORT", "0");
+            } else if kernel.is_empty() {
                 cmd.env_remove("PACMAN_RECURRENCE_KERNEL");
             } else {
                 cmd.env("PACMAN_RECURRENCE_KERNEL", kernel);
@@ -3720,7 +3722,7 @@ int main(int argc, char **argv) {
         let scale = want.iter().fold(0.0f64, |m, v| m.max(v.abs()));
         for (kernel, got) in &results[1..] {
             for (k, (g, w)) in got.iter().zip(want).enumerate() {
-                if matches!(*kernel, "acc" | "cache") {
+                if *kernel == "f64 unsorted" {
                     assert_eq!(g.to_bits(), w.to_bits(), "{} value {}: {} for {}", kernel, k, g, w);
                 } else {
                     assert!((g - w).abs() <= 1e-9 * scale, "{} value {}: {} for {}", kernel, k, g, w);
