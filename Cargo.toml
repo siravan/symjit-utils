@@ -41,7 +41,7 @@ syn = { version = "3", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 # the JIT: the .sjb format, the MIR and the `Generator` trait (`symjit::backend`); neither the
 # C interface (`sympy`) nor the coroutines (`async`) are needed
-symjit = { version = "2.28.2", default-features = false }
+symjit = { version = "2.28.3", default-features = false }
 # pacman plan: the executor templates of pyAmpliCol's `eager-kernel-pack.json`
 serde_json = "1"
 
