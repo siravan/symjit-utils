@@ -18,6 +18,15 @@
 //   an arena of f32 planes would hold them.
 // - Labels, jumps, funclet calls and returns: every value is converted to f64 before them, and
 //   is f64 after them (the analysis does not follow control flow).
+//
+// `retype` makes three passes. The generator reuses register names (the PTX is not in SSA form),
+// so types belong to definitions, not to names:
+// 1. forward: parse the ops; each definition becomes a node (an SSA value), and each op records
+//    its seeds (the operands it needs in f64);
+// 2. backward (`need` only): one reverse sweep marks each op's seeds and, for a marked definition,
+//    its operands: the backward slices of the denominators;
+// 3. forward: the types of the nodes each op adds, then the op, with conversions where an operand
+//    is not of the type it is used in.
 
 use std::collections::HashMap;
 
@@ -300,7 +309,6 @@ struct Graph {
     cur: HashMap<String, usize>,
     /// the kind of each name's last definition (kept across control items)
     last_kind: HashMap<String, Kind>,
-    seeds: Vec<usize>,
 }
 
 impl Graph {
@@ -335,6 +343,14 @@ struct Rec {
     def: Option<usize>,
 }
 
+/// Per op, for the two sweeps: its `Rec`, the operands it makes f64 (a divisor, a reciprocal's
+/// operand, a library argument) and the number of nodes once it is parsed.
+struct Step {
+    rec: Rec,
+    seeds: Vec<usize>,
+    end: usize,
+}
+
 /// Retypes `body` (see the top of this file). `count_in`: the input slots (memory slots
 /// `0 .. count_in`).
 pub fn retype(body: &[Item], mixed: &Mixed, count_in: usize) -> Result<(Vec<Item>, MixedCounts)> {
@@ -343,10 +359,11 @@ pub fn retype(body: &[Item], mixed: &Mixed, count_in: usize) -> Result<(Vec<Item
         nodes: Vec::new(),
         cur: HashMap::new(),
         last_kind: HashMap::new(),
-        seeds: Vec::new(),
     };
-    let mut recs = Vec::with_capacity(ops.len());
+    // 1. forward: the nodes (one per definition, i.e. SSA values) and each op's seeds
+    let mut steps = Vec::with_capacity(ops.len());
     for op in &ops {
+        let mut seeds = Vec::new();
         let rec = match op {
             Op::Line(_) => Rec {
                 srcs: vec![],
@@ -379,7 +396,7 @@ pub fn retype(body: &[Item], mixed: &Mixed, count_in: usize) -> Result<(Vec<Item
                     // the divisor, or the reciprocal's operand
                     let divisor = if mnem.starts_with("rcp.") { 0 } else { 1 };
                     if let Some(&d) = s.get(divisor) {
-                        g.seeds.push(d);
+                        seeds.push(d);
                     }
                 }
                 let def = g.def(
@@ -435,7 +452,7 @@ pub fn retype(body: &[Item], mixed: &Mixed, count_in: usize) -> Result<(Vec<Item
             }
             Op::StParam { src, .. } => {
                 let s = g.get(src);
-                g.seeds.push(s);
+                seeds.push(s);
                 Rec {
                     srcs: vec![s],
                     def: None,
@@ -560,49 +577,58 @@ pub fn retype(body: &[Item], mixed: &Mixed, count_in: usize) -> Result<(Vec<Item
                 }
             }
         };
-        recs.push(rec);
+        steps.push(Step {
+            rec,
+            seeds,
+            end: g.nodes.len(),
+        });
     }
 
-    // the backward slices of the seeds
+    // 2. backward: the slices of the seeds. An op comes after the definitions of its operands,
+    // so one reverse sweep both records its seeds and passes a definition's flag on to its operands.
     let mut need = vec![false; g.nodes.len()];
     if mixed.rule == MixedRule::Need {
-        for &s in &g.seeds {
-            need[s] = true;
-        }
-        for n in (0..g.nodes.len()).rev() {
-            if need[n] {
-                for &s in &g.nodes[n].srcs {
-                    need[s] = true;
+        for step in steps.iter().rev() {
+            for &s in &step.seeds {
+                need[s] = true;
+            }
+            if let Some(d) = step.rec.def {
+                if need[d] {
+                    for &s in &g.nodes[d].srcs {
+                        need[s] = true;
+                    }
                 }
             }
         }
     }
-    // the types, in definition order (operands are defined first)
-    let mut ty = vec![Ty::F64; g.nodes.len()];
-    for n in 0..g.nodes.len() {
-        let node = &g.nodes[n];
-        ty[n] = match node.base {
-            Base::Fixed64 | Base::Store64 | Base::Div => Ty::F64,
-            Base::Input32 | Base::Store32 => Ty::F32,
-            Base::Flexible => Ty::Both,
-            Base::Mov => ty[node.srcs[0]],
-            Base::Other => match mixed.rule {
-                MixedRule::Need if need[n] => Ty::F64,
-                MixedRule::Need => Ty::F32,
-                MixedRule::Forward if node.srcs.iter().any(|&s| ty[s] == Ty::F64) => Ty::F64,
-                MixedRule::Forward => Ty::F32,
-            },
-        };
-    }
 
+    // 3. forward: the types of the nodes an op adds (its operands are typed already), then the op
+    let mut ty = Vec::with_capacity(g.nodes.len());
     let mut e = Emitter {
         out: Vec::with_capacity(body.len() * 5 / 4),
         valid: HashMap::new(),
         counts: MixedCounts::default(),
         kinds: HashMap::new(),
     };
-    for (op, rec) in ops.into_iter().zip(&recs) {
-        e.op(op, rec, &g, &ty, mixed)?;
+    for (op, step) in ops.into_iter().zip(&steps) {
+        while ty.len() < step.end {
+            let n = ty.len();
+            let node = &g.nodes[n];
+            let t = match node.base {
+                Base::Fixed64 | Base::Store64 | Base::Div => Ty::F64,
+                Base::Input32 | Base::Store32 => Ty::F32,
+                Base::Flexible => Ty::Both,
+                Base::Mov => ty[node.srcs[0]],
+                Base::Other => match mixed.rule {
+                    MixedRule::Need if need[n] => Ty::F64,
+                    MixedRule::Need => Ty::F32,
+                    MixedRule::Forward if node.srcs.iter().any(|&s| ty[s] == Ty::F64) => Ty::F64,
+                    MixedRule::Forward => Ty::F32,
+                },
+            };
+            ty.push(t);
+        }
+        e.op(op, &step.rec, &g, &ty, mixed)?;
     }
     Ok((e.out, e.counts))
 }
