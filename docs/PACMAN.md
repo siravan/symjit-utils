@@ -56,6 +56,7 @@ r/runner out arena/*.json && pacman replay --scalar --against out artifacts/qq_z
 | `--sm LIST` | runner | The GPUs' SM numbers, e.g. `80,90,120` (implies `--cuda`; default: the local GPU's). |
 | `--jobs N` | runner | `ptxas` runs at a time (default: the CPUs). |
 | `--f32` | runner | f32 CUDA kernels (with `--cuda`; below). |
+| `--mixed need\|forward` | runner | Mixed-precision CUDA kernels (with `--cuda`, not `--f32`; below). |
 | `--fallback PCT` | runner | A hybrid runner (with `--cuda --f32`; below): its reductions rerun the PCT largest points (`1%` or `0.01`) and every non-finite one on the CPU in f64, with scalar kernels or those of `--simd`/`--simd512`. |
 | `--set KEY=VALUE` | runner | An option of the kernels' configuration (symjit's `set_option`, e.g. `stable_math=true`), set before they are compiled (CPU and CUDA runners); may be repeated. |
 
@@ -598,6 +599,12 @@ the f32 arena; after the leaves, it widens the planes to copy back into the f64 
 over PCIe are therefore the f64 runner's. The `runner` executable and the statistics (`, f32`)
 work as before. Results are not bit-equal to the CPU: the test compares the toy execution with the
 scalar replay within 1e-6. Accuracy and speed for Z+6g: `plans/pacman-ptx/F32.md`.
+
+**Mixed-precision runners (`--cuda --mixed need|forward`).** The f64 runner with `sjb2ptx --mixed`
+leaves (`docs/PTX.md`, "Numbers"). The planes from the momenta on (momenta, the zero plane,
+parameters) are f64 inputs. The currents and amplitudes are rounded to f32 where they are loaded
+and stored, so the arena holds f32 values in f64 planes. Results for Z+6g and pp_zjj:
+`plans/sjb2ptx/MIXED.md`.
 
 **Hybrid runners (`--cuda --f32 --fallback PCT`).** An f32 CUDA runner whose reductions rerun
 their largest points on the CPU in f64 (`plans/pacman-ptx/HYBRID.md`). The library holds both:

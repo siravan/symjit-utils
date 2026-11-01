@@ -22,6 +22,8 @@ cc prog.c model_cuda.c -ldl              # a C program running it: no CUDA toolk
 | `--no-header` | Do not write the header. |
 | `--driver` | Also write the C driver `<name>_cuda.c` and `<name>_cuda.h` next to the module (below). |
 | `--f32` | Single precision (below, "Numbers"); not with `--driver`. |
+| `--mixed need\|forward` | Mixed precision on f64 inputs and outputs (below, "Numbers"); not with `--f32`. |
+| `--f64-inputs <LIST>` | With `--mixed`: the inputs that are f64, e.g. `0,4-7`; the others are rounded to f32. |
 
 The function may have been compiled for any machine (`ty="native"`, `"arm"`, `"riscv"`,
 `"bytecode"`) and opt level: sjb2ptx compiles its saved MIR and lets ptxas allocate the registers.
@@ -136,6 +138,22 @@ constants rounded to the nearest f32. Math functions are computed in f64 by the 
 arguments are widened and the result rounded to f32. The C header says "floats"; `--driver` is
 f64 only. There is no CPU f32 kernel to compare with: f32 results are compared with the f64 ones
 within single-precision rounding.
+
+With `--mixed RULE` (`PtxOptions::mixed`, `src/ptx/mixed.rs`) each value is an f32 or an f64, for
+rational kernels whose accuracy is lost near the poles. The interface stays f64 (`in`, `out`,
+`params`, `--driver`).
+- **Types.** Divisions and reciprocals are f64. With `need`, so is everything a divisor, a
+  reciprocal's operand or a math-function argument depends on (the backward slice of the
+  denominators), and every other operation is f32. With `forward`, an operation is f64 if an
+  operand is.
+- **Inputs and outputs.** The inputs `--f64-inputs` lists are f64, and the others are rounded to
+  f32 where they are loaded. Outputs are rounded to f32 where they are stored. Constants exist in
+  both types.
+- **Conversions.** An operand of the other type is converted where it is used, into the register's
+  f32 twin (`%g3` and `%fg3`). Masks are sign-extended or truncated.
+- **Control flow.** Before a label, jump, funclet call or return, every value is converted to f64.
+- **Header.** The module's header comment counts the f64 and f32 operations and the conversions.
+- Results: `plans/sjb2ptx/MIXED.md`.
 
 ## Math functions
 
