@@ -56,8 +56,12 @@ pub struct Mixed {
     pub rule: MixedRule,
     /// per input slot, whether it is f64 (missing: f32)
     pub f64_inputs: Vec<bool>,
-    /// round the outputs to f32
+    /// round the outputs to f32 (f64 arena)
     pub round_outputs: bool,
+    /// a mixed arena (plane kernels): the f32 inputs and the outputs are f32 slots of `in` and
+    /// `out` (4 bytes), the f64 inputs f64 slots of a second arena, `params` (8 bytes), at the
+    /// same planes and leading dimension
+    pub arena: bool,
 }
 
 impl Mixed {
@@ -66,6 +70,7 @@ impl Mixed {
             rule,
             f64_inputs,
             round_outputs: true,
+            arena: false,
         }
     }
 }
@@ -164,6 +169,8 @@ enum Base {
     Input32,
     Flexible,
     Store64,
+    /// an output stored into an f32 slot (mixed arena)
+    Store32,
     Mov,
     Div,
     Other,
@@ -497,7 +504,11 @@ pub fn retype(body: &[Item], mixed: &Mixed, count_in: usize) -> Result<(Vec<Item
                     Node {
                         srcs: vec![s],
                         kind,
-                        base: Base::Store64,
+                        base: if mixed.arena {
+                            Base::Store32
+                        } else {
+                            Base::Store64
+                        },
                     },
                 );
                 Rec {
@@ -572,7 +583,7 @@ pub fn retype(body: &[Item], mixed: &Mixed, count_in: usize) -> Result<(Vec<Item
         let node = &g.nodes[n];
         ty[n] = match node.base {
             Base::Fixed64 | Base::Store64 | Base::Div => Ty::F64,
-            Base::Input32 => Ty::F32,
+            Base::Input32 | Base::Store32 => Ty::F32,
             Base::Flexible => Ty::Both,
             Base::Mov => ty[node.srcs[0]],
             Base::Other => match mixed.rule {
@@ -784,6 +795,25 @@ impl Emitter {
                 self.out.push(Item::Const(dst.clone(), idx));
                 self.out.push(Item::Const(f32_name(&dst), idx));
                 self.set(&dst, Ty::Both, Kind::Float);
+            }
+            Op::LoadMem(dst, idx) if mixed.arena => {
+                // f32 slots load into the f32 register; so does an output stored before
+                let def = rec.def.unwrap();
+                let slot = format!("%m{}", idx);
+                let stored32 = self.valid.get(&slot) == Some(&(true, false));
+                if g.nodes[def].base == Base::Input32 || (rec.srcs.len() == 1 && stored32) {
+                    self.out.push(Item::LoadMem(f32_name(&dst), idx));
+                    self.set(&dst, Ty::F32, kind_of(def));
+                } else {
+                    self.out.push(Item::LoadMem(dst.clone(), idx));
+                    self.set(&dst, Ty::F64, kind_of(def));
+                }
+            }
+            Op::SaveMem(src, idx) if mixed.arena => {
+                let n = rec.srcs[0];
+                let s = self.want(&src, Ty::F32, kind_of(n));
+                self.out.push(Item::SaveMem(s, idx));
+                self.set(&format!("%m{}", idx), Ty::F32, kind_of(n));
             }
             Op::LoadMem(dst, idx) => {
                 let def = rec.def.unwrap();

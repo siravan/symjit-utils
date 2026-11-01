@@ -180,20 +180,44 @@ pub fn objects(
 }
 
 /// The kernels of `spec` as PTX modules for the CUDA runner: one per leaf (`pacman_leaf<k>`),
+/// The precision of a CUDA runner's kernels and device arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precision {
+    F64,
+    /// f32 kernels on an f32 copy of the arena
+    F32,
+    /// mixed-precision kernels (`ptx::Mixed`): the momenta, the zero plane and the parameters
+    /// are f64 inputs, the currents and amplitudes f32; `arena`: on a mixed arena (f32 planes
+    /// for the currents and amplitudes, the f64 arena for the rest), else on the f64 arena
+    Mixed {
+        rule: crate::ptx::MixedRule,
+        arena: bool,
+    },
+}
+
+impl Precision {
+    /// The leaves run on an f32 device arena (with conversions after and before the copies).
+    pub fn f32_arena(self) -> bool {
+        matches!(self, Precision::F32 | Precision::Mixed { arena: true, .. })
+    }
+}
+
+/// The first f64 plane of a mixed arena: the momenta, the zero plane and the parameters follow
+/// the currents and amplitudes.
+pub fn first_f64_plane(spec: &Spec) -> u32 {
+    2 * (spec.arena.currents + spec.arena.amplitudes)
+}
+
 /// with its planes compiled in (inputs then outputs, as the `.mapping` rows), for `.target
-/// sm_<sm>`; with `f32`, single-precision kernels on an arena of floats; with `mixed`,
-/// mixed-precision kernels on the f64 arena (`ptx::Mixed`: the momenta, the zero plane and the
-/// parameters are f64 inputs, the currents and amplitudes f32). `settings` as for `objects`.
+/// sm_<sm>`, in `precision` (`Precision`). `settings` as for `objects`.
 pub fn ptx_modules(
     spec: &Spec,
     members: &HashMap<&str, &[u8]>,
     sm: u32,
-    f32: bool,
-    mixed: Option<crate::ptx::MixedRule>,
+    precision: Precision,
     settings: &[(String, String)],
 ) -> Result<Vec<String>> {
-    // the planes from the momenta on: momenta, zero, parameters
-    let first_f64 = 2 * (spec.arena.currents + spec.arena.amplitudes);
+    let first_f64 = first_f64_plane(spec);
     let mut modules = Vec::new();
     for (k, call) in spec.calls.iter().enumerate() {
         let bytes = members
@@ -206,11 +230,13 @@ pub fn ptx_modules(
         }
         let mut options = crate::ptx::PtxOptions::new(&format!("pacman_leaf{}", k));
         options.sm = sm;
-        options.f32 = f32;
-        options.mixed = mixed.map(|rule| {
+        options.f32 = precision == Precision::F32;
+        if let Precision::Mixed { rule, arena } = precision {
             let f64_inputs = call.inputs.iter().map(|&p| p >= first_f64).collect();
-            crate::ptx::Mixed::new(rule, f64_inputs)
-        });
+            let mut mixed = crate::ptx::Mixed::new(rule, f64_inputs);
+            mixed.arena = arena;
+            options.mixed = Some(mixed);
+        }
         options.mapping = Some(call.inputs.iter().chain(&call.outputs).copied().collect());
         let ptx = model.ptx(&options).with_context(|| {
             format!("{}: cannot compile `{}` into PTX", call.label, call.member)
@@ -1238,7 +1264,9 @@ pub fn build(dir: &Path, cc: &str, kernels: usize) -> Result<()> {
 /// leaves are single precision: the f64 planes RustiCol passes are copied as before into the f64
 /// device arena, converted into an f32 one for the leaves, and the planes copied back are
 /// converted back to f64 first (`CONVERT_PTX`).
-pub fn runner_cuda_c(spec: &Spec, f32: bool, fallback: Option<(f64, u32)>) -> String {
+pub fn runner_cuda_c(spec: &Spec, precision: Precision, fallback: Option<(f64, u32)>) -> String {
+    let f32 = precision == Precision::F32;
+    let mixed_arena = precision.f32_arena() && !f32;
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -1263,6 +1291,17 @@ pub fn runner_cuda_c(spec: &Spec, f32: bool, fallback: Option<(f64, u32)>) -> St
         "/* 1: the leaves are f32 kernels on an f32 copy of the arena */\n#define F32 {}\n",
         f32 as u8
     );
+    let _ = writeln!(
+        s,
+        "/* 1: the leaves are mixed-precision kernels on a mixed arena: the planes before FIRST_F64\n\
+         \x20  (currents, amplitudes) in an f32 copy of the arena, the others (momenta, the zero\n\
+         \x20  plane, parameters) in the f64 arena, which the kernels get as `params` */\n\
+         #define MIXED_ARENA {}\n#define FIRST_F64 {}u\n\
+         /* the leaves run on an f32 copy of (some of) the arena */\n\
+         #define F32_ARENA (F32 || MIXED_ARENA)\n",
+        mixed_arena as u8,
+        first_f64_plane(spec)
+    );
     let (fraction, lanes) = fallback.unwrap_or((0.0, 1));
     let _ = writeln!(
         s,
@@ -1274,7 +1313,7 @@ pub fn runner_cuda_c(spec: &Spec, f32: bool, fallback: Option<(f64, u32)>) -> St
         lanes
     );
     s.push_str(&tables_c(spec));
-    if f32 {
+    if precision.f32_arena() {
         s.push_str(
             "/* the conversions between the f64 and the f32 arenas (PTX, compiled by the driver) */\n",
         );
@@ -1562,7 +1601,7 @@ static struct {
     CUfunction functions[NUM_LEAVES];
     CUdeviceptr arena; /* NUM_PLANES planes of `ld` points */
     size_t ld;
-#if F32
+#if F32_ARENA
     CUdeviceptr arena32; /* the f32 arena the leaves run on, NUM_PLANES planes of `ld` points */
     CUdeviceptr lists;   /* the planes converted in, then those converted out (2 x NUM_PLANES) */
     CUfunction to_f32, to_f64;
@@ -1639,7 +1678,8 @@ __attribute__((destructor)) static void print_stats(void) {
         fprintf(stderr,
                 "pacman runner (%s of %s%s): %llu calls, %llu points (%llu reduced on the GPU), "
                 "%llu copies (%.1f MB), %u streams, %llu groups, %.3f s (%.2f us/point)\n",
-                METADATA.execution, METADATA.process, F32 ? ", f32" : "", STATS.calls,
+                METADATA.execution, METADATA.process,
+                F32 ? ", f32" : MIXED_ARENA ? ", mixed arena" : "", STATS.calls,
                 STATS.points, STATS.reduced, STATS.copies,
                 STATS.bytes * 1e-6, G.num_streams, STATS.groups, STATS.seconds,
                 STATS.points ? 1e6 * STATS.seconds / STATS.points : 0.0);
@@ -1804,7 +1844,7 @@ static int cuda_open(void) {
         CU(G.cu.ModuleLoadData(&module, REDUCE_PTX), "cuModuleLoadData (the reduction)");
         CU(G.cu.ModuleGetFunction(&G.reduce, module, "pacman_reduce"), "cuModuleGetFunction");
     }
-#if F32
+#if F32_ARENA
     {
         CUmodule module;
         CU(G.cu.ModuleLoadData(&module, CONVERT_PTX), "cuModuleLoadData (the conversions)");
@@ -1832,7 +1872,7 @@ const pacman_runner_metadata *pacman_runner_v1_metadata(void) {
     return &METADATA;
 }
 
-#if F32
+#if F32_ARENA
 static uint32_t LISTS[2 * NUM_PLANES];
 
 /* converts the `count` planes listed at `offset` in G.lists from the arena `src` into `dst`
@@ -2132,7 +2172,7 @@ static int run(double *const *planes, uint32_t num_planes, const uint32_t *leave
             G.values = 0;
             G.ld = 0;
         }
-#if F32
+#if F32_ARENA
         if (G.arena32 != 0) {
             G.cu.MemFree(G.arena32);
             G.arena32 = 0;
@@ -2147,10 +2187,12 @@ static int run(double *const *planes, uint32_t num_planes, const uint32_t *leave
         goto fail;
     }
     unsigned long long n = point_count, stride = G.ld;
-#if F32
+#if F32_ARENA
     /* the planes copied in, rounded into the f32 arena, and those to copy back */
     uint32_t num_in = 0, num_out = 0;
     for (uint32_t p = 0; p < NUM_PLANES; p++) {
+        /* a mixed arena's f64 planes stay in the f64 arena */
+        if (MIXED_ARENA && p >= FIRST_F64) continue;
         if (FLAGS[p] & READ_FIRST) LISTS[num_in++] = p;
         if (FLAGS[p] & COPY_BACK) LISTS[NUM_PLANES + num_out++] = p;
     }
@@ -2162,12 +2204,14 @@ static int run(double *const *planes, uint32_t num_planes, const uint32_t *leave
 #else
     CUdeviceptr arena = G.arena;
 #endif
-    void *args[] = {&arena, &arena, &arena, &n, &stride, &stride};
+    /* `params`: the f64 arena of a mixed arena's f64 inputs (unused otherwise) */
+    CUdeviceptr params = MIXED_ARENA ? G.arena : arena;
+    void *args[] = {&arena, &arena, &params, &n, &stride, &stride};
     unsigned grid = (point_count + BLOCK - 1) / BLOCK;
     if (launch(leaves, count, grid, args) != 0) {
         goto fail;
     }
-#if F32
+#if F32_ARENA
     /* on the default stream, which the leaves' streams joined */
     if (convert(G.to_f64, G.arena32, G.arena, NUM_PLANES, num_out, point_count) != 0) {
         goto fail;
@@ -2308,7 +2352,7 @@ pub fn write_cuda(
     spec: &Spec,
     modules: &[String],
     sms: &[u32],
-    f32: bool,
+    precision: Precision,
     fallback: Option<(&Kernels, f64)>,
 ) -> Result<()> {
     let write = |name: &str, bytes: &[u8]| -> Result<()> {
@@ -2323,7 +2367,10 @@ pub fn write_cuda(
         write(&format!("kernels/leaf{}.ptx", k), m.as_bytes())?;
     }
     let hybrid = fallback.map(|(kernels, fraction)| (fraction, kernels.lanes));
-    write("runner.c", runner_cuda_c(spec, f32, hybrid).as_bytes())?;
+    write(
+        "runner.c",
+        runner_cuda_c(spec, precision, hybrid).as_bytes(),
+    )?;
     write("pacman_runner.h", RUNNER_H.as_bytes())?;
     write("main.c", MAIN_C.as_bytes())?;
     let cpu_kernels = fallback.map(|(kernels, _)| kernels.objects.len());
@@ -2890,7 +2937,7 @@ int main(int argc, char **argv) {
         .into_iter()
         .collect();
         let modules =
-            ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, true, None, &[]).unwrap();
+            ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, Precision::F32, &[]).unwrap();
         assert!(modules.iter().all(|m| !m.contains("f64")));
         // f32 planes: the leaf's plane offsets are in floats
         assert!(
@@ -2899,7 +2946,7 @@ int main(int argc, char **argv) {
             modules[1]
         );
         let sms = [local_sm().unwrap_or(80)];
-        write_cuda(&dir, &spec, &modules, &sms, true, None).unwrap();
+        write_cuda(&dir, &spec, &modules, &sms, Precision::F32, None).unwrap();
         assert!(std::fs::read_to_string(dir.join("runner.c"))
             .unwrap()
             .contains("#define F32 1"));
@@ -3003,7 +3050,7 @@ int main(int argc, char **argv) {
         .into_iter()
         .collect();
         let modules =
-            ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, false, None, &[]).unwrap();
+            ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, Precision::F64, &[]).unwrap();
         assert_eq!(modules.len(), 2);
         // the leaf's planes are compiled in: leaf 1 writes plane 3 (re) and 8 (im)
         assert!(modules[1].contains(".visible .entry pacman_leaf1("));
@@ -3013,7 +3060,7 @@ int main(int argc, char **argv) {
             modules[1]
         );
         let sms = [local_sm().unwrap_or(80)];
-        write_cuda(&dir, &spec, &modules, &sms, false, None).unwrap();
+        write_cuda(&dir, &spec, &modules, &sms, Precision::F64, None).unwrap();
         build_cuda(&dir, "cc", modules.len(), &sms, 2, None).unwrap();
 
         // the library's argument checks come before the GPU
@@ -3115,7 +3162,7 @@ int main(int argc, char **argv) {
         spec.calls.truncate(1);
         let member = spec.calls[0].member.clone();
         let members: HashMap<&str, &[u8]> = [(member.as_str(), &a[..])].into_iter().collect();
-        assert!(ptx_modules(&spec, &members, 70, false, None, &[]).is_ok());
+        assert!(ptx_modules(&spec, &members, 70, Precision::F64, &[]).is_ok());
         for (outputs, message) in [
             (vec![2, 2], "writes plane 2 twice"),
             (vec![2, 5], "reads and writes plane 5"),
@@ -3124,7 +3171,7 @@ int main(int argc, char **argv) {
             spec.calls[0].outputs = outputs;
             let err = format!(
                 "{:#}",
-                ptx_modules(&spec, &members, 70, false, None, &[]).unwrap_err()
+                ptx_modules(&spec, &members, 70, Precision::F64, &[]).unwrap_err()
             );
             assert!(err.contains(message), "{}", err);
         }
@@ -3363,12 +3410,12 @@ int main(int argc, char **argv) {
         .into_iter()
         .collect();
         let sms = [local_sm().unwrap_or(80)];
-        for f32 in [false, true] {
-            let sub = dir.join(if f32 { "f32" } else { "f64" });
+        for (name, precision) in [("f64", Precision::F64), ("f32", Precision::F32)] {
+            let sub = dir.join(name);
             std::fs::create_dir_all(sub.join("out")).unwrap();
             let modules =
-                ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, f32, None, &[]).unwrap();
-            write_cuda(&sub, &spec, &modules, &sms, f32, None).unwrap();
+                ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, precision, &[]).unwrap();
+            write_cuda(&sub, &spec, &modules, &sms, precision, None).unwrap();
             build_cuda(&sub, "cc", modules.len(), &sms, 2, None).unwrap();
             if reduce_check(&sub).is_none() {
                 break;
@@ -3376,6 +3423,75 @@ int main(int argc, char **argv) {
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
+    /// A mixed-arena runner (f32 currents and amplitudes, the momentum and zero planes in the f64
+    /// arena) of the amplitude execution: its second leaf reads the momentum and zero planes as
+    /// f64 slots of `params`, its reductions are the arena's (`reduce_check`), and its arena
+    /// equals that of the same mixed-precision kernels on the f64 arena bit for bit (both round
+    /// the currents where they are loaded and the outputs where they are stored).
+    #[test]
+    fn mixed_arena_runner_equals_the_f64_arena_one() {
+        let ptxas = cuda_tool("PTXAS", "ptxas");
+        let fatbinary = cuda_tool("FATBINARY", "fatbinary");
+        let have = |tool: &str| {
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !have_cc() || !have(&ptxas) || !have(&fatbinary) {
+            eprintln!("no C compiler or CUDA toolkit: the mixed-arena runner is not built");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pacman-mixed-arena-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (a, b) = (
+            plane_application(PRODUCT_PLUS_ONE),
+            plane_application(SQUARE_MINUS),
+        );
+        let spec = amplitude_spec();
+        assert_eq!(first_f64_plane(&spec), 10);
+        let members: HashMap<&str, &[u8]> = [
+            (spec.calls[0].member.as_str(), &a[..]),
+            (spec.calls[1].member.as_str(), &b[..]),
+        ]
+        .into_iter()
+        .collect();
+        let sms = [local_sm().unwrap_or(80)];
+        let mut arenas = Vec::new();
+        for arena in [false, true] {
+            let precision = Precision::Mixed {
+                rule: crate::ptx::MixedRule::Need,
+                arena,
+            };
+            let sub = dir.join(if arena { "mixed" } else { "f64" });
+            std::fs::create_dir_all(sub.join("out")).unwrap();
+            let modules =
+                ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, precision, &[]).unwrap();
+            if arena {
+                // f32 slots of `in` and `out`; the momentum and zero planes from the f64 arena
+                let m = &modules[1];
+                assert!(m.contains("shl.b64 %ldi, %ldi, 2;"), "{}", m);
+                assert!(m.contains("add.u64 %p64, %par, %a0;"), "{}", m);
+                assert!(m.contains("ld.global.nc.b32"), "{}", m);
+                assert!(m.contains("ld.global.nc.b64"), "{}", m);
+                assert!(!m.contains("st.global.b64"), "{}", m);
+            }
+            write_cuda(&sub, &spec, &modules, &sms, precision, None).unwrap();
+            let c = std::fs::read_to_string(sub.join("runner.c")).unwrap();
+            assert!(c.contains(&format!("#define MIXED_ARENA {}", arena as u8)));
+            build_cuda(&sub, "cc", modules.len(), &sms, 2, None).unwrap();
+            if reduce_check(&sub).is_none() {
+                std::fs::remove_dir_all(&dir).unwrap();
+                return;
+            }
+            arenas.push(recording::read_f64s(&sub.join("out/t.e0.r0.arena"), 12 * 9).unwrap());
+        }
+        for (k, (x, y)) in arenas[0].iter().zip(&arenas[1]).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "value {}: {} and {}", k, x, y);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A hybrid runner (f32 leaves on the GPU, reruns on the CPU in f64) of the amplitude
     /// execution against the CPU runner and the f32 CUDA runner, with point 2 out of f32's range:
     /// with no fallback only the non-finite point is rerun, with all of it every value is the
@@ -3410,7 +3526,7 @@ int main(int argc, char **argv) {
         let sms = [local_sm().unwrap_or(80)];
         let kernels = objects(&spec, &members, 1, &[]).unwrap();
         let modules =
-            ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, true, None, &[]).unwrap();
+            ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, Precision::F32, &[]).unwrap();
         for name in ["cpu", "f32", "hybrid"] {
             let sub = dir.join(name);
             std::fs::create_dir_all(sub.join("out")).unwrap();
@@ -3420,11 +3536,19 @@ int main(int argc, char **argv) {
                     build(&sub, "cc", kernels.objects.len()).unwrap();
                 }
                 "f32" => {
-                    write_cuda(&sub, &spec, &modules, &sms, true, None).unwrap();
+                    write_cuda(&sub, &spec, &modules, &sms, Precision::F32, None).unwrap();
                     build_cuda(&sub, "cc", modules.len(), &sms, 2, None).unwrap();
                 }
                 _ => {
-                    write_cuda(&sub, &spec, &modules, &sms, true, Some((&kernels, 0.34))).unwrap();
+                    write_cuda(
+                        &sub,
+                        &spec,
+                        &modules,
+                        &sms,
+                        Precision::F32,
+                        Some((&kernels, 0.34)),
+                    )
+                    .unwrap();
                     build_cuda(
                         &sub,
                         "cc",

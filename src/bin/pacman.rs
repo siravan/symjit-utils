@@ -117,10 +117,14 @@ Options:
       --jobs N         runner: ptxas runs at a time (default: the CPUs)
       --f32            runner: f32 CUDA kernels (with --cuda): the f64 planes
                        are rounded to f32 on the GPU and the results widened
-      --mixed RULE     runner: mixed-precision CUDA kernels (with --cuda) on the
-                       f64 planes: need (f64 for what the denominators depend
-                       on) or forward (f64 if an operand is f64); the momenta
-                       and parameters are f64, the outputs rounded to f32
+      --mixed RULE     runner: mixed-precision CUDA kernels (with --cuda): need
+                       (f64 for what the denominators depend on) or forward
+                       (f64 if an operand is f64); the momenta and parameters
+                       are f64, the currents and amplitudes f32
+      --arena KIND     runner, with --mixed: mixed (default: the currents and
+                       amplitudes in f32 planes on the GPU, the momenta and
+                       parameters in f64 ones) or f64 (every plane f64, the
+                       f32 values rounded where loaded and stored)
       --fallback PCT   runner: a hybrid runner (with --cuda --f32): its reductions
                        rerun the PCT largest points (e.g. 1%, or 0.01) and every
                        non-finite one on the CPU in f64 (scalar kernels, or
@@ -163,6 +167,8 @@ struct Runner {
     f32: bool,
     /// `--mixed RULE`: mixed-precision CUDA kernels
     mixed: Option<symjit_utils::ptx::MixedRule>,
+    /// `--arena f64`: the mixed-precision kernels on the f64 arena (default: a mixed arena)
+    f64_arena: bool,
     /// `--set KEY=VALUE`: options of the kernels' configuration
     settings: Vec<(String, String)>,
     /// `--fallback PCT`: a hybrid runner rerunning this fraction of the points on the CPU
@@ -228,6 +234,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
     let mut cuda: Option<Vec<u32>> = None;
     let mut f32 = false;
     let mut mixed = None;
+    let mut arena: Option<bool> = None;
     let mut settings = Vec::new();
     let mut fallback: Option<f64> = None;
     let mut jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -299,6 +306,18 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
                 cuda.get_or_insert_with(Vec::new);
             }
             ("runner", "--f32") => f32 = true,
+            ("runner", "--arena") => {
+                arena = Some(match value(arg)?.as_str() {
+                    "mixed" => false,
+                    "f64" => true,
+                    other => {
+                        return Err(format!(
+                            "unknown arena `{}` for `--arena` (expected mixed or f64)",
+                            other
+                        ))
+                    }
+                });
+            }
             ("runner", "--mixed") => {
                 let v = value(arg)?;
                 mixed = Some(symjit_utils::ptx::MixedRule::parse(&v).ok_or_else(|| {
@@ -421,6 +440,9 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
         "runner" if mixed.is_some() && (cuda.is_none() || f32) => {
             Err("`--mixed` is for f64 CUDA runners: add `--cuda` or `--sm`, not `--f32`".into())
         }
+        "runner" if arena.is_some() && mixed.is_none() => {
+            Err("`--arena` is for mixed-precision runners: add `--mixed RULE`".into())
+        }
         "runner" if f32 && cuda.is_none() => {
             Err("`--f32` is for CUDA runners: add `--cuda` or `--sm`".into())
         }
@@ -436,6 +458,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             cuda,
             f32,
             mixed,
+            f64_arena: arena.unwrap_or(false),
             settings,
             fallback,
             jobs,
@@ -1008,12 +1031,20 @@ fn cuda_runner(
     sms.sort_unstable();
     sms.dedup();
     let start = std::time::Instant::now();
+    use symjit_utils::runner::Precision;
+    let precision = match (args.f32, args.mixed) {
+        (true, _) => Precision::F32,
+        (false, Some(rule)) => Precision::Mixed {
+            rule,
+            arena: !args.f64_arena,
+        },
+        (false, None) => Precision::F64,
+    };
     let modules = symjit_utils::runner::ptx_modules(
         spec,
         members,
         symjit_utils::ptx::DEFAULT_SM,
-        args.f32,
-        args.mixed,
+        precision,
         &args.settings,
     )?;
     let kernels = match args.fallback {
@@ -1026,7 +1057,7 @@ fn cuda_runner(
         None => None,
     };
     let fallback = kernels.as_ref().zip(args.fallback);
-    symjit_utils::runner::write_cuda(dir, spec, &modules, &sms, args.f32, fallback)?;
+    symjit_utils::runner::write_cuda(dir, spec, &modules, &sms, precision, fallback)?;
     eprintln!(
         "pacman: wrote the CUDA runner of {} of {} to {}: {} leaves, {} bytes of PTX in {:.2} s",
         spec.execution,

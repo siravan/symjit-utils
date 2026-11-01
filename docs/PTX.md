@@ -153,6 +153,11 @@ rational kernels whose accuracy is lost near the poles. The interface stays f64 
   f32 twin (`%g3` and `%fg3`). Masks are sign-extended or truncated.
 - **Control flow.** Before a label, jump, funclet call or return, every value is converted to f64.
 - **Header.** The module's header comment counts the f64 and f32 operations and the conversions.
+- **Mixed arena** (`Mixed::arena`, plane kernels with a mapping only; `pacman runner --mixed`). The
+  f32 inputs and the outputs are f32 slots of `in` and `out` (4 bytes per slot, `ld` in floats).
+  The f64 inputs are f64 slots of a second arena passed as `params`, at the same planes and
+  leading dimension. f32 values are then loaded and stored without conversions. The results
+  equal those of the same kernels on the f64 arena bit for bit.
 - Results: `plans/sjb2ptx/MIXED.md`.
 
 ## Math functions
