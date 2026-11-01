@@ -181,15 +181,19 @@ pub fn objects(
 
 /// The kernels of `spec` as PTX modules for the CUDA runner: one per leaf (`pacman_leaf<k>`),
 /// with its planes compiled in (inputs then outputs, as the `.mapping` rows), for `.target
-/// sm_<sm>`; with `f32`, single-precision kernels on an arena of floats. `settings` as for
-/// `objects`.
+/// sm_<sm>`; with `f32`, single-precision kernels on an arena of floats; with `mixed`,
+/// mixed-precision kernels on the f64 arena (`ptx::Mixed`: the momenta, the zero plane and the
+/// parameters are f64 inputs, the currents and amplitudes f32). `settings` as for `objects`.
 pub fn ptx_modules(
     spec: &Spec,
     members: &HashMap<&str, &[u8]>,
     sm: u32,
     f32: bool,
+    mixed: Option<crate::ptx::MixedRule>,
     settings: &[(String, String)],
 ) -> Result<Vec<String>> {
+    // the planes from the momenta on: momenta, zero, parameters
+    let first_f64 = 2 * (spec.arena.currents + spec.arena.amplitudes);
     let mut modules = Vec::new();
     for (k, call) in spec.calls.iter().enumerate() {
         let bytes = members
@@ -203,6 +207,10 @@ pub fn ptx_modules(
         let mut options = crate::ptx::PtxOptions::new(&format!("pacman_leaf{}", k));
         options.sm = sm;
         options.f32 = f32;
+        options.mixed = mixed.map(|rule| {
+            let f64_inputs = call.inputs.iter().map(|&p| p >= first_f64).collect();
+            crate::ptx::Mixed::new(rule, f64_inputs)
+        });
         options.mapping = Some(call.inputs.iter().chain(&call.outputs).copied().collect());
         let ptx = model.ptx(&options).with_context(|| {
             format!("{}: cannot compile `{}` into PTX", call.label, call.member)
@@ -2881,7 +2889,8 @@ int main(int argc, char **argv) {
         ]
         .into_iter()
         .collect();
-        let modules = ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, true, &[]).unwrap();
+        let modules =
+            ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, true, None, &[]).unwrap();
         assert!(modules.iter().all(|m| !m.contains("f64")));
         // f32 planes: the leaf's plane offsets are in floats
         assert!(
@@ -2993,7 +3002,8 @@ int main(int argc, char **argv) {
         ]
         .into_iter()
         .collect();
-        let modules = ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, false, &[]).unwrap();
+        let modules =
+            ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, false, None, &[]).unwrap();
         assert_eq!(modules.len(), 2);
         // the leaf's planes are compiled in: leaf 1 writes plane 3 (re) and 8 (im)
         assert!(modules[1].contains(".visible .entry pacman_leaf1("));
@@ -3105,7 +3115,7 @@ int main(int argc, char **argv) {
         spec.calls.truncate(1);
         let member = spec.calls[0].member.clone();
         let members: HashMap<&str, &[u8]> = [(member.as_str(), &a[..])].into_iter().collect();
-        assert!(ptx_modules(&spec, &members, 70, false, &[]).is_ok());
+        assert!(ptx_modules(&spec, &members, 70, false, None, &[]).is_ok());
         for (outputs, message) in [
             (vec![2, 2], "writes plane 2 twice"),
             (vec![2, 5], "reads and writes plane 5"),
@@ -3114,7 +3124,7 @@ int main(int argc, char **argv) {
             spec.calls[0].outputs = outputs;
             let err = format!(
                 "{:#}",
-                ptx_modules(&spec, &members, 70, false, &[]).unwrap_err()
+                ptx_modules(&spec, &members, 70, false, None, &[]).unwrap_err()
             );
             assert!(err.contains(message), "{}", err);
         }
@@ -3356,7 +3366,8 @@ int main(int argc, char **argv) {
         for f32 in [false, true] {
             let sub = dir.join(if f32 { "f32" } else { "f64" });
             std::fs::create_dir_all(sub.join("out")).unwrap();
-            let modules = ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, f32, &[]).unwrap();
+            let modules =
+                ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, f32, None, &[]).unwrap();
             write_cuda(&sub, &spec, &modules, &sms, f32, None).unwrap();
             build_cuda(&sub, "cc", modules.len(), &sms, 2, None).unwrap();
             if reduce_check(&sub).is_none() {
@@ -3398,7 +3409,8 @@ int main(int argc, char **argv) {
         .collect();
         let sms = [local_sm().unwrap_or(80)];
         let kernels = objects(&spec, &members, 1, &[]).unwrap();
-        let modules = ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, true, &[]).unwrap();
+        let modules =
+            ptx_modules(&spec, &members, crate::ptx::DEFAULT_SM, true, None, &[]).unwrap();
         for name in ["cpu", "f32", "hybrid"] {
             let sub = dir.join(name);
             std::fs::create_dir_all(sub.join("out")).unwrap();
@@ -3694,18 +3706,31 @@ int main(int argc, char **argv) {
         build_recurrence(&dir, &[sm]).unwrap();
         std::fs::write(dir.join("rectest.c"), RECTEST_C).unwrap();
         let cc = Command::new("cc")
-            .args(["-O1", "-ffp-contract=off", "-o", "rectest", "rectest.c", "-ldl", "-lm"])
+            .args([
+                "-O1",
+                "-ffp-contract=off",
+                "-o",
+                "rectest",
+                "rectest.c",
+                "-ldl",
+                "-lm",
+            ])
             .current_dir(&dir)
             .output()
             .unwrap();
-        assert!(cc.status.success(), "{}", String::from_utf8_lossy(&cc.stderr));
+        assert!(
+            cc.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cc.stderr)
+        );
         let lib = dir.join("librecurrence.so");
         let mut results: Vec<(&str, Vec<f64>)> = Vec::new();
         for kernel in ["f64", "f64 unsorted", "df64", ""] {
             let mut cmd = Command::new(dir.join("rectest"));
             cmd.arg(&lib).current_dir(&dir);
             if kernel == "f64 unsorted" {
-                cmd.env("PACMAN_RECURRENCE_KERNEL", "f64").env("PACMAN_RECURRENCE_SORT", "0");
+                cmd.env("PACMAN_RECURRENCE_KERNEL", "f64")
+                    .env("PACMAN_RECURRENCE_SORT", "0");
             } else if kernel.is_empty() {
                 cmd.env_remove("PACMAN_RECURRENCE_KERNEL");
             } else {
@@ -3717,7 +3742,12 @@ int main(int argc, char **argv) {
                 std::fs::remove_dir_all(&dir).unwrap();
                 return;
             }
-            assert!(out.status.success(), "{}: {}", kernel, String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}: {}",
+                kernel,
+                String::from_utf8_lossy(&out.stderr)
+            );
             let values: Vec<f64> = String::from_utf8_lossy(&out.stdout)
                 .split_whitespace()
                 .map(|v| v.parse().unwrap())
@@ -3731,18 +3761,39 @@ int main(int argc, char **argv) {
         for (kernel, got) in &results[1..] {
             for (k, (g, w)) in got.iter().zip(want).enumerate() {
                 if *kernel == "f64 unsorted" {
-                    assert_eq!(g.to_bits(), w.to_bits(), "{} value {}: {} for {}", kernel, k, g, w);
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "{} value {}: {} for {}",
+                        kernel,
+                        k,
+                        g,
+                        w
+                    );
                 } else {
-                    assert!((g - w).abs() <= 1e-9 * scale, "{} value {}: {} for {}", kernel, k, g, w);
+                    assert!(
+                        (g - w).abs() <= 1e-9 * scale,
+                        "{} value {}: {} for {}",
+                        kernel,
+                        k,
+                        g,
+                        w
+                    );
                 }
             }
         }
         // the default is df64: it equals df64's values exactly
         let df64 = &results.iter().find(|r| r.0 == "df64").unwrap().1;
         let default = &results.iter().find(|r| r.0 == "default").unwrap().1;
-        assert!(df64.iter().zip(default).all(|(a, b)| a.to_bits() == b.to_bits()));
+        assert!(df64
+            .iter()
+            .zip(default)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
         // and it is not the f64 arithmetic
-        assert!(df64.iter().zip(want).any(|(a, b)| a.to_bits() != b.to_bits()));
+        assert!(df64
+            .iter()
+            .zip(want)
+            .any(|(a, b)| a.to_bits() != b.to_bits()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -30,6 +30,11 @@ Options:
   --driver             also write the C driver NAME_cuda.c and NAME_cuda.h
   --f32                single precision: f32 values, inputs and outputs (math
                        functions are evaluated in f64); not with --driver
+  --mixed <RULE>       mixed precision on f64 inputs and outputs: need (f64 for
+                       the values the denominators depend on) or forward (f64
+                       if an operand is f64); outputs rounded to f32
+  --f64-inputs <LIST>  with --mixed: the f64 inputs, e.g. 0,4-7 (the others
+                       are rounded to f32)
   -h, --help           print this help
   -V, --version        print the version";
 
@@ -47,6 +52,8 @@ struct Args {
     no_header: bool,
     driver: bool,
     f32: bool,
+    mixed: Option<symjit_utils::ptx::MixedRule>,
+    f64_inputs: Vec<usize>,
 }
 
 enum Command {
@@ -66,6 +73,8 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         no_header: false,
         driver: false,
         f32: false,
+        mixed: None,
+        f64_inputs: Vec::new(),
     };
     let mut input: Option<PathBuf> = None;
     let mut args = args.peekable();
@@ -100,6 +109,26 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
             "--no-header" => a.no_header = true,
             "--driver" => a.driver = true,
             "--f32" => a.f32 = true,
+            "--mixed" => {
+                let v = value(&arg)?;
+                a.mixed =
+                    Some(symjit_utils::ptx::MixedRule::parse(&v).ok_or_else(|| {
+                        format!("unknown rule `{}` (expected need or forward)", v)
+                    })?)
+            }
+            "--f64-inputs" => {
+                let v = value(&arg)?;
+                for part in v.split(',').filter(|p| !p.is_empty()) {
+                    let bad = || format!("`--f64-inputs {}`: expected a list such as 0,4-7", v);
+                    let (lo, hi) = part.split_once('-').unwrap_or((part, part));
+                    let lo: usize = lo.trim().parse().map_err(|_| bad())?;
+                    let hi: usize = hi.trim().parse().map_err(|_| bad())?;
+                    if hi < lo {
+                        return Err(bad());
+                    }
+                    a.f64_inputs.extend(lo..=hi);
+                }
+            }
             _ if arg.starts_with('-') && arg.len() > 1 => {
                 return Err(format!("unknown option `{}`", arg))
             }
@@ -110,6 +139,12 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
 
     if a.no_header && a.header.is_some() {
         return Err("--no-header and --header exclude each other".into());
+    }
+    if a.f32 && a.mixed.is_some() {
+        return Err("--f32 and --mixed exclude each other".into());
+    }
+    if !a.f64_inputs.is_empty() && a.mixed.is_none() {
+        return Err("--f64-inputs is for --mixed".into());
     }
     if a.f32 && a.driver {
         return Err("--driver is f64 only: it does not take --f32".into());
@@ -183,6 +218,14 @@ fn run(a: &Args) -> Result<()> {
         sm: a.sm,
         mapping: None,
         f32: a.f32,
+        mixed: a.mixed.map(|rule| {
+            let n = a.f64_inputs.iter().max().map_or(0, |m| m + 1);
+            let mut f64_inputs = vec![false; n];
+            for &k in &a.f64_inputs {
+                f64_inputs[k] = true;
+            }
+            symjit_utils::ptx::Mixed::new(rule, f64_inputs)
+        }),
     };
     let ptx = model.ptx(&options)?;
 

@@ -674,3 +674,82 @@ fn header_describes_the_interface() {
     assert!(h.contains("in[i * ld_in + k]"));
     assert!(h.contains("#define MODEL_COMPLEX 1"));
 }
+
+/// Mixed precision (`PtxOptions::mixed`): the denominators in f64, the rest in f32, conversions
+/// where the types meet; ptxas accepts every module.
+#[test]
+fn mixed_precision() {
+    let mixed_ptx = |app: &Application, mixed: Mixed, what: &str| {
+        let mut options = PtxOptions::new("model");
+        options.mixed = Some(mixed);
+        let p = saved(app).ptx(&options).unwrap();
+        ptxas(&p.text, what);
+        p
+    };
+    // a propagator: n / (e^2 - p^2 - m^2), with e, p f64 inputs and n an f32 input
+    let (n, e, p) = (var("n"), var("e"), var("p"));
+    let m2 = Expr::from(0.81);
+    let den = &(&(&e * &e) - &(&p * &p)) - &m2;
+    let num = &(&n * &n) + &(&n * &e);
+    let app = Compiler::with_config(config(CompilerType::Native, 2, true))
+        .compile(&[n.clone(), e.clone(), p.clone()], &[&num / &den])
+        .unwrap();
+    let inputs = vec![false, true, true];
+    let need = mixed_ptx(&app, Mixed::new(MixedRule::Need, inputs.clone()), "need");
+    let t = &need.text;
+    // the denominator in f64, the numerator in f32, the division in f64
+    assert!(t.contains("// mixed precision (need):"), "{}", t);
+    assert!(t.contains("div.rn.f64"), "{}", t);
+    assert!(t.contains("mul.rn.f32"), "{}", t);
+    assert!(
+        t.contains("sub.rn.f64") || t.contains("fma.rn.f64"),
+        "{}",
+        t
+    );
+    // n is rounded where it is loaded, e is rounded for the numerator, the output to f32
+    assert!(t.contains("cvt.rn.f32.f64"), "{}", t);
+    assert!(t.contains("cvt.f64.f32"), "{}", t);
+    assert!(t.contains(".reg .b32 %fg<"), "{}", t);
+    // need: n n + n e in f32, e e - p p - m^2 and the division in f64
+    assert!(t.contains("(need): 5 f64 and 2 f32 operations"), "{}", t);
+    let fwd = mixed_ptx(&app, Mixed::new(MixedRule::Forward, inputs), "forward");
+    // forward: n e is f64 (e is), so only n n is f32
+    assert!(
+        fwd.text.contains("(forward): 6 f64 and 1 f32 operations"),
+        "{}",
+        fwd.text
+    );
+
+    // the arithmetic model at every opt level, all inputs f32 or all f64
+    for opt_level in [0, 2, 3] {
+        for rule in [MixedRule::Need, MixedRule::Forward] {
+            for all64 in [false, true] {
+                let what = format!("{:?}, opt level {}, f64 inputs {}", rule, opt_level, all64);
+                let app = arithmetic(config(CompilerType::Native, opt_level, true));
+                mixed_ptx(&app, Mixed::new(rule, vec![all64; 3]), &what);
+            }
+        }
+    }
+    // a complex model: funclets, masks
+    for stable in [false, true] {
+        let what = format!("complex, stable {}", stable);
+        let p = mixed_ptx(
+            &complex(stable, false, 2),
+            Mixed::new(MixedRule::Need, vec![]),
+            &what,
+        );
+        assert!(p.text.contains("brx.idx %site, $SITES;"), "{}", what);
+    }
+    // the math library: its arguments are f64
+    let (x, y) = (var("x"), var("y"));
+    let app = Compiler::with_config(config(CompilerType::Native, 2, true))
+        .compile(&[x.clone(), y.clone()], &[&x.sin() + &x.exp(), x.pow(&y)])
+        .unwrap();
+    let p = mixed_ptx(&app, Mixed::new(MixedRule::Need, vec![]), "math functions");
+    assert!(p.text.contains("call.uni (ret0), __sj_sin, (arg0);"));
+    // f32 and mixed exclude each other
+    let mut options = PtxOptions::new("model");
+    options.f32 = true;
+    options.mixed = Some(Mixed::new(MixedRule::Need, vec![]));
+    assert!(saved(&app).ptx(&options).is_err());
+}

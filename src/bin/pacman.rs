@@ -117,6 +117,10 @@ Options:
       --jobs N         runner: ptxas runs at a time (default: the CPUs)
       --f32            runner: f32 CUDA kernels (with --cuda): the f64 planes
                        are rounded to f32 on the GPU and the results widened
+      --mixed RULE     runner: mixed-precision CUDA kernels (with --cuda) on the
+                       f64 planes: need (f64 for what the denominators depend
+                       on) or forward (f64 if an operand is f64); the momenta
+                       and parameters are f64, the outputs rounded to f32
       --fallback PCT   runner: a hybrid runner (with --cuda --f32): its reductions
                        rerun the PCT largest points (e.g. 1%, or 0.01) and every
                        non-finite one on the CPU in f64 (scalar kernels, or
@@ -157,6 +161,8 @@ struct Runner {
     cuda: Option<Vec<u32>>,
     /// `--f32`: single-precision CUDA kernels
     f32: bool,
+    /// `--mixed RULE`: mixed-precision CUDA kernels
+    mixed: Option<symjit_utils::ptx::MixedRule>,
     /// `--set KEY=VALUE`: options of the kernels' configuration
     settings: Vec<(String, String)>,
     /// `--fallback PCT`: a hybrid runner rerunning this fraction of the points on the CPU
@@ -221,6 +227,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
     let mut lanes = 1;
     let mut cuda: Option<Vec<u32>> = None;
     let mut f32 = false;
+    let mut mixed = None;
     let mut settings = Vec::new();
     let mut fallback: Option<f64> = None;
     let mut jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -292,6 +299,15 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
                 cuda.get_or_insert_with(Vec::new);
             }
             ("runner", "--f32") => f32 = true,
+            ("runner", "--mixed") => {
+                let v = value(arg)?;
+                mixed = Some(symjit_utils::ptx::MixedRule::parse(&v).ok_or_else(|| {
+                    format!(
+                        "unknown rule `{}` for `--mixed` (expected need or forward)",
+                        v
+                    )
+                })?);
+            }
             ("runner", "--fallback") => {
                 let v = value(arg)?;
                 let (number, scale) = match v.strip_suffix('%') {
@@ -402,6 +418,9 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
         "runner" if fallback.is_some() && !f32 => {
             Err("`--fallback` is for f32 CUDA runners: add `--cuda --f32`".into())
         }
+        "runner" if mixed.is_some() && (cuda.is_none() || f32) => {
+            Err("`--mixed` is for f64 CUDA runners: add `--cuda` or `--sm`, not `--f32`".into())
+        }
         "runner" if f32 && cuda.is_none() => {
             Err("`--f32` is for CUDA runners: add `--cuda` or `--sm`".into())
         }
@@ -416,6 +435,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             lanes,
             cuda,
             f32,
+            mixed,
             settings,
             fallback,
             jobs,
@@ -993,6 +1013,7 @@ fn cuda_runner(
         members,
         symjit_utils::ptx::DEFAULT_SM,
         args.f32,
+        args.mixed,
         &args.settings,
     )?;
     let kernels = match args.fallback {

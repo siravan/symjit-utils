@@ -30,6 +30,7 @@
 mod driver;
 mod header;
 pub mod libm;
+mod mixed;
 #[cfg(test)]
 mod tests;
 
@@ -44,6 +45,7 @@ use crate::sjb::SavedModel;
 
 pub use driver::{driver_header, driver_source};
 pub use header::header;
+pub use mixed::{Mixed, MixedCounts, MixedRule};
 
 /// The PTX ISA version and the default target: clang 18 emits PTX 8.3 (the math library's
 /// functions are compiled by it), and CUDA 13 compiles for sm_70 and newer.
@@ -87,6 +89,8 @@ pub struct PtxOptions {
     pub mapping: Option<Vec<u32>>,
     /// single precision (see the top of this file)
     pub f32: bool,
+    /// mixed precision (`mixed.rs`; not with `f32`)
+    pub mixed: Option<Mixed>,
 }
 
 impl PtxOptions {
@@ -97,6 +101,7 @@ impl PtxOptions {
             sm: DEFAULT_SM,
             mapping: None,
             f32: false,
+            mixed: None,
         }
     }
 }
@@ -142,6 +147,9 @@ impl SavedModel {
 
         if let Some(map) = &options.mapping {
             check_mapping(map, &shape, options.layout)?;
+        }
+        if options.f32 && options.mixed.is_some() {
+            return Err(anyhow!("f32 and mixed precision exclude each other"));
         }
         let mut generator = PtxGenerator::new(options.clone(), shape);
         let (count_states, count_obs, count_params) =
@@ -190,6 +198,7 @@ fn check_mapping(map: &[u32], shape: &Shape, layout: Layout) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug)]
 enum Item {
     Line(String),
     /// `mov.b64 <reg>, consts[idx]`; the constants arrive after the code (`add_consts`)
@@ -232,6 +241,8 @@ pub struct PtxGenerator {
     calls: Vec<String>,
     unsupported: Vec<String>,
     module: String,
+    /// what the mixed-precision pass did
+    mixed_counts: Option<MixedCounts>,
 }
 
 /// Where the memory slots live. A slot that is not direct is a register: gathered from `in`
@@ -266,6 +277,7 @@ impl PtxGenerator {
             calls: Vec::new(),
             unsupported: Vec::new(),
             module: String::new(),
+            mixed_counts: None,
         }
     }
 
@@ -811,13 +823,16 @@ impl PtxGenerator {
                     }
                 }
                 Item::LoadStack(dst, idx) => {
-                    let _ = writeln!(o, "\tmov.{} {}, %s{};", bt, dst, idx);
+                    let (b, s) = Self::slot_variant(dst, bt);
+                    let _ = writeln!(o, "\tmov.{} {}, {}s{};", b, dst, s, idx);
                 }
                 Item::SaveStack(src, idx) => {
-                    let _ = writeln!(o, "\tmov.{} %s{}, {};", bt, idx, src);
+                    let (b, s) = Self::slot_variant(src, bt);
+                    let _ = writeln!(o, "\tmov.{} {}s{}, {};", b, s, idx, src);
                     for &k in place.forward.get(&at).into_iter().flatten() {
                         let a = self.slot(&mut o, "%pout", "%ldo", k - first);
-                        let _ = writeln!(o, "\tst.global.{} {}, {};", bt, a, src);
+                        let value = self.mixed_output(&mut o, src);
+                        let _ = writeln!(o, "\tst.global.{} {}, {};", bt, a, value);
                     }
                 }
                 Item::SaveMem(src, idx) => {
@@ -833,6 +848,10 @@ impl PtxGenerator {
                     }
                 }
                 Item::Const(reg, idx) => match self.consts.get(*idx as usize) {
+                    Some(v) if self.options.mixed.is_some() && reg.starts_with("%f") => {
+                        let c = format!("0f{:08X}", (*v as f32).to_bits());
+                        let _ = writeln!(o, "\tmov.b32 {}, {};", reg, c);
+                    }
                     Some(v) => {
                         let _ = writeln!(o, "\tmov.{} {}, {};", bt, reg, self.fconst(*v));
                     }
@@ -898,7 +917,49 @@ impl PtxGenerator {
         table + &o
     }
 
+    /// The bit type and the stack-slot prefix of a register: f32 registers (`%f...`) of mixed
+    /// precision use the f32 slots (`%fs<k>`).
+    fn slot_variant(reg: &str, bt: &'static str) -> (&'static str, &'static str) {
+        if reg.starts_with("%f") {
+            ("b32", "%f")
+        } else {
+            (bt, "%")
+        }
+    }
+
+    /// The f64 register to store for the output value `src` (mixed precision: rounded to f32,
+    /// through `%x0`/`%fx0`); `src` itself otherwise.
+    fn mixed_output(&self, o: &mut String, src: &str) -> String {
+        let Some(mixed) = &self.options.mixed else {
+            return src.to_string();
+        };
+        if src.starts_with("%f") {
+            let _ = writeln!(o, "\tcvt.f64.f32 %x0, {};", src);
+            "%x0".to_string()
+        } else if mixed.round_outputs {
+            let _ = writeln!(o, "\tcvt.rn.f32.f64 %fx0, {};", src);
+            let _ = writeln!(o, "\tcvt.f64.f32 %x0, %fx0;");
+            "%x0".to_string()
+        } else {
+            src.to_string()
+        }
+    }
+
     fn build_module(&mut self) -> String {
+        if let Some(mixed) = self.options.mixed.clone() {
+            let count_in = if self.shape.row_first {
+                0
+            } else {
+                self.count_states as usize
+            };
+            match mixed::retype(&self.body, &mixed, count_in) {
+                Ok((body, counts)) => {
+                    self.body = body;
+                    self.mixed_counts = Some(counts);
+                }
+                Err(e) => self.unsupported(&e.to_string()),
+            }
+        }
         let place = self.placement();
         let body = self.lower_body(&place);
         let name = self.options.name.clone();
@@ -920,6 +981,16 @@ impl PtxGenerator {
             self.ft(),
             self.options.layout.name()
         );
+        if let (Some(mixed), Some(c)) = (&self.options.mixed, &self.mixed_counts) {
+            let _ = writeln!(
+                o,
+                "// mixed precision ({}): {} f64 and {} f32 operations, {} conversions",
+                mixed.rule.name(),
+                c.f64_ops,
+                c.f32_ops,
+                c.conversions
+            );
+        }
         let _ = writeln!(o, "//");
         let _ = writeln!(o);
         let _ = writeln!(o, ".version {}", PTX_VERSION);
@@ -953,7 +1024,13 @@ impl PtxGenerator {
         ] {
             if count > 0 {
                 let _ = writeln!(o, "\t.reg .{} %{}<{}>;", self.bt(), prefix, count);
+                if self.options.mixed.is_some() {
+                    let _ = writeln!(o, "\t.reg .b32 %f{}<{}>;", prefix, count);
+                }
             }
+        }
+        if self.options.mixed.is_some() {
+            let _ = writeln!(o, "\t.reg .b32 %fret, %ftmp, %fx<4>;");
         }
         let _ = writeln!(o);
         self.prologue(&mut o, &place);
