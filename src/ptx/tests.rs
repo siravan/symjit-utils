@@ -753,3 +753,109 @@ fn mixed_precision() {
     options.mixed = Some(Mixed::new(MixedRule::Need, vec![]));
     assert!(saved(&app).ptx(&options).is_err());
 }
+
+/// The SSA form (`crate::ssa`): every `Static` register written once, before its reads; the
+/// `.ssa` file read back as written; ssa2ptx's modules accepted by ptxas.
+#[test]
+fn ssa_form_of_saved_models() {
+    use crate::ssa::{operands, to_ssa, SsaModel};
+    let check = |app: &Application, what: &str| -> SsaModel {
+        let mut bytes: Vec<u8> = Vec::new();
+        app.save(&mut bytes).unwrap();
+        let model = SavedModel::read(&mut &bytes[..]).unwrap();
+        let (mir, stats) = to_ssa(&model.mir).unwrap();
+        let mut defined = std::collections::HashSet::new();
+        for ins in mir.code.iter() {
+            let (reads, writes) = operands(&ins).unwrap();
+            for r in reads {
+                if let Reg::Static(s) = r {
+                    assert!(
+                        defined.contains(&s),
+                        "{}: σ{} read before it is written",
+                        what,
+                        s
+                    );
+                }
+            }
+            for r in writes {
+                if let Reg::Static(s) = r {
+                    assert!(defined.insert(s), "{}: σ{} written twice", what, s);
+                }
+            }
+        }
+        assert_eq!(defined.len(), stats.statics, "{}", what);
+        assert_eq!(
+            mir.code.iter().count(),
+            model.mir.code.iter().count(),
+            "{}",
+            what
+        );
+        assert!(to_ssa(&mir).is_err(), "{}: converted twice", what);
+
+        // the file
+        let ssa = SsaModel::from_saved(model).unwrap();
+        let mut file: Vec<u8> = Vec::new();
+        ssa.write(&mut file).unwrap();
+        let back = SsaModel::read(&mut &file[..]).unwrap();
+        let listing = |m: &Mir| {
+            m.code
+                .iter()
+                .map(|i| format!("{:?}", i))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listing(&back.mir), listing(&ssa.mir), "{}", what);
+        assert_eq!(back.mir.consts, ssa.mir.consts, "{}", what);
+        assert_eq!(back.reals, ssa.reals, "{}", what);
+        assert_eq!(back.stats, ssa.stats, "{}", what);
+        // symjit's reader refuses an .ssa file, and the .ssa reader a .sjb file
+        assert!(SavedModel::read(&mut &file[..]).is_err(), "{}", what);
+        assert!(SsaModel::read(&mut &bytes[..]).is_err(), "{}", what);
+        back
+    };
+    let ssa_ptx = |ssa: &mut SsaModel, f32: bool, what: &str| -> Ptx {
+        let mut options = PtxOptions::new("model");
+        options.f32 = f32;
+        let p = ssa.ptx(&options).unwrap();
+        ptxas(&p.text, what);
+        p
+    };
+
+    for opt_level in [0, 2, 3] {
+        let what = format!("arithmetic, opt level {}", opt_level);
+        let mut ssa = check(
+            &arithmetic(config(CompilerType::Native, opt_level, true)),
+            &what,
+        );
+        // straight-line code: every definition is static
+        assert_eq!((ssa.stats.kept, ssa.stats.pinned.len()), (0, 0), "{}", what);
+        let p = ssa_ptx(&mut ssa, false, &what);
+        assert!(p.text.contains(".reg .b64 %v<"), "{}:\n{}", what, p.text);
+        assert!(!p.text.contains(".reg .b64 %g<"), "{}:\n{}", what, p.text);
+        ssa_ptx(&mut ssa, true, &format!("{}, f32", what));
+        // not yet
+        let mut options = PtxOptions::new("model");
+        options.mixed = Some(Mixed::new(MixedRule::Need, vec![]));
+        assert!(ssa.ptx(&options).is_err());
+    }
+    // lowered complex models: funclets pass values in registers across calls and labels
+    for stable in [false, true] {
+        let what = format!("complex, stable {}", stable);
+        let mut ssa = check(&complex(stable, false, 2), &what);
+        assert!(!ssa.stats.pinned.is_empty(), "{}", what);
+        assert!(
+            ssa.stats.kept > 0 && ssa.stats.kept < ssa.stats.statics,
+            "{}",
+            what
+        );
+        let p = ssa_ptx(&mut ssa, false, &what);
+        assert!(p.text.contains("brx.idx %site, $SITES;"), "{}", what);
+    }
+    // the math library
+    let (x, y) = (var("x"), var("y"));
+    let app = Compiler::with_config(config(CompilerType::Native, 2, true))
+        .compile(&[x.clone(), y.clone()], &[&x.sin() + &x.exp(), x.pow(&y)])
+        .unwrap();
+    let mut ssa = check(&app, "math functions");
+    let p = ssa_ptx(&mut ssa, false, "math functions");
+    assert!(p.text.contains("call.uni (ret0), __sj_sin, (arg0);"));
+}

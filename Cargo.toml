@@ -31,6 +31,14 @@ name = "sjb2ptx"
 path = "src/bin/sjb2ptx.rs"
 
 [[bin]]
+name = "sjb2ssa"
+path = "src/bin/sjb2ssa.rs"
+
+[[bin]]
+name = "ssa2ptx"
+path = "src/bin/ssa2ptx.rs"
+
+[[bin]]
 name = "pacman"
 path = "src/bin/pacman.rs"
 
