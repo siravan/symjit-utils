@@ -177,6 +177,10 @@ impl SavedModel {
         };
 
         obj.add_function(name, &scalar.0, &scalar.1)?;
+        // the stack the kernel reserves: its frame of inputs and outputs and its stack slots
+        // (`prologue_indirect`; 16 bytes each for complex models) and the registers it saves
+        let slot = if config.is_complex() { 16 } else { 8 };
+        obj.stack = (prog.count_states + prog.count_obs + prog.builder.stack_size()) * slot + 1024;
         if let Some((code, relocs)) = fast {
             obj.add_function(&format!("{}_fast", name), &code, &relocs)?;
         }
