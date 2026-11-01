@@ -151,6 +151,9 @@ impl SavedModel {
         if options.f32 && options.mixed.is_some() {
             return Err(anyhow!("f32 and mixed precision exclude each other"));
         }
+        if options.mixed.as_ref().is_some_and(|m| m.arena) && options.mapping.is_none() {
+            return Err(anyhow!("a mixed arena needs a plane mapping (pacman runners)"));
+        }
         let mut generator = PtxGenerator::new(options.clone(), shape);
         let (count_states, count_obs, count_params) =
             (prog.count_states, prog.count_obs, prog.count_params);
@@ -334,7 +337,7 @@ impl PtxGenerator {
 
     /// The size of a value in bytes and its log2.
     fn size(&self) -> usize {
-        if self.options.f32 {
+        if self.options.f32 || self.mixed_arena() {
             4
         } else {
             8
@@ -342,11 +345,24 @@ impl PtxGenerator {
     }
 
     fn shift(&self) -> u32 {
-        if self.options.f32 {
+        if self.options.f32 || self.mixed_arena() {
             2
         } else {
             3
         }
+    }
+
+    /// A mixed arena (`Mixed::arena`): `in` and `out` hold f32 slots, `params` the f64 inputs.
+    fn mixed_arena(&self) -> bool {
+        self.options.mixed.as_ref().is_some_and(|m| m.arena)
+    }
+
+    /// Input slot `k` is an f64 slot of a mixed arena.
+    fn f64_slot(&self, k: usize) -> bool {
+        self.options
+            .mixed
+            .as_ref()
+            .is_some_and(|m| m.arena && m.f64_inputs.get(k).copied().unwrap_or(false))
     }
 
     /// A constant as a PTX immediate of the value type (rounded to nearest for f32).
@@ -686,6 +702,12 @@ impl PtxGenerator {
     /// The address of slot `k` of the point in `%a1` (SoA), or the operand addressing it; with a
     /// plane mapping, slot `k` of `%pin` (an input) or `%pout` (an output) is its plane.
     fn slot(&self, o: &mut String, base: &str, ld: &str, k: usize) -> String {
+        // a mixed arena's f64 inputs are in the second arena, of 8-byte slots
+        let (base, ld) = if base == "%pin" && self.f64_slot(k) {
+            ("%p64", "%ld64")
+        } else {
+            (base, ld)
+        };
         let k = match &self.options.mapping {
             Some(map) if base == "%pout" => map[self.shape.count_in + k] as usize,
             Some(map) => map[k] as usize,
@@ -754,6 +776,13 @@ impl PtxGenerator {
             }
             let _ = writeln!(o, "\tadd.u64 {}, {}, %a0;", reg, reg);
         }
+        if self.mixed_arena() {
+            // the f64 arena: %par at the point, its leading dimension in bytes
+            let _ = writeln!(o, "\tld.param.u64 %ld64, [{}_ld_in];", self.options.name);
+            let _ = writeln!(o, "\tshl.b64 %ld64, %ld64, 3;");
+            let _ = writeln!(o, "\tshl.b64 %a0, %i, 3;");
+            let _ = writeln!(o, "\tadd.u64 %p64, %par, %a0;");
+        }
 
         let count_states = if shape.row_first {
             0
@@ -764,7 +793,16 @@ impl PtxGenerator {
             if place.direct_in[k] || place.direct_out[k] {
                 continue;
             }
-            if k < count_states {
+            if self.mixed_arena() {
+                if k < count_states {
+                    let a = self.slot(o, "%pin", "%ldi", k);
+                    let (b, m) = if self.f64_slot(k) { ("b64", "%m") } else { ("b32", "%fm") };
+                    let _ = writeln!(o, "\tld.global.nc.{} {}{}, {};", b, m, k, a);
+                } else {
+                    let _ = writeln!(o, "\tmov.b64 %m{}, 0d0000000000000000;", k);
+                    let _ = writeln!(o, "\tmov.b32 %fm{}, 0f00000000;", k);
+                }
+            } else if k < count_states {
                 let a = self.slot(o, "%pin", "%ldi", k);
                 let _ = writeln!(o, "\tld.global.nc.{} %m{}, {};", self.bt(), k, a);
             } else {
@@ -780,7 +818,11 @@ impl PtxGenerator {
             let k = first + j;
             if !place.direct_out[k] {
                 let a = self.slot(o, "%pout", "%ldo", j);
-                let _ = writeln!(o, "\tst.global.{} {}, %m{};", self.bt(), a, k);
+                if self.mixed_arena() {
+                    let _ = writeln!(o, "\tst.global.b32 {}, %fm{};", a, k);
+                } else {
+                    let _ = writeln!(o, "\tst.global.{} {}, %m{};", self.bt(), a, k);
+                }
             }
         }
         let _ = writeln!(o, "$Lexit:");
@@ -815,11 +857,13 @@ impl PtxGenerator {
                 }
                 Item::LoadMem(dst, idx) => {
                     let k = *idx as usize;
+                    // f32 registers of mixed precision use the f32 memory registers (`%fm<k>`)
+                    let (b, m) = Self::slot_variant(dst, bt);
                     if place.direct_in[k] {
                         let a = self.slot(&mut o, "%pin", "%ldi", k);
-                        let _ = writeln!(o, "\tld.global.nc.{} {}, {};", bt, dst, a);
-                    } else if *dst != format!("%m{}", k) {
-                        let _ = writeln!(o, "\tmov.{} {}, %m{};", bt, dst, k);
+                        let _ = writeln!(o, "\tld.global.nc.{} {}, {};", b, dst, a);
+                    } else if *dst != format!("{}m{}", m, k) {
+                        let _ = writeln!(o, "\tmov.{} {}, {}m{};", b, dst, m, k);
                     }
                 }
                 Item::LoadStack(dst, idx) => {
@@ -831,8 +875,8 @@ impl PtxGenerator {
                     let _ = writeln!(o, "\tmov.{} {}s{}, {};", b, s, idx, src);
                     for &k in place.forward.get(&at).into_iter().flatten() {
                         let a = self.slot(&mut o, "%pout", "%ldo", k - first);
-                        let value = self.mixed_output(&mut o, src);
-                        let _ = writeln!(o, "\tst.global.{} {}, {};", bt, a, value);
+                        let (b, value) = self.mixed_output(&mut o, src, bt);
+                        let _ = writeln!(o, "\tst.global.{} {}, {};", b, a, value);
                     }
                 }
                 Item::SaveMem(src, idx) => {
@@ -842,9 +886,13 @@ impl PtxGenerator {
                             continue;
                         }
                         let a = self.slot(&mut o, "%pout", "%ldo", k - first);
-                        let _ = writeln!(o, "\tst.global.{} {}, {};", bt, a, src);
-                    } else if *src != format!("%m{}", k) {
-                        let _ = writeln!(o, "\tmov.{} %m{}, {};", bt, k, src);
+                        let (b, _) = Self::slot_variant(src, bt);
+                        let _ = writeln!(o, "\tst.global.{} {}, {};", b, a, src);
+                    } else {
+                        let (b, m) = Self::slot_variant(src, bt);
+                        if *src != format!("{}m{}", m, k) {
+                            let _ = writeln!(o, "\tmov.{} {}m{}, {};", b, m, k, src);
+                        }
                     }
                 }
                 Item::Const(reg, idx) => match self.consts.get(*idx as usize) {
@@ -927,21 +975,29 @@ impl PtxGenerator {
         }
     }
 
-    /// The f64 register to store for the output value `src` (mixed precision: rounded to f32,
-    /// through `%x0`/`%fx0`); `src` itself otherwise.
-    fn mixed_output(&self, o: &mut String, src: &str) -> String {
+    /// The bit type and the register to store for the output value `src`: with mixed
+    /// precision rounded to f32 (through `%x0`/`%fx0`), an f32 slot in a mixed arena; `src` and
+    /// `bt` otherwise.
+    fn mixed_output(&self, o: &mut String, src: &str, bt: &'static str) -> (&'static str, String) {
         let Some(mixed) = &self.options.mixed else {
-            return src.to_string();
+            return (bt, src.to_string());
         };
-        if src.starts_with("%f") {
-            let _ = writeln!(o, "\tcvt.f64.f32 %x0, {};", src);
-            "%x0".to_string()
-        } else if mixed.round_outputs {
-            let _ = writeln!(o, "\tcvt.rn.f32.f64 %fx0, {};", src);
-            let _ = writeln!(o, "\tcvt.f64.f32 %x0, %fx0;");
-            "%x0".to_string()
-        } else {
-            src.to_string()
+        match (mixed.arena, src.starts_with("%f")) {
+            (true, true) => ("b32", src.to_string()),
+            (true, false) => {
+                let _ = writeln!(o, "\tcvt.rn.f32.f64 %fx0, {};", src);
+                ("b32", "%fx0".to_string())
+            }
+            (false, true) => {
+                let _ = writeln!(o, "\tcvt.f64.f32 %x0, {};", src);
+                (bt, "%x0".to_string())
+            }
+            (false, false) if mixed.round_outputs => {
+                let _ = writeln!(o, "\tcvt.rn.f32.f64 %fx0, {};", src);
+                let _ = writeln!(o, "\tcvt.f64.f32 %x0, %fx0;");
+                (bt, "%x0".to_string())
+            }
+            (false, false) => (bt, src.to_string()),
         }
     }
 
@@ -978,7 +1034,11 @@ impl PtxGenerator {
             self.shape.count_in,
             self.shape.count_out,
             self.shape.count_params,
-            self.ft(),
+            if self.mixed_arena() {
+                "f32 and f64"
+            } else {
+                self.ft()
+            },
             self.options.layout.name()
         );
         if let (Some(mixed), Some(c)) = (&self.options.mixed, &self.mixed_counts) {
@@ -1031,6 +1091,9 @@ impl PtxGenerator {
         }
         if self.options.mixed.is_some() {
             let _ = writeln!(o, "\t.reg .b32 %fret, %ftmp, %fx<4>;");
+        }
+        if self.mixed_arena() {
+            let _ = writeln!(o, "\t.reg .u64 %p64, %ld64;");
         }
         let _ = writeln!(o);
         self.prologue(&mut o, &place);

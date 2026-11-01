@@ -57,6 +57,7 @@ r/runner out arena/*.json && pacman replay --scalar --against out artifacts/qq_z
 | `--jobs N` | runner | `ptxas` runs at a time (default: the CPUs). |
 | `--f32` | runner | f32 CUDA kernels (with `--cuda`; below). |
 | `--mixed need\|forward` | runner | Mixed-precision CUDA kernels (with `--cuda`, not `--f32`; below). |
+| `--arena mixed\|f64` | runner | With `--mixed`: a mixed arena (default) or the f64 arena (below). |
 | `--fallback PCT` | runner | A hybrid runner (with `--cuda --f32`; below): its reductions rerun the PCT largest points (`1%` or `0.01`) and every non-finite one on the CPU in f64, with scalar kernels or those of `--simd`/`--simd512`. |
 | `--set KEY=VALUE` | runner | An option of the kernels' configuration (symjit's `set_option`, e.g. `stable_math=true`), set before they are compiled (CPU and CUDA runners); may be repeated. |
 
@@ -600,11 +601,19 @@ over PCIe are therefore the f64 runner's. The `runner` executable and the statis
 work as before. Results are not bit-equal to the CPU: the test compares the toy execution with the
 scalar replay within 1e-6. Accuracy and speed for Z+6g: `plans/pacman-ptx/F32.md`.
 
-**Mixed-precision runners (`--cuda --mixed need|forward`).** The f64 runner with `sjb2ptx --mixed`
-leaves (`docs/PTX.md`, "Numbers"). The planes from the momenta on (momenta, the zero plane,
-parameters) are f64 inputs. The currents and amplitudes are rounded to f32 where they are loaded
-and stored, so the arena holds f32 values in f64 planes. Results for Z+6g and pp_zjj:
-`plans/sjb2ptx/MIXED.md`.
+**Mixed-precision runners (`--cuda --mixed need|forward`).** Leaves from `sjb2ptx --mixed`
+(`docs/PTX.md`, "Numbers"). The planes from the momenta on (momenta, the zero plane, parameters)
+are f64 inputs; the currents and amplitudes are f32.
+- **Mixed arena (default).** The f32 runner's structure (`#define MIXED_ARENA 1`): the copies over
+  PCIe stay f64, and the conversion kernels round the current and amplitude planes read first
+  into an f32 copy of the arena and widen those copied back. The planes from `FIRST_F64` on stay
+  in the f64 arena, which the leaves get as `params`. The statistics say `, mixed arena`.
+- **`--arena f64`.** The f64 runner unchanged: the leaves round the currents where they load them
+  and the outputs where they store them, so the f64 planes hold f32 values. Its values equal the
+  mixed arena's bit for bit (test `mixed_arena_runner_equals_the_f64_arena_one`); it moves twice
+  the bytes.
+
+Results for Z+6g and pp_zjj: `plans/sjb2ptx/MIXED.md`.
 
 **Hybrid runners (`--cuda --f32 --fallback PCT`).** An f32 CUDA runner whose reductions rerun
 their largest points on the CPU in f64 (`plans/pacman-ptx/HYBRID.md`). The library holds both:
