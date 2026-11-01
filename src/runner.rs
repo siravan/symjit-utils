@@ -13,7 +13,8 @@
 //! - `--simd`, `--simd512`: the kernels are AVX2 or AVX-512 SIMD kernels instead
 //!   (`SavedModel::object_simd`, 4 or 8 points per call, `simd_branch` on, no scalar kernel); the runner takes point ranges of multiples of 8 and
 //!   runs every leaf on blocks of `PACMAN_RUNNER_BLOCK` points (default 64) at a time, the
-//!   points of a call split over `PACMAN_RUNNER_THREADS` threads (default 1).
+//!   points of a call split over `PACMAN_RUNNER_THREADS` threads (default 1). Scalar runners
+//!   do the same on point ranges of any length (since 2026-11-01).
 //! - `main.c` reads recordings (`NAME.json`, `NAME.pre`), runs their schedules per recorded tile
 //!   and writes the arena as `NAME.arena` (the layout of `.post`), for `pacman replay
 //!   --against`.
@@ -106,7 +107,8 @@ pub struct Kernels {
     pub of_leaf: Vec<usize>,
     /// points per kernel call: 1 (scalar), 4 (AVX2) or 8 (AVX-512)
     pub lanes: u32,
-    /// the largest stack a kernel reserves, in bytes (SIMD kernels; 0 for scalar ones)
+    /// the largest stack a kernel reserves, in bytes (SIMD kernels: their `sub rsp`s; scalar
+    /// ones: their frame and stack slots)
     pub stack: usize,
 }
 
@@ -425,7 +427,7 @@ pub fn runner_c(spec: &Spec, kernels: &Kernels) -> String {
         kernels.lanes, kernels.stack
     );
     s.push_str(
-        "/* SIMD kernels: PACMAN_RUNNER_BLOCK and PACMAN_RUNNER_THREADS when unset (a hybrid\n\
+        "/* PACMAN_RUNNER_BLOCK and PACMAN_RUNNER_THREADS when unset (a hybrid\n\
          \x20  runner's cpu.c sets its own) */\n\
          #ifndef DEFAULT_BLOCK\n#define DEFAULT_BLOCK 64u\n#endif\n\
          #ifndef DEFAULT_THREADS\n#define DEFAULT_THREADS 1\n#endif\n\n",
@@ -440,7 +442,6 @@ const RUN_C: &str = r#"const pacman_runner_metadata *pacman_runner_v1_metadata(v
     return &METADATA;
 }
 
-#if LANES > 1
 #include <pthread.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -489,6 +490,7 @@ __attribute__((destructor)) static void print_stats(void) {
 }
 
 static void setup(void) {
+#if LANES > 1
     /* whether the CPU runs the SIMD kernels (AVX2 and FMA; AVX-512: AVX512F and AVX512DQ) */
     __builtin_cpu_init();
 #if LANES == 8
@@ -502,6 +504,9 @@ static void setup(void) {
         fprintf(stderr, "pacman runner (%s of %s): this CPU has no %s\n", METADATA.execution,
                 METADATA.process, needs);
     }
+#else
+    CPU_OK = 1; /* scalar kernels: any CPU of their architecture */
+#endif
     /* every leaf on a block of points at a time, so that the block's planes stay in the
        cache (PACMAN_RUNNER_BLOCK points, a multiple of 8, default DEFAULT_BLOCK, at most 2^20) */
     const char *env = getenv("PACMAN_RUNNER_BLOCK");
@@ -525,6 +530,15 @@ static __thread int STACK_KNOWN;
 static int caller_has_room(void) {
     if (!STACK_KNOWN) {
         STACK_KNOWN = 1;
+#ifdef __APPLE__
+        /* macOS: the top of the stack and its size */
+        pthread_t self = pthread_self();
+        char *top = pthread_get_stackaddr_np(self);
+        size_t size = pthread_get_stacksize_np(self);
+        if (top != NULL && size > 0) {
+            STACK_LOW = top - size;
+        }
+#else
         pthread_attr_t attr;
         if (pthread_getattr_np(pthread_self(), &attr) == 0) {
             void *low;
@@ -534,11 +548,11 @@ static int caller_has_room(void) {
             }
             pthread_attr_destroy(&attr);
         }
+#endif
     }
     char here;
     return STACK_LOW != NULL && STACK_LOW < &here && (size_t)(&here - STACK_LOW) > STACK_NEEDED;
 }
-#endif
 
 /* the kernel of `leaf` on the points start..stop, LANES points per call */
 static int run_leaf(uint32_t leaf, double *const *planes, uint32_t start, uint32_t stop) {
@@ -574,7 +588,9 @@ static int run_points(double *const *planes, const uint32_t *leaves, uint32_t co
     return PACMAN_RUNNER_OK;
 }
 
-#if LANES > 1
+/* points per group: a SIMD kernel's ranges are whole 8-point groups, a scalar one's any points */
+#define GROUP (LANES > 1 ? 8u : 1u)
+
 /* the points of one thread */
 typedef struct {
     double *const *planes;
@@ -591,7 +607,7 @@ static void *run_share(void *arg) {
 }
 
 /* the points start..start+point_count on up to THREADS threads, contiguous ranges of whole
-   8-point groups and at least BLOCK points each. The calling thread runs the first range if
+   GROUPs and at least BLOCK points each. The calling thread runs the first range if
    its stack has STACK_NEEDED bytes left; otherwise every range runs on a worker thread (of
    WORKER_STACK bytes), one even for a single range. */
 static int run_threads(double *const *planes, const uint32_t *leaves, uint32_t count,
@@ -605,11 +621,11 @@ static int run_threads(double *const *planes, const uint32_t *leaves, uint32_t c
     share_t shares[MAX_THREADS];
     pthread_t ids[MAX_THREADS];
     int started[MAX_THREADS];
-    uint32_t groups = point_count / 8, point = start;
+    uint32_t groups = point_count / GROUP, point = start;
     for (uint32_t t = 0; t < threads; t++) {
         uint32_t n = groups / threads + (t < groups % threads);
-        shares[t] = (share_t){planes, leaves, count, point, point + 8 * n, PACMAN_RUNNER_OK};
-        point += 8 * n;
+        shares[t] = (share_t){planes, leaves, count, point, point + GROUP * n, PACMAN_RUNNER_OK};
+        point += GROUP * n;
     }
     pthread_attr_t attr;
     int attr_ok = pthread_attr_init(&attr) == 0;
@@ -641,7 +657,6 @@ static int run_threads(double *const *planes, const uint32_t *leaves, uint32_t c
     }
     return status;
 }
-#endif
 
 int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint32_t *leaves,
                          uint32_t num_leaves, uint32_t point_start, uint32_t point_count) {
@@ -665,6 +680,7 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
     if (point_start % 8 != 0 || point_count % 8 != 0) {
         return PACMAN_RUNNER_BAD_ARGUMENTS;
     }
+#endif
     pthread_once(&SETUP, setup);
     if (!CPU_OK) {
         return PACMAN_RUNNER_DEVICE_ERROR;
@@ -680,9 +696,6 @@ int pacman_runner_v1_run(double *const *planes, uint32_t num_planes, const uint3
         pthread_mutex_unlock(&STATS_LOCK);
     }
     return status;
-#else
-    return run_points(planes, leaves, count, point_start, point_start + point_count, point_count);
-#endif
 }
 
 int pacman_runner_v1_run_reduce(double *const *planes, uint32_t num_planes,
@@ -2681,17 +2694,30 @@ int main(int argc, char **argv) {
             eprintln!("no C compiler (cc) or no AVX2: the SIMD runner is not built");
             return;
         }
-        simd_runner_check(4);
+        runner_threads_check(4);
         if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512dq") {
-            simd_runner_check(8);
+            runner_threads_check(8);
         } else {
             eprintln!("no AVX512F and AVX512DQ: the AVX-512 runner is not run");
         }
     }
 
-    // the SIMD runner of `lanes` lanes on a recording of 16 points against the (SIMD) replay
-    #[cfg(target_arch = "x86_64")]
-    fn simd_runner_check(lanes: u32) {
+    #[test]
+    #[cfg_attr(
+        target_arch = "riscv64",
+        ignore = "sjb2obj writes x86-64 and AArch64 objects only"
+    )]
+    fn scalar_runner_runs_on_threads() {
+        if !have_cc() {
+            eprintln!("no C compiler (cc): the runner is not built");
+            return;
+        }
+        runner_threads_check(1);
+    }
+
+    // the runner of `lanes` lanes (1: scalar kernels) on a recording of 16 points against the
+    // replay (SIMD, or `--scalar` for scalar kernels), on 1 and 3 threads
+    fn runner_threads_check(lanes: u32) {
         let dir = std::env::temp_dir().join(format!(
             "pacman-simd{}-runner-{}",
             lanes,
@@ -2738,7 +2764,11 @@ int main(int argc, char **argv) {
             CpuKernel::load("b", &b).unwrap(),
         ];
         let ks: Vec<&CpuKernel> = kernels.iter().collect();
-        let want = replay::replay(&rec, &spec.calls, &ks, &replay::Options::default())
+        let options = replay::Options {
+            scalar: lanes == 1,
+            ..replay::Options::default()
+        };
+        let want = replay::replay(&rec, &spec.calls, &ks, &options)
             .unwrap()
             .arena;
         assert!(want[3 * n..4 * n].iter().all(|x| x.is_finite()));
@@ -2769,7 +2799,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        // a point range that is not a multiple of 8 is refused
+        // a point range that is not a multiple of 8: refused by SIMD runners, run by scalar ones
         let text = RECORDING.replace("\"tiles\": [5, 4]", "\"tiles\": [9]");
         std::fs::write(&json, text).unwrap();
         let mut pre9 = vec![0.0; 12 * 9];
@@ -2781,10 +2811,11 @@ int main(int argc, char **argv) {
         let out = Command::new(dir.join("runner"))
             .args(["out"])
             .arg(&json)
+            .env("PACMAN_RUNNER_THREADS", "3")
             .current_dir(&dir)
             .output()
             .unwrap();
-        assert!(!out.status.success());
+        assert_eq!(out.status.success(), lanes == 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

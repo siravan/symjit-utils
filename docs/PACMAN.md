@@ -433,6 +433,23 @@ Generating takes 0.06 s and building 0.1 s. The `.so` is tested through `dlopen`
 argument errors, a point range split in two) in `runner::tests`, and the real recordings in
 `tests/pacman.rs` (`PACMAN_REPLAY_SAMPLES`).
 
+Since 2026-11-01 the scalar runner takes the settings of the SIMD runners below: blocks of
+`PACMAN_RUNNER_BLOCK` points, `PACMAN_RUNNER_THREADS`, `PACMAN_RUNNER_STATS` and the same stacks.
+Its threads split a call into ranges of any points, not only whole 8-point groups. A point range
+need not be a multiple of 8. The scalar runner is the only CPU runner on AArch64 (e.g. an Apple
+M4): SIMD object kernels are x86-64 only. `KERNEL_STACK` is then the largest kernel's frame: its
+inputs, outputs and stack slots (16 bytes each for complex models) and 1 KiB for saved registers.
+On macOS the calling thread's stack comes from `pthread_get_stackaddr_np` and
+`pthread_get_stacksize_np`. The values are the same on any number of threads.
+
+| u u~ > Z + 5g, Ryzen 9 9900X, `profile`, 16,384 points per call | helicity sum | one helicity |
+|---|---|---|
+| stock RustiCol (its AVX2 kernels), 1 thread | 10.3 | 0.56 |
+| scalar runner, 1 / 4 / 8 threads (runner alone) | 74.7 / 19.5 / 10.0 | 2.98 / 0.83 / 0.45 |
+
+On one thread, blocks of 64 points take 73.6 µs/point, of 1,024 75.4, and the whole call at once
+(the scalar runner before blocks) 87.8.
+
 ### SIMD runners (`--simd`, `--simd512`)
 
 `pacman runner --simd` writes the same files with AVX2 kernels: each leaf's SIMD kernel
@@ -460,7 +477,8 @@ Stacks: `pacman` records the largest stack a kernel reserves (`KERNEL_STACK` in 
 sum of the kernel's `sub rsp`s; 111 KB for the Z+6g AVX-512 kernels). A thread that runs kernels
 needs that and 256 KiB for the C library's math functions and the runner (`STACK_NEEDED`). Worker
 threads get `STACK_NEEDED`, at least 1 MiB. The calling thread runs the first range only if its own
-stack has `STACK_NEEDED` bytes left below the runner's frame (`pthread_getattr_np`); otherwise that
+stack has `STACK_NEEDED` bytes left below the runner's frame (`pthread_getattr_np`; on macOS
+`pthread_get_stackaddr_np`); otherwise that
 range runs on a worker too, even when it is the only one, so a caller with a small stack (e.g. a
 128 KiB thread, where the runner of PR #6 crashed) is safe. A range whose thread cannot be started
 runs on the caller.
