@@ -125,6 +125,8 @@ struct Run {
     mode: Mode,
     /// the module of `sjb2ssa` + `ssa2ptx` instead of `sjb2ptx`
     ssa: bool,
+    /// `--mixed RULE`
+    mixed: Option<&'static str>,
 }
 
 const RUN: Run = Run {
@@ -133,6 +135,7 @@ const RUN: Run = Run {
     batch: 0,
     mode: Mode::Host,
     ssa: false,
+    mixed: None,
 };
 
 /// A C program that runs kernel `name` with its driver: it reads the inputs (and parameters)
@@ -275,6 +278,9 @@ fn gpu(
     if run.aos {
         args.extend(["--layout", "aos"]);
     }
+    if let Some(rule) = run.mixed {
+        args.extend(["--mixed", rule]);
+    }
     if run.ssa {
         let ssa = format!("{}.ssa", name);
         ok(&tool(SJB2SSA, d, &[sjb.as_str(), "-o", ssa.as_str(), "-q"]));
@@ -367,7 +373,8 @@ fn gpu(
 }
 
 /// The same bits (NaNs of any payload are equal: the GPU's NaNs are canonical).
-/// `gpu` with `RUN`, then through the SSA form (`sjb2ssa`, `ssa2ptx`): the same bits.
+/// `gpu` with `RUN`, then through the SSA form (`sjb2ssa`, `ssa2ptx`): the same bits, in f64
+/// and in mixed precision (each rule, all inputs f32; not for loops).
 fn gpu_and_ssa(
     d: &Path,
     name: &str,
@@ -375,16 +382,35 @@ fn gpu_and_ssa(
     count_out: usize,
 ) -> Option<Vec<Vec<f64>>> {
     let got = gpu(d, name, RUN, points, &[], count_out)?;
-    let ssa = gpu(d, name, Run { ssa: true, ..RUN }, points, &[], count_out).unwrap();
-    for (i, (a, b)) in got.iter().zip(&ssa).enumerate() {
-        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        assert_eq!(
-            bits(a),
-            bits(b),
-            "{}: the SSA form differs at point {}",
-            name,
-            i
-        );
+    // not the loops: in f32 a counter stops growing (x + 1 = x for |x| >= 2^24), and the loop
+    // never ends
+    let rules: &[Option<&'static str>] = if name == "loop" {
+        &[None]
+    } else {
+        &[None, Some("need"), Some("forward")]
+    };
+    for &mixed in rules {
+        let plain = match mixed {
+            None => got.clone(),
+            Some(_) => gpu(d, name, Run { mixed, ..RUN }, points, &[], count_out).unwrap(),
+        };
+        let run = Run {
+            ssa: true,
+            mixed,
+            ..RUN
+        };
+        let ssa = gpu(d, name, run, points, &[], count_out).unwrap();
+        for (i, (a, b)) in plain.iter().zip(&ssa).enumerate() {
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(a),
+                bits(b),
+                "{} (mixed {:?}): the SSA form differs at point {}",
+                name,
+                mixed,
+                i
+            );
+        }
     }
     Some(got)
 }
@@ -595,6 +621,7 @@ fn layouts_batches_and_device_pointers() {
                 batch,
                 mode,
                 ssa: false,
+                mixed: None,
             };
             let what = format!(
                 "aos {}, padding {}, batch {}, device {}",
@@ -1473,8 +1500,28 @@ fn ssa_files_and_errors() {
     );
     fails(&tool(SJB2SSA, &d, &[]), 2, "no input file");
     fails(
-        &tool(SSA2PTX, &d, &["m.ssa", "--mixed", "need"]),
+        &tool(SSA2PTX, &d, &["m.ssa", "--mixed", "most"]),
         2,
-        "unknown option",
+        "unknown rule",
     );
+    fails(
+        &tool(SSA2PTX, &d, &["m.ssa", "--mixed", "need", "--f32"]),
+        2,
+        "exclude",
+    );
+    ok(&tool(
+        SSA2PTX,
+        &d,
+        &[
+            "m.ssa",
+            "--mixed",
+            "need",
+            "-o",
+            "mx.ptx",
+            "--f64-inputs",
+            "1-2",
+        ],
+    ));
+    let mx = std::fs::read_to_string(d.join("mx.ptx")).unwrap();
+    assert!(mx.contains("// mixed precision (need):"), "{}", mx);
 }

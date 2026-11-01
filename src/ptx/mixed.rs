@@ -17,7 +17,8 @@
 // - The arena stays f64. Outputs are rounded to f32 when they are stored (`round_outputs`), as
 //   an arena of f32 planes would hold them.
 // - Labels, jumps, funclet calls and returns: every value is converted to f64 before them, and
-//   is f64 after them (the analysis does not follow control flow).
+//   is f64 after them (the analysis does not follow control flow). The SSA values of ssa2ptx
+//   (`%v<k>`) are not: none is read across a label or call.
 //
 // `retype` makes three passes. The generator reuses register names (the PTX is not in SSA form),
 // so types belong to definitions, not to names:
@@ -97,12 +98,18 @@ pub fn f32_name(name: &str) -> String {
     format!("%f{}", &name[1..])
 }
 
-/// A register the generator allocates values in.
+/// A `Static` register of an SSA-form MIR (`%v<k>`, `crate::ssa`).
+fn ssa_value(name: &str) -> bool {
+    name.strip_prefix("%v")
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A register the generator allocates values in (`%v<k>`: the `Static` registers of ssa2ptx).
 fn tracked(name: &str) -> bool {
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     name == "%ret"
         || name == "%tmp"
-        || ["%g", "%s", "%m", "%x"]
+        || ["%g", "%v", "%s", "%m", "%x"]
             .iter()
             .any(|p| name.strip_prefix(p).is_some_and(digits))
 }
@@ -899,11 +906,13 @@ impl Emitter {
                 self.kinds.insert(slot, kind_of(n));
             }
             Op::Control(item) => {
-                // every value in its f64 register
+                // every value in its f64 register, but the SSA values (`%v<k>`, ssa2ptx): the
+                // SSA form reads none across a label or call (a value that crosses one stays in
+                // a general register, `crate::ssa`), so they need no conversion and keep theirs
                 let mut names: Vec<String> = self
                     .valid
                     .iter()
-                    .filter(|(_, &(_, has64))| !has64)
+                    .filter(|(n, &(_, has64))| !has64 && !ssa_value(n))
                     .map(|(n, _)| n.clone())
                     .collect();
                 names.sort();
@@ -914,7 +923,7 @@ impl Emitter {
                 let clear = !matches!(item, Item::BranchIf { .. });
                 self.out.push(item);
                 if clear {
-                    self.valid.clear();
+                    self.valid.retain(|n, _| ssa_value(n));
                 }
             }
         }

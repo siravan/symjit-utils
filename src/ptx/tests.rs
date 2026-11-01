@@ -832,10 +832,25 @@ fn ssa_form_of_saved_models() {
         assert!(p.text.contains(".reg .b64 %v<"), "{}:\n{}", what, p.text);
         assert!(!p.text.contains(".reg .b64 %g<"), "{}:\n{}", what, p.text);
         ssa_ptx(&mut ssa, true, &format!("{}, f32", what));
-        // not yet
-        let mut options = PtxOptions::new("model");
-        options.mixed = Some(Mixed::new(MixedRule::Need, vec![]));
-        assert!(ssa.ptx(&options).is_err());
+        // mixed precision: the same operations as on the saved model, the values in `%v`
+        for rule in [MixedRule::Need, MixedRule::Forward] {
+            let mut options = PtxOptions::new("model");
+            options.mixed = Some(Mixed::new(rule, vec![false, true, true]));
+            let p = ssa.ptx(&options).unwrap();
+            ptxas(&p.text, &format!("{}, mixed {:?}", what, rule));
+            assert!(p.text.contains(".reg .b32 %fv<"), "{}:\n{}", what, p.text);
+            let plain = saved(&arithmetic(config(CompilerType::Native, opt_level, true)))
+                .ptx(&options)
+                .unwrap();
+            let ops = |t: &str| {
+                let l = t
+                    .lines()
+                    .find(|l| l.starts_with("// mixed precision"))
+                    .unwrap();
+                l[..l.rfind(" operations").unwrap()].to_string()
+            };
+            assert_eq!(ops(&p.text), ops(&plain.text), "{}", what);
+        }
     }
     // lowered complex models: funclets pass values in registers across calls and labels
     for stable in [false, true] {

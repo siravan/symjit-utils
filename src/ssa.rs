@@ -373,12 +373,9 @@ impl SsaModel {
         self.prog.config()
     }
 
-    /// The PTX module (`ssa2ptx`): sjb2ptx's generator on the SSA MIR, `Static(k)` as `%v<k>`.
-    /// Mixed precision is not supported yet.
+    /// The PTX module (`ssa2ptx`): sjb2ptx's generator on the SSA MIR, `Static(k)` as `%v<k>`
+    /// (mixed precision included: `ptx::mixed` types `%v<k>` as the generator's registers).
     pub fn ptx(&mut self, options: &PtxOptions) -> Result<Ptx> {
-        if options.mixed.is_some() {
-            bail!("ssa2ptx does not support mixed precision yet");
-        }
         crate::ptx::ptx_of(&mut self.prog, &self.mir, options)
     }
 

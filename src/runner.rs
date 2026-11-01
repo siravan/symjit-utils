@@ -217,6 +217,18 @@ pub fn ptx_modules(
     precision: Precision,
     settings: &[(String, String)],
 ) -> Result<Vec<String>> {
+    ptx_modules_with(spec, members, sm, precision, settings, false)
+}
+
+/// `ptx_modules`; with `ssa`, each leaf through its SSA form (`crate::ssa`, as ssa2ptx).
+pub fn ptx_modules_with(
+    spec: &Spec,
+    members: &HashMap<&str, &[u8]>,
+    sm: u32,
+    precision: Precision,
+    settings: &[(String, String)],
+    ssa: bool,
+) -> Result<Vec<String>> {
     let first_f64 = first_f64_plane(spec);
     let mut modules = Vec::new();
     for (k, call) in spec.calls.iter().enumerate() {
@@ -238,9 +250,12 @@ pub fn ptx_modules(
             options.mixed = Some(mixed);
         }
         options.mapping = Some(call.inputs.iter().chain(&call.outputs).copied().collect());
-        let ptx = model.ptx(&options).with_context(|| {
-            format!("{}: cannot compile `{}` into PTX", call.label, call.member)
-        })?;
+        let ptx = if ssa {
+            crate::ssa::SsaModel::from_saved(model).and_then(|mut m| m.ptx(&options))
+        } else {
+            model.ptx(&options)
+        }
+        .with_context(|| format!("{}: cannot compile `{}` into PTX", call.label, call.member))?;
         modules.push(ptx.text);
     }
     Ok(modules)
