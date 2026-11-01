@@ -125,6 +125,8 @@ Options:
                        amplitudes in f32 planes on the GPU, the momenta and
                        parameters in f64 ones) or f64 (every plane f64, the
                        f32 values rounded where loaded and stored)
+      --ssa            runner: CUDA kernels through the SSA form of the leaves
+                       (sjb2ssa, ssa2ptx)
       --fallback PCT   runner: a hybrid runner (with --cuda --f32): its reductions
                        rerun the PCT largest points (e.g. 1%, or 0.01) and every
                        non-finite one on the CPU in f64 (scalar kernels, or
@@ -173,6 +175,8 @@ struct Runner {
     settings: Vec<(String, String)>,
     /// `--fallback PCT`: a hybrid runner rerunning this fraction of the points on the CPU
     fallback: Option<f64>,
+    /// `--ssa`: the CUDA kernels through the SSA form of the leaves
+    ssa: bool,
     jobs: usize,
 }
 
@@ -237,6 +241,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
     let mut arena: Option<bool> = None;
     let mut settings = Vec::new();
     let mut fallback: Option<f64> = None;
+    let mut ssa = false;
     let mut jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
 
     let mut it = args[1..].iter();
@@ -306,6 +311,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
                 cuda.get_or_insert_with(Vec::new);
             }
             ("runner", "--f32") => f32 = true,
+            ("runner", "--ssa") => ssa = true,
             ("runner", "--arena") => {
                 arena = Some(match value(arg)?.as_str() {
                     "mixed" => false,
@@ -443,6 +449,9 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
         "runner" if arena.is_some() && mixed.is_none() => {
             Err("`--arena` is for mixed-precision runners: add `--mixed RULE`".into())
         }
+        "runner" if ssa && cuda.is_none() => {
+            Err("`--ssa` is for CUDA runners: add `--cuda` or `--sm`".into())
+        }
         "runner" if f32 && cuda.is_none() => {
             Err("`--f32` is for CUDA runners: add `--cuda` or `--sm`".into())
         }
@@ -461,6 +470,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             f64_arena: arena.unwrap_or(false),
             settings,
             fallback,
+            ssa,
             jobs,
         })),
         "recurrence-runner" if !inputs.is_empty() => {
@@ -1040,12 +1050,13 @@ fn cuda_runner(
         },
         (false, None) => Precision::F64,
     };
-    let modules = symjit_utils::runner::ptx_modules(
+    let modules = symjit_utils::runner::ptx_modules_with(
         spec,
         members,
         symjit_utils::ptx::DEFAULT_SM,
         precision,
         &args.settings,
+        args.ssa,
     )?;
     let kernels = match args.fallback {
         Some(_) => Some(symjit_utils::runner::objects(

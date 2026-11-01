@@ -39,7 +39,8 @@ use std::fmt::Write;
 
 use anyhow::{anyhow, Result};
 
-use symjit::backend::{Func, Generator, GeneratorType, Loc, Reg};
+use symjit::backend::{Func, Generator, GeneratorType, Loc, Mir, Reg};
+use symjit::Program;
 
 use crate::sjb::SavedModel;
 
@@ -126,50 +127,55 @@ pub struct Ptx {
 impl SavedModel {
     /// The PTX module of the model (see the top of this file for its interface).
     pub fn ptx(&mut self, options: &PtxOptions) -> Result<Ptx> {
-        if libm::is_library_name(&options.name) {
-            return Err(anyhow!(
-                "the kernel name `{}` is reserved: names starting with `__sj` belong to the math library",
-                options.name
-            ));
-        }
-        let prog = &mut self.prog;
-        let row_first = prog.config().symbolica() && !prog.config().direct_arena();
-        let shape = Shape {
-            count_in: if row_first {
-                prog.count_params
-            } else {
-                prog.count_states
-            },
-            count_out: prog.count_obs + prog.count_diffs,
-            count_params: if row_first { 0 } else { prog.count_params },
-            row_first,
-        };
-
-        if let Some(map) = &options.mapping {
-            check_mapping(map, &shape, options.layout)?;
-        }
-        if options.f32 && options.mixed.is_some() {
-            return Err(anyhow!("f32 and mixed precision exclude each other"));
-        }
-        if options.mixed.as_ref().is_some_and(|m| m.arena) && options.mapping.is_none() {
-            return Err(anyhow!("a mixed arena needs a plane mapping (pacman runners)"));
-        }
-        let mut generator = PtxGenerator::new(options.clone(), shape);
-        let (count_states, count_obs, count_params) =
-            (prog.count_states, prog.count_obs, prog.count_params);
-        prog.builder.compile_from_mir(
-            &self.mir,
-            &mut generator,
-            count_states,
-            count_obs,
-            count_params,
-        )?;
-        generator.check()?;
-        Ok(Ptx {
-            text: generator.text(),
-            shape,
-        })
+        ptx_of(&mut self.prog, &self.mir, options)
     }
+}
+
+/// The PTX module of `prog` with the (real) MIR `mir`: a saved model's, or its SSA form's
+/// (`crate::ssa`), whose `Static` registers become `%v<k>`.
+pub(crate) fn ptx_of(prog: &mut Program, mir: &Mir, options: &PtxOptions) -> Result<Ptx> {
+    if libm::is_library_name(&options.name) {
+        return Err(anyhow!(
+            "the kernel name `{}` is reserved: names starting with `__sj` belong to the math library",
+            options.name
+        ));
+    }
+    let row_first = prog.config().symbolica() && !prog.config().direct_arena();
+    let shape = Shape {
+        count_in: if row_first {
+            prog.count_params
+        } else {
+            prog.count_states
+        },
+        count_out: prog.count_obs + prog.count_diffs,
+        count_params: if row_first { 0 } else { prog.count_params },
+        row_first,
+    };
+
+    if let Some(map) = &options.mapping {
+        check_mapping(map, &shape, options.layout)?;
+    }
+    if options.f32 && options.mixed.is_some() {
+        return Err(anyhow!("f32 and mixed precision exclude each other"));
+    }
+    if options.mixed.as_ref().is_some_and(|m| m.arena) && options.mapping.is_none() {
+        return Err(anyhow!("a mixed arena needs a plane mapping (pacman runners)"));
+    }
+    let mut generator = PtxGenerator::new(options.clone(), shape);
+    let (count_states, count_obs, count_params) =
+        (prog.count_states, prog.count_obs, prog.count_params);
+    prog.builder.compile_from_mir(
+        mir,
+        &mut generator,
+        count_states,
+        count_obs,
+        count_params,
+    )?;
+    generator.check()?;
+    Ok(Ptx {
+        text: generator.text(),
+        shape,
+    })
 }
 
 /// A plane mapping fits `shape`: one plane per slot, SoA, no shared parameters, a model whose
@@ -236,6 +242,8 @@ pub struct PtxGenerator {
     body: Vec<Item>,
     consts: Vec<f64>,
     count_gen: u32,
+    /// `%v<k>`: the `Static` registers of an SSA-form MIR (`crate::ssa`)
+    count_static: u32,
     count_stack: u32,
     count_mem: u32,
     count_states: u32,
@@ -273,6 +281,7 @@ impl PtxGenerator {
             body: Vec::new(),
             consts: Vec::new(),
             count_gen: 0,
+            count_static: 0,
             count_stack: 0,
             count_mem: 0,
             count_states: 0,
@@ -399,8 +408,8 @@ impl PtxGenerator {
                 format!("%g{}", n)
             }
             Reg::Static(n) => {
-                self.unsupported(&format!("unallocated registers (Static({}))", n));
-                "%x0".into()
+                self.count_static = self.count_static.max(n + 1);
+                format!("%v{}", n)
             }
         }
     }
@@ -1079,6 +1088,7 @@ impl PtxGenerator {
         let _ = writeln!(o, "\t.reg .{} %ret, %tmp, %x<4>;", self.bt());
         for (prefix, count) in [
             ("g", self.count_gen),
+            ("v", self.count_static),
             ("s", self.count_stack),
             ("m", self.count_mem),
         ] {

@@ -24,6 +24,7 @@ pub mod replay;
 pub mod runner;
 pub mod sha256;
 pub mod sjb;
+pub mod ssa;
 pub mod source;
 pub mod wasm;
 

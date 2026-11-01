@@ -13,6 +13,8 @@ use symjit::{
 };
 
 const SJB2PTX: &str = env!("CARGO_BIN_EXE_sjb2ptx");
+const SJB2SSA: &str = env!("CARGO_BIN_EXE_sjb2ssa");
+const SSA2PTX: &str = env!("CARGO_BIN_EXE_ssa2ptx");
 
 fn dir(name: &str) -> PathBuf {
     let d = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -38,6 +40,14 @@ fn save(app: &Application, path: &Path) {
 
 fn sjb2ptx(d: &Path, args: &[&str]) -> Output {
     Command::new(SJB2PTX)
+        .args(args)
+        .current_dir(d)
+        .output()
+        .unwrap()
+}
+
+fn tool(exe: &str, d: &Path, args: &[&str]) -> Output {
+    Command::new(exe)
         .args(args)
         .current_dir(d)
         .output()
@@ -113,6 +123,10 @@ struct Run {
     /// `<name>_cuda_set_batch` (0: the default)
     batch: usize,
     mode: Mode,
+    /// the module of `sjb2ssa` + `ssa2ptx` instead of `sjb2ptx`
+    ssa: bool,
+    /// `--mixed RULE`
+    mixed: Option<&'static str>,
 }
 
 const RUN: Run = Run {
@@ -120,6 +134,8 @@ const RUN: Run = Run {
     pad: 0,
     batch: 0,
     mode: Mode::Host,
+    ssa: false,
+    mixed: None,
 };
 
 /// A C program that runs kernel `name` with its driver: it reads the inputs (and parameters)
@@ -262,7 +278,17 @@ fn gpu(
     if run.aos {
         args.extend(["--layout", "aos"]);
     }
-    ok(&sjb2ptx(d, &args));
+    if let Some(rule) = run.mixed {
+        args.extend(["--mixed", rule]);
+    }
+    if run.ssa {
+        let ssa = format!("{}.ssa", name);
+        ok(&tool(SJB2SSA, d, &[sjb.as_str(), "-o", ssa.as_str(), "-q"]));
+        args[0] = ssa.as_str();
+        ok(&tool(SSA2PTX, d, &args));
+    } else {
+        ok(&sjb2ptx(d, &args));
+    }
     harness(d, name);
 
     let n = points.len();
@@ -347,6 +373,48 @@ fn gpu(
 }
 
 /// The same bits (NaNs of any payload are equal: the GPU's NaNs are canonical).
+/// `gpu` with `RUN`, then through the SSA form (`sjb2ssa`, `ssa2ptx`): the same bits, in f64
+/// and in mixed precision (each rule, all inputs f32; not for loops).
+fn gpu_and_ssa(
+    d: &Path,
+    name: &str,
+    points: &[Vec<f64>],
+    count_out: usize,
+) -> Option<Vec<Vec<f64>>> {
+    let got = gpu(d, name, RUN, points, &[], count_out)?;
+    // not the loops: in f32 a counter stops growing (x + 1 = x for |x| >= 2^24), and the loop
+    // never ends
+    let rules: &[Option<&'static str>] = if name == "loop" {
+        &[None]
+    } else {
+        &[None, Some("need"), Some("forward")]
+    };
+    for &mixed in rules {
+        let plain = match mixed {
+            None => got.clone(),
+            Some(_) => gpu(d, name, Run { mixed, ..RUN }, points, &[], count_out).unwrap(),
+        };
+        let run = Run {
+            ssa: true,
+            mixed,
+            ..RUN
+        };
+        let ssa = gpu(d, name, run, points, &[], count_out).unwrap();
+        for (i, (a, b)) in plain.iter().zip(&ssa).enumerate() {
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(a),
+                bits(b),
+                "{} (mixed {:?}): the SSA form differs at point {}",
+                name,
+                mixed,
+                i
+            );
+        }
+    }
+    Some(got)
+}
+
 fn same(a: f64, b: f64) -> bool {
     a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
 }
@@ -515,7 +583,7 @@ fn real_models_match_the_jit() {
                     jit_of(&mut app, &pts)
                 };
 
-                let Some(got) = gpu(&d, "real", RUN, &pts, &[], 8) else {
+                let Some(got) = gpu_and_ssa(&d, "real", &pts, 8) else {
                     return;
                 };
                 if foreign {
@@ -552,6 +620,8 @@ fn layouts_batches_and_device_pointers() {
                 pad,
                 batch,
                 mode,
+                ssa: false,
+                mixed: None,
             };
             let what = format!(
                 "aos {}, padding {}, batch {}, device {}",
@@ -645,7 +715,7 @@ fn symbolica_loops() {
             outs.to_vec()
         })
         .collect();
-    let Some(got) = gpu(&d, "loop", RUN, &pts, &[], 2) else {
+    let Some(got) = gpu_and_ssa(&d, "loop", &pts, 2) else {
         return;
     };
     assert_same(&got, &expected, &pts, "loops");
@@ -703,7 +773,7 @@ fn complex_models_match_the_jit() {
                         outs.iter().flat_map(|z| [z.re, z.im]).collect()
                     })
                     .collect();
-                let Some(got) = gpu(&d, "cplx", RUN, &pts, &[], 8) else {
+                let Some(got) = gpu_and_ssa(&d, "cplx", &pts, 8) else {
                     return;
                 };
                 assert_same(&got, &expected, &pts, &what);
@@ -1163,7 +1233,7 @@ fn math_models_match_the_jit() {
                 save(&app, &d.join("real.sjb"));
                 let mut jit = compile(&model, config(CompilerType::Native, opt_level, fastmath));
                 let expected: Vec<Vec<f64>> = pts.iter().map(|p| jit.call(p)).collect();
-                let Some(got) = gpu(&d, "real", RUN, &pts, &[], 6) else {
+                let Some(got) = gpu_and_ssa(&d, "real", &pts, 6) else {
                     return;
                 };
                 assert_close(&got, &expected, &pts, &what);
@@ -1222,7 +1292,7 @@ fn math_models_match_the_jit() {
                     outs.iter().flat_map(|z| [z.re, z.im]).collect()
                 })
                 .collect();
-            let got = gpu(&d, "cplx", RUN, &pts, &[], 10).unwrap();
+            let got = gpu_and_ssa(&d, "cplx", &pts, 10).unwrap();
             for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
                 for k in 0..5 {
                     let rel = relative((g[2 * k], g[2 * k + 1]), (e[2 * k], e[2 * k + 1]));
@@ -1382,4 +1452,76 @@ int main(void) {
     ok(&out);
     // (1 * 2 + 3) / (1 + 9)
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0.5");
+}
+
+/// sjb2ssa and ssa2ptx: the default file names, the report, and the errors.
+#[test]
+fn ssa_files_and_errors() {
+    let d = dir("ssa_cli");
+    save(
+        &compile(&arithmetic(), config(CompilerType::Native, 2, true)),
+        &d.join("m.sjb"),
+    );
+    let out = tool(SJB2SSA, &d, &["m.sjb"]);
+    ok(&out);
+    let report = String::from_utf8_lossy(&out.stderr);
+    assert!(report.contains("static registers"), "{}", report);
+    assert!(d.join("m.ssa").exists());
+    ok(&tool(SSA2PTX, &d, &["m.ssa"]));
+    let ptx = std::fs::read_to_string(d.join("m.ptx")).unwrap();
+    assert!(
+        ptx.contains(".visible .entry m(") && ptx.contains("%v"),
+        "{}",
+        ptx
+    );
+    assert!(d.join("m.h").exists());
+    // the same module as sjb2ptx's but for the registers
+    ok(&sjb2ptx(&d, &["m.sjb", "-o", "plain.ptx", "--no-header"]));
+    let plain = std::fs::read_to_string(d.join("plain.ptx")).unwrap();
+    assert_eq!(
+        plain.lines().filter(|l| l.contains("div.rn.f64")).count(),
+        ptx.lines().filter(|l| l.contains("div.rn.f64")).count()
+    );
+    ok(&tool(SJB2SSA, &d, &["m.sjb", "-o", "q.ssa", "-q"]));
+    assert!(d.join("q.ssa").exists());
+
+    // an .sjb is not an .ssa file, nor the other way round
+    fails(&tool(SSA2PTX, &d, &["m.sjb"]), 1, "not an .ssa file");
+    fails(
+        &tool(SJB2SSA, &d, &["m.ssa", "-o", "x.ssa"]),
+        1,
+        "cannot read",
+    );
+    fails(&sjb2ptx(&d, &["m.ssa", "-o", "x.ptx"]), 1, "magic");
+    fails(
+        &tool(SJB2SSA, &d, &["m.sjb", "-o", "m.sjb"]),
+        1,
+        "overwrite",
+    );
+    fails(&tool(SJB2SSA, &d, &[]), 2, "no input file");
+    fails(
+        &tool(SSA2PTX, &d, &["m.ssa", "--mixed", "most"]),
+        2,
+        "unknown rule",
+    );
+    fails(
+        &tool(SSA2PTX, &d, &["m.ssa", "--mixed", "need", "--f32"]),
+        2,
+        "exclude",
+    );
+    ok(&tool(
+        SSA2PTX,
+        &d,
+        &[
+            "m.ssa",
+            "--mixed",
+            "need",
+            "-o",
+            "mx.ptx",
+            "--f64-inputs",
+            "1-2",
+        ],
+    ));
+    let mx = std::fs::read_to_string(d.join("mx.ptx")).unwrap();
+    assert!(mx.contains("// mixed precision (need):"), "{}", mx);
 }
