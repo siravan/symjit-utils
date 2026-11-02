@@ -2,7 +2,8 @@
 //! (`symjit::backend`): `sjb2wasm` compiles one into a WebAssembly module, `sjb2obj` into a
 //! relocatable object file and C header, `rust2sjb` saves a `#[kernel]` function of a Rust
 //! file (`source`, `kernel`), `sjbinfo` prints what one holds (`info`), `sjb2ptx`
-//! compiles one into a CUDA PTX module (`ptx`), and `pacman` reports on and extracts the
+//! compiles one into a CUDA PTX module (`ptx`), `sjb2msl` into a Metal kernel (`msl`, a
+//! probe), and `pacman` reports on and extracts the
 //! kernels of pyAmpliCol's evaluator containers (`pacbin`, `pacman`), its recurrence plans
 //! (`plan`) and the plane tables of its compiled-mode kernels (`bindings`), and replays RustiCol
 //! arena recordings with them (`recording`, `replay`) or builds them into a runner (`runner`).
@@ -14,6 +15,7 @@ pub mod bindings;
 pub mod info;
 pub mod kernel;
 pub mod linker;
+pub mod msl;
 mod obj;
 pub mod pacbin;
 pub mod pacman;
