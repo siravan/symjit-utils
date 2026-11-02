@@ -10,6 +10,10 @@ recorded execution with it.
 4.6× stock RustiCol, with Σ|A|² within 1.3e-6 of RustiCol's f64 at every recorded point. Over the
 whole sweep, n = 4..8, it is 7.4× down to 4.5×, within 2.4e-6 (see the sweep below).
 
+**Inside RustiCol** (`pacman runner --metal`, 2026-11-02): `pyamplicol profile` of the n = 8
+helicity sum takes 28.5 µs/point, 3.3× stock RustiCol, with every point's |M|² within 2.4e-6
+of stock for n = 1..8. A single helicity is less accurate (up to 2.4e-3, see below).
+
 ## What it supports
 
 - **Straight-line arithmetic only.** It handles add, subtract, multiply, divide, FMA, sqrt,
@@ -133,15 +137,96 @@ and without `--mixed`, at 4,096, 16,384 and 65,536 points per call. Times are th
   the caches. Larger calls are slower from n = 5 on.
 - **Compile time** grows with the source (45 MB at n = 8) and is paid once: Metal caches it.
 
+## `pacman runner --metal`: inside RustiCol (2026-11-02)
+
+`pacman runner --metal ARTIFACT RECORDING.json` (or `--execution PAT`) builds a runner with
+the `pacman-runner-v1` interface that RustiCol loads through `PACMAN_RUNNER`, as the CPU and
+CUDA runners (`src/runner/metal.rs`, `src/runner/run_metal.m`):
+
+- **Kernels:** one Metal source for all the leaves (`pacman_leaf<k>`, the leaf's planes compiled
+  in), embedded in `librunner.so` by `.incbin`. The Metal framework compiles it the first
+  time the library runs, then serves it from its cache: 2 minutes for n = 8 the first time,
+  0.07 s after that.
+- **Precision:** mixed f32/df64 by default, or `--f32`. The momenta, the zero plane and the
+  parameters (the planes from `FIRST_F64` on) are df64 inputs. `MslOptions::lo_first` keeps
+  their low parts in a buffer of those planes only.
+- **Arena:** one shared f32 buffer, in blocks of `PACMAN_RUNNER_BLOCK` points (default 4,096).
+  Each block holds all the planes of its points, and every leaf runs on a block before the next
+  block, all in one command buffer.
+- **Conversions:** memory is unified, so they run on the CPU. Planes read before they are
+  written are rounded to f32, with the low parts split off; planes copied back are widened.
+  The default copy-back is the amplitudes (all written planes with `PACMAN_RUNNER_COPY_BACK=all`
+  or `PACMAN_SAVE_ARENA`), and `run_reduce` reduces from the f32 arena. Conversions are single
+  threaded: 3.4% of the runner's time for the n = 8 sum, but 26% for the n = 4 sum and 27% for
+  one helicity at n = 8, where the kernels are short.
+- **Calls:** one at a time (a mutex); `PACMAN_RUNNER_STATS=1` prints calls, GPU time and
+  conversion time.
+- **Test:** `runner::tests::metal_runner_is_close_to_the_scalar_replay`, mixed and f32, in
+  blocks of 4 points across tiles of 5 and 4.
+
+**The sweep in RustiCol** (`zng-mac`; `examples/metal_runner_zng.sh`). Each n gets runners for
+every execution of its artifact. The check is `pyamplicol evaluate` on `check/momenta<n>.json`
+(2,000 points; n = 1 has one point) against stock RustiCol's `check/*-cpu.json`. The timing is
+`pyamplicol profile --batch-size 16384` (wall time per point, `RUSTICOL_TILE_POINTS=16384`),
+the same as `run.sh`:
+
+| n | helicity sum: Metal | stock | × | one helicity: Metal | stock | × |
+|---|---|---|---|---|---|---|
+| 1 | 0.112 | 0.094 | 0.8 | 0.059 | 0.045 | 0.8 |
+| 2 | 0.187 | 0.235 | 1.3 | 0.092 | 0.094 | 1.0 |
+| 3 | 0.387 | 0.556 | 1.4 | 0.153 | 0.149 | 1.0 |
+| 4 | 0.593 | 1.66 | 2.8 | 0.218 | 0.265 | 1.2 |
+| 5 | 1.46 | 5.47 | 3.8 | 0.342 | 0.459 | 1.3 |
+| 6 | 3.97 | 14.6 | 3.7 | 0.465 | 0.783 | 1.7 |
+| 7 | 11.0 | 37.3 | 3.4 | 0.657 | 1.25 | 1.9 |
+| 8 | 28.5 | 94.2 | 3.3 | 0.858 | 2.07 | 2.4 |
+
+(µs/point. For comparison, the 10-thread CPU runner does the n = 8 sum in 93.6.)
+
+|M|² against stock RustiCol, relative, per point (median / 99% / max):
+
+| n | helicity sum | one helicity |
+|---|---|---|
+| 2 | 1.2e-7 / 4.8e-7 / 6.5e-7 | 1.5e-7 / 5.1e-7 / 1.5e-6 |
+| 3 | 1.6e-7 / 6.6e-7 / 2.4e-6 | 2.7e-7 / 2.1e-5 / 8.2e-5 |
+| 4 | 2.0e-7 / 7.0e-7 / 2.3e-6 | 3.4e-7 / 9.0e-6 / 6.7e-5 |
+| 5 | 2.2e-7 / 7.9e-7 / 1.5e-6 | 4.6e-7 / 1.5e-5 / 1.7e-4 |
+| 6 | 2.5e-7 / 8.9e-7 / 1.5e-6 | 5.0e-7 / 1.1e-5 / 2.4e-3 |
+| 7 | 2.7e-7 / 9.8e-7 / 1.9e-6 | 6.2e-7 / 1.4e-5 / 1.4e-4 |
+| 8 | 3.0e-7 / 9.4e-7 / 1.3e-6 | 6.6e-7 / 1.5e-5 / 1.6e-4 |
+
+- **The helicity sum** keeps the probe's accuracy. The probe's speed falls by about a quarter:
+  at n = 8 the GPU takes 26.3 µs/point in RustiCol (mean over all calls) against the probe's
+  21.0 (best of 5). The rest of the wall time is RustiCol's own work.
+- **One helicity** (the `top` execution, 11 leaves at n = 6) gains less. Its kernels are short,
+  so the CPU conversions (a quarter of the runner's time) and RustiCol's host work weigh more.
+  It is also less accurate.
+- **Why one helicity is less accurate:** at n = 6, the worst point (2.4e-3) is not a small
+  value. Its |M|² is 220× the median, but two of its currents come out 1,000× smaller than
+  their planes' scale: the amplitude cancels strongly, with a condition number of about 1e5
+  with respect to the momenta. f64 arithmetic on momenta rounded to f32 is as wrong (4.2e-3,
+  `metal_probe` on a recording of that execution). Two other remedies did not help:
+  - square roots in df64: the kernels have none;
+  - df64 for all the momentum-only algebra: 2.5e-3 at 11% df64.
+
+  The f32 currents themselves lose it, so only df64 currents, or rerunning such points in f64
+  on the CPU (as CUDA's `--fallback`), would fix it. The helicity sum hides this, because it is
+  dominated by helicities that do not cancel. CUDA's `--mixed need` is expected to behave the
+  same, since its rule is the same.
+- **Block size** (n = 8 sum, GPU µs/point): 33.6 for blocks of 16,384 (no blocking), 26.3 for
+  4,096, 24.8 for 2,048, 32.4 for 1,024. At n = 5, 4,096 is best. Laying out the blocks
+  separately (block-major) gained little over plane-major planes of the whole call (26.6): what
+  matters is how many points a dispatch covers.
+
 ## Next steps
 
 1. **Mixed precision with df64: done** (see above).
-2. **Locality:** run the arena in tiles of about 4,096 points. Later, possibly smaller kernels
-   (stage splitting, `plans/sjb2ptx/PHASE5.md`), since time follows code size.
-3. **`pacman runner --metal`:** unified memory means no copies, since a shared buffer can wrap
-   RustiCol's arena. RustiCol's arena is f64: a conversion kernel would split it into the f32
-   arena and the lo planes (integer operations, since there is no `double`), and round the
-   written planes back.
+2. **Locality: done** for blocks (`PACMAN_RUNNER_BLOCK`). Possibly smaller kernels later (stage
+   splitting, `plans/sjb2ptx/PHASE5.md`), since time follows code size.
+3. **`pacman runner --metal`: done** (above), with CPU conversions. They are a quarter of
+   the runner's time for short kernels (one helicity, n ≤ 4): convert on threads, on the GPU
+   (an integer f64 → f32 + lo kernel, no `double` in MSL), or overlap them with the previous
+   block's kernels.
 4. **More points:** the n = 1..8 sweep is done (above). Still to do: other processes, and a
    tolerance test in the suite against a checked-in recording.
 

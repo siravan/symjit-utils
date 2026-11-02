@@ -248,10 +248,23 @@ reports `ok`, so a green run there says nothing about the PTX backend.
   are straight-line (lowered complex sqrt/division) are inlined at each call (`inline_funclets`),
   other labels/jumps, math calls, compression are errors; roundings in df64 are errors. `Placement` is a straight-line copy of
   ptx's (keep in sync); `MslOptions::mapping` as `PtxOptions::mapping` (kernel takes one `arena`).
+  `MslOptions::lo_first` (the runner's `lo` holds planes FIRST_F64.. only); an f32 input typed
+  df64 (in a divisor slice) gets a zero low part (`float2(x, 0)`), not `lo`'s.
   `run.m` (`RUN_M`): Objective-C host, compiles the source at run time (`newLibraryWithSource`,
   `MTLMathModeSafe`; no Xcode), `run arena|plain`. `examples/metal_probe.rs`: a recorded execution on
   the GPU vs `.post`, plus CPU f64 runs on f32-rounded inputs; `examples/metal_sweep.sh ZNG [N...]` records
   and probes the zng sweep (results n = 1..8 in `docs/METAL.md`). Unit tests run on the GPU on macOS.
+- `src/runner/metal.rs` + `src/runner/run_metal.m` (`pacman runner --metal [--f32]`, 2026-11-02,
+  branch `metal-runner`): `metal_source` (prelude + `pacman_leaf<k>` per leaf, mixed = inputs
+  ≥ `first_f64_plane`), `runner_metal_m` (`tables_c` + `REDUCE_C` + `RUN_METAL_M`; the source
+  embedded by Mach-O `.incbin` of `kernels/leaves.metal`), `write_metal`/`build_metal` (`cc
+  -fobjc-arc`, Metal + Foundation frameworks; `librunner.so`, `runner` from `MAIN_C`). Host: f64
+  planes → shared f32 arena on the CPU (unified memory; low parts of planes ≥ FIRST_F64 split
+  off), arena in blocks of `PACMAN_RUNNER_BLOCK` (4096) points (block-major, kernel `ld` = the
+  block), every leaf per block, one command buffer, copy back widened (amplitudes, or all written
+  planes with `PACMAN_RUNNER_COPY_BACK=all`/`PACMAN_SAVE_ARENA`), `run_reduce` from the f32 arena;
+  one call at a time (mutex). Test `metal_runner_is_close_to_the_scalar_replay`.
+  `examples/metal_runner_zng.sh`: the zng sweep in RustiCol (results in `docs/METAL.md`).
 - `src/bin/{sjb2wasm,sjb2obj,rust2sjb,sjbinfo,sjb2ptx,sjb2msl,sjb2ssa,ssa2ptx,pacman}.rs`: the CLIs (sjb2obj: `-o`, `--name`, `--format`,
   `--header`, `--no-header`; the architecture is the saved one, `native` = host; rust2sjb:
   `--kernel`, `--target`, `-O0..3`, `-f(no-)fast-math`, `--set KEY=VALUE`; sjbinfo: several
@@ -263,7 +276,7 @@ reports `ok`, so a green run there says nothing about the PTX backend.
   [--repeat N] [--whole] [--scalar] [--no-poison] [--leaf PAT] [-v] [--dump DIR] ARTIFACT
   RECORDING.json|DIR...` (`--against DIR`), `runner [-o DIR] [--execution PAT] [--cc CC] [--no-build]
   [--cuda] [--sm LIST] [--jobs N] [--f32] [--mixed RULE] [--arena mixed|f64] [--ssa] [--fallback PCT]
-  [--simd|--simd512] [--set KEY=VALUE] ARTIFACT [RECORDING.json]`, `recurrence-runner [-o DIR]
+  [--simd|--simd512] [--metal] [--set KEY=VALUE] ARTIFACT [RECORDING.json]`, `recurrence-runner [-o DIR]
   [--sm LIST]`); exit status 1 on
   errors, 2 on usage errors.
 
@@ -292,7 +305,11 @@ reports `ok`, so a green run there says nothing about the PTX backend.
 - Metal: f32 denormals are flushed to zero; Metal caches compiled sources and pipelines (the n = 8
   execution: 22 s + 100 s the first time, 0.04 s after). pyAmpliCol amplitudes in f32 lose up to
   5e-3 (n = 8), almost all from rounding the momenta; mixed f32/df64 (momenta, zero plane,
-  parameters df64) gives 1.3e-6 at the same speed (`docs/METAL.md`).
+  parameters df64) gives 1.3e-6 at the same speed (`docs/METAL.md`). Single helicities in RustiCol
+  (the `top` execution) reach 1e-4..2.4e-3 at their worst points: cancellation in the currents
+  (not fixable by the typing rule; `plans/metal/PLAN.md` step 2). Metal runner block size matters
+  (n = 8: 16384 → 33.6, 4096 → 26.3 µs/point GPU); its CPU conversions are a quarter of the
+  time for short kernels.
 - `test_wasm.test_stable_math` fails on macOS by 1 ulp in `sin(x/y)`: Node's `Math.sinh` differs from
   the system libm (the wasm module calls the host's math).
 - stable's own complex SIMD kernels differ from its scalar kernel in the last bit (vector generator

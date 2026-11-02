@@ -19,7 +19,8 @@
 // slot k of the inputs at plane map[k], output j at plane map[count_in + j]. `in_lo` and `lo`
 // (same layout as `in` and the arena) hold the low parts of the df64 inputs of mixed precision:
 // such an input x is (in[..], in_lo[..]) = (f32(x), f32(x - f32(x))). Without mixed precision
-// they are not read.
+// they are not read. `MslOptions::lo_first` = f: `lo` holds the planes from f on only (plane p
+// at lo[(p - f) * ld + i]; the df64 inputs must be planes >= f).
 //
 // The probe covers straight-line code without math-library calls: what pyAmpliCol's plane
 // kernels need. Their complex square roots and divisions are lowered to funclets that are
@@ -69,6 +70,8 @@ pub struct MslOptions {
     pub mapping: Option<Vec<u32>>,
     /// mixed precision: per input slot, whether it is a df64 input (missing: f32)
     pub mixed: Option<Vec<bool>>,
+    /// with a mapping: the first plane of `lo` (the df64 inputs' planes are `lo_first` on)
+    pub lo_first: u32,
 }
 
 impl MslOptions {
@@ -78,6 +81,7 @@ impl MslOptions {
             layout: Layout::Soa,
             mapping: None,
             mixed: None,
+            lo_first: 0,
         }
     }
 }
@@ -452,6 +456,7 @@ impl MslGenerator {
     fn slot(&self, base: &str, k: usize) -> String {
         let k = match &self.options.mapping {
             Some(map) if base == "pout" => map[self.shape.count_in + k] as usize,
+            Some(map) if base == "plo" => (map[k] - self.options.lo_first) as usize,
             Some(map) => map[k] as usize,
             None => k,
         };
@@ -465,8 +470,11 @@ impl MslGenerator {
 
     /// Input slot `k` as a value of type `ty`.
     fn input(&self, k: usize, ty: Ty) -> String {
-        if ty == Ty::D64 {
+        if ty == Ty::D64 && self.f64_input(k) {
             format!("float2({}, {})", self.slot("pin", k), self.slot("plo", k))
+        } else if ty == Ty::D64 {
+            // an f32 input in a df64 slice: exact, no low part
+            format!("float2({}, 0.0f)", self.slot("pin", k))
         } else {
             self.slot("pin", k)
         }

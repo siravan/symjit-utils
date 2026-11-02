@@ -115,7 +115,11 @@ Options:
                        80,90,120 (for runner it implies --cuda; default: the
                        local GPU's, from nvidia-smi)
       --jobs N         runner: ptxas runs at a time (default: the CPUs)
-      --f32            runner: f32 CUDA kernels (with --cuda): the f64 planes
+      --metal          runner: a Metal runner (macOS, Apple GPUs): mixed
+                       f32/df64 kernels (the momenta and parameters df64, and
+                       what the denominators depend on), or f32 with --f32;
+                       compiled by the Metal framework when first run
+      --f32            runner: f32 kernels (--cuda, --metal): the f64 planes
                        are rounded to f32 on the GPU and the results widened
       --mixed RULE     runner: mixed-precision CUDA kernels (with --cuda): need
                        (f64 for what the denominators depend on) or forward
@@ -165,6 +169,8 @@ struct Runner {
     lanes: u32,
     /// a CUDA runner, for these SMs (empty: the local GPU's)
     cuda: Option<Vec<u32>>,
+    /// `--metal`: a Metal runner
+    metal: bool,
     /// `--f32`: single-precision CUDA kernels
     f32: bool,
     /// `--mixed RULE`: mixed-precision CUDA kernels
@@ -236,6 +242,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
     let mut build = true;
     let mut lanes = 1;
     let mut cuda: Option<Vec<u32>> = None;
+    let mut metal = false;
     let mut f32 = false;
     let mut mixed = None;
     let mut arena: Option<bool> = None;
@@ -311,6 +318,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
                 cuda.get_or_insert_with(Vec::new);
             }
             ("runner", "--f32") => f32 = true,
+            ("runner", "--metal") => metal = true,
             ("runner", "--ssa") => ssa = true,
             ("runner", "--arena") => {
                 arena = Some(match value(arg)?.as_str() {
@@ -435,6 +443,19 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
         "runner" if inputs.len() == 1 && execution.is_none() => {
             Err("`runner` needs a recording or `--execution`".into())
         }
+        "runner" if metal && cuda.is_some() => {
+            Err("`--metal` and `--cuda` (or `--sm`) exclude each other".into())
+        }
+        "runner" if metal && (lanes > 1 || ssa || fallback.is_some() || arena.is_some()) => Err(
+            "`--metal` takes no `--simd`, `--simd512`, `--ssa`, `--fallback` or `--arena`".into(),
+        ),
+        "runner"
+            if metal
+                && (f32 && mixed.is_some()
+                    || mixed == Some(symjit_utils::ptx::MixedRule::Forward)) =>
+        {
+            Err("a Metal runner is mixed (`--mixed need`, the default) or `--f32`".into())
+        }
         "runner" if lanes > 1 && cuda.is_some() && fallback.is_none() => Err(
             "`--simd` and `--simd512` are for CPU runners, not with `--cuda` or `--sm` (unless \
              `--fallback`: its CPU kernels)"
@@ -443,7 +464,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
         "runner" if fallback.is_some() && !f32 => {
             Err("`--fallback` is for f32 CUDA runners: add `--cuda --f32`".into())
         }
-        "runner" if mixed.is_some() && (cuda.is_none() || f32) => {
+        "runner" if !metal && mixed.is_some() && (cuda.is_none() || f32) => {
             Err("`--mixed` is for f64 CUDA runners: add `--cuda` or `--sm`, not `--f32`".into())
         }
         "runner" if arena.is_some() && mixed.is_none() => {
@@ -452,8 +473,8 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
         "runner" if ssa && cuda.is_none() => {
             Err("`--ssa` is for CUDA runners: add `--cuda` or `--sm`".into())
         }
-        "runner" if f32 && cuda.is_none() => {
-            Err("`--f32` is for CUDA runners: add `--cuda` or `--sm`".into())
+        "runner" if f32 && cuda.is_none() && !metal => {
+            Err("`--f32` is for GPU runners: add `--cuda`, `--sm` or `--metal`".into())
         }
         "runner" => Ok(Command::Runner(Runner {
             artifact: inputs[0].clone().into(),
@@ -465,6 +486,7 @@ fn parse(args: Vec<String>) -> Result<Command, String> {
             build,
             lanes,
             cuda,
+            metal,
             f32,
             mixed,
             f64_arena: arena.unwrap_or(false),
@@ -1099,6 +1121,52 @@ fn cuda_runner(
     Ok(())
 }
 
+/// `pacman runner --metal`: the runner of `spec` with its kernels on an Apple GPU.
+fn metal_runner(
+    args: &Runner,
+    spec: &symjit_utils::runner::Spec,
+    members: &HashMap<&str, &[u8]>,
+    dir: &Path,
+) -> Result<()> {
+    use symjit_utils::runner::metal::{self, MetalPrecision};
+    let start = std::time::Instant::now();
+    let precision = if args.f32 {
+        MetalPrecision::F32
+    } else {
+        MetalPrecision::Mixed
+    };
+    let (source, counts) = metal::metal_source(spec, members, precision, &args.settings)?;
+    metal::write_metal(dir, spec, &source, precision)?;
+    eprintln!(
+        "pacman: wrote the Metal runner of {} of {} to {}: {} leaves, {:.1} MB of source{} in {:.2} s",
+        spec.execution,
+        spec.process,
+        dir.display(),
+        spec.calls.len(),
+        source.len() as f64 / 1e6,
+        if precision == MetalPrecision::Mixed {
+            format!(
+                " ({} df64 and {} f32 operations)",
+                counts.df64_ops, counts.f32_ops
+            )
+        } else {
+            String::new()
+        },
+        start.elapsed().as_secs_f64()
+    );
+    if args.build {
+        let start = std::time::Instant::now();
+        metal::build_metal(dir, &args.cc)?;
+        eprintln!(
+            "pacman: built {0}/runner and {0}/librunner.so in {1:.1} s (Metal compiles the kernels \
+             when they first run)",
+            dir.display(),
+            start.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
 /// `pacman recurrence-runner`.
 fn recurrence_runner(dir: &Path, sms: &[u32]) -> Result<()> {
     let mut sms = sms.to_vec();
@@ -1199,6 +1267,9 @@ fn runner(args: &Runner) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from(format!("runner-{}", spec.process)));
     if let Some(sms) = &args.cuda {
         return cuda_runner(args, &spec, &members, &dir, sms);
+    }
+    if args.metal {
+        return metal_runner(args, &spec, &members, &dir);
     }
     let start = std::time::Instant::now();
     let kernels = symjit_utils::runner::objects(&spec, &members, args.lanes, &args.settings)?;
