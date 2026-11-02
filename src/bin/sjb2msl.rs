@@ -1,5 +1,5 @@
 //! sjb2msl: compiles a saved symjit application (`.sjb`) into a Metal Shading Language kernel
-//! (one GPU thread per point, f32). A probe: straight-line kernels without math functions. See
+//! (one GPU thread per point, f32, or mixed f32/df64). A probe: straight-line kernels without math functions. See
 //! `docs/METAL.md`.
 
 use std::fs::File;
@@ -16,7 +16,8 @@ const USAGE: &str = "\
 Usage: sjb2msl [OPTIONS] <INPUT.sjb>
 
 Compiles a saved symjit application into a Metal Shading Language kernel, one
-GPU thread per evaluation point, in single precision (Apple GPUs have no f64).
+GPU thread per evaluation point, in single precision (Apple GPUs have no f64),
+or in mixed precision (--df64-inputs).
 The Metal framework compiles the source at run time; Xcode is not needed. A
 probe: kernels of straight-line arithmetic (pyAmpliCol's plane kernels), no
 control flow or math functions.
@@ -26,6 +27,9 @@ Options:
   --name <IDENT>       the kernel's name (default: the source's stem; a C identifier)
   --layout <LAYOUT>    soa | aos: slot k of point i at in[k*ld + i] (soa, default)
                        or in[i*ld + k] (aos)
+  --df64-inputs <LIST> mixed precision: the inputs that are df64 (pairs of f32,
+                       their low parts in `in_lo`), e.g. 0,4-7; divisions, and what
+                       their divisors depend on, are df64, the rest f32
   --host               also write run.m next to the source: a host program that
                        compiles and runs kernels (usage at its top)
   -h, --help           print this help
@@ -37,6 +41,7 @@ struct Args {
     name: Option<String>,
     layout: Layout,
     host: bool,
+    df64_inputs: Option<Vec<usize>>,
 }
 
 enum Command {
@@ -52,6 +57,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
         name: None,
         layout: Layout::Soa,
         host: false,
+        df64_inputs: None,
     };
     let mut input: Option<PathBuf> = None;
     let mut args = args.peekable();
@@ -75,6 +81,20 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
                 }
             }
             "--host" => a.host = true,
+            "--df64-inputs" => {
+                let v = value(&arg)?;
+                let list = a.df64_inputs.get_or_insert_with(Vec::new);
+                for part in v.split(',').filter(|p| !p.is_empty()) {
+                    let bad = || format!("`--df64-inputs {}`: expected a list such as 0,4-7", v);
+                    let (lo, hi) = part.split_once('-').unwrap_or((part, part));
+                    let lo: usize = lo.trim().parse().map_err(|_| bad())?;
+                    let hi: usize = hi.trim().parse().map_err(|_| bad())?;
+                    if hi < lo {
+                        return Err(bad());
+                    }
+                    list.extend(lo..=hi);
+                }
+            }
             _ if arg.starts_with('-') && arg.len() > 1 => {
                 return Err(format!("unknown option `{}`", arg))
             }
@@ -125,6 +145,13 @@ fn run(a: &Args) -> Result<()> {
     }
     let mut options = MslOptions::new(&name);
     options.layout = a.layout;
+    options.mixed = a.df64_inputs.as_ref().map(|list| {
+        let mut f = vec![false; list.iter().max().map_or(0, |m| m + 1)];
+        for &k in list {
+            f[k] = true;
+        }
+        f
+    });
     let msl = model.msl(&options)?;
     std::fs::write(&output, msl.source())
         .with_context(|| format!("cannot write `{}`", output.display()))?;
@@ -134,12 +161,20 @@ fn run(a: &Args) -> Result<()> {
             .with_context(|| format!("cannot write `{}`", path.display()))?;
     }
     println!(
-        "sjb2msl: {}: kernel {}, {} inputs, {} outputs, {} parameters",
+        "sjb2msl: {}: kernel {}, {} inputs, {} outputs, {} parameters{}",
         output.display(),
         name,
         msl.shape.count_in,
         msl.shape.count_out,
-        msl.shape.count_params
+        msl.shape.count_params,
+        if options.mixed.is_some() {
+            format!(
+                "; {} df64 and {} f32 operations",
+                msl.counts.df64_ops, msl.counts.f32_ops
+            )
+        } else {
+            String::new()
+        }
     );
     Ok(())
 }

@@ -2,12 +2,14 @@
 //! f32, and compares its amplitudes with the recording's (RustiCol, f64). See docs/METAL.md.
 //!
 //!   cargo run --release --example metal_probe -- ARTIFACT RECORDING.json [-o DIR]
-//!       [--points N] [--repeat R]
+//!       [--points N] [--repeat R] [--mixed]
 //!
 //! Every leaf of the execution becomes one Metal kernel on the recording's arena planes
 //! (`MslOptions::mapping`), all in one source; `run.m` runs them in order on N points (the
 //! recorded points repeated), R times, and reports the best GPU time. The arena starts as the
 //! recording's `.pre` in f32, with the planes the execution writes first poisoned (NaN).
+//! `--mixed`: mixed precision, the momenta, the zero plane and the parameters df64 inputs
+//! (their low parts in a second arena).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,11 +30,13 @@ struct Args {
     dir: PathBuf,
     points: usize,
     repeat: usize,
+    mixed: bool,
 }
 
 fn parse() -> Result<Args> {
     let mut pos = Vec::new();
     let (mut dir, mut points, mut repeat) = (PathBuf::from("metal-probe"), 16384, 5);
+    let mut mixed = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = || args.next().ok_or_else(|| anyhow!("`{}` needs a value", a));
@@ -40,11 +44,12 @@ fn parse() -> Result<Args> {
             "-o" => dir = value()?.into(),
             "--points" => points = value()?.parse()?,
             "--repeat" => repeat = value()?.parse()?,
+            "--mixed" => mixed = true,
             _ => pos.push(PathBuf::from(&a)),
         }
     }
     let [artifact, recording] = <[PathBuf; 2]>::try_from(pos).map_err(|_| {
-        anyhow!("usage: metal_probe ARTIFACT RECORDING.json [-o DIR] [--points N] [--repeat R]")
+        anyhow!("usage: metal_probe ARTIFACT RECORDING.json [-o DIR] [--points N] [--repeat R] [--mixed]")
     })?;
     Ok(Args {
         artifact,
@@ -52,6 +57,7 @@ fn parse() -> Result<Args> {
         dir,
         points,
         repeat,
+        mixed,
     })
 }
 
@@ -110,6 +116,9 @@ fn main() -> Result<()> {
     let start = Instant::now();
     let mut source = prelude();
     let mut names = String::new();
+    // the df64 planes of mixed precision
+    let df64_plane = |p: u32| matches!(rec.region_of(p).0, "momenta" | "zero" | "parameters");
+    let (mut df64_ops, mut f32_ops) = (0, 0);
     for (k, c) in calls.iter().enumerate() {
         let bytes = members
             .get(c.member.as_str())
@@ -117,9 +126,14 @@ fn main() -> Result<()> {
         let mut model = SavedModel::read(&mut &bytes[..])?;
         let mut options = MslOptions::new(&format!("leaf{}", k));
         options.mapping = Some(c.inputs.iter().chain(&c.outputs).copied().collect());
+        if a.mixed {
+            options.mixed = Some(c.inputs.iter().map(|&p| df64_plane(p)).collect());
+        }
         let msl = model
             .msl(&options)
             .with_context(|| format!("{} ({})", c.label, c.member))?;
+        df64_ops += msl.counts.df64_ops;
+        f32_ops += msl.counts.f32_ops;
         source.push('\n');
         source.push_str(&msl.kernel);
         names.push_str(&format!("leaf{}\n", k));
@@ -133,6 +147,14 @@ fn main() -> Result<()> {
         source.len() as f64 / 1e6,
         start.elapsed().as_secs_f64()
     );
+    if a.mixed {
+        println!(
+            "mixed precision: {} df64 and {} f32 operations ({:.1}% df64)",
+            df64_ops,
+            f32_ops,
+            100.0 * df64_ops as f64 / (df64_ops + f32_ops).max(1) as f64
+        );
+    }
 
     // the arena: N points, point i a copy of recorded point i % num_points
     let (np, n) = (rec.num_points, a.points);
@@ -145,13 +167,22 @@ fn main() -> Result<()> {
         pre[p as usize * np..(p as usize + 1) * np].fill(f64::NAN);
     }
     let mut arena = vec![0f32; rec.num_planes * n];
+    let mut lo = vec![0f32; if a.mixed { rec.num_planes * n } else { 0 }];
     for p in 0..rec.num_planes {
         for i in 0..n {
-            arena[p * n + i] = pre[p * np + i % np] as f32;
+            let x = pre[p * np + i % np];
+            arena[p * n + i] = x as f32;
+            if a.mixed && df64_plane(p as u32) {
+                lo[p * n + i] = (x - x as f32 as f64) as f32;
+            }
         }
     }
     write_f32(&a.dir.join("arena.f32"), &arena)?;
     drop(arena);
+    if a.mixed {
+        write_f32(&a.dir.join("lo.f32"), &lo)?;
+    }
+    drop(lo);
 
     // run.m
     let run_m = a.dir.join("run.m");
@@ -167,16 +198,19 @@ fn main() -> Result<()> {
         bail!("cc run.m: {}", String::from_utf8_lossy(&out.stderr));
     }
     let out_path = a.dir.join("arena.out");
-    let status = Command::new(&exe)
-        .arg("arena")
+    let mut run = Command::new(&exe);
+    run.arg("arena")
         .arg(&src)
         .arg(a.dir.join("kernels.txt"))
         .arg(a.dir.join("arena.f32"))
         .arg(n.to_string())
         .arg(n.to_string())
         .arg(a.repeat.to_string())
-        .arg(&out_path)
-        .status()?;
+        .arg(&out_path);
+    if a.mixed {
+        run.arg(a.dir.join("lo.f32"));
+    }
+    let status = run.status()?;
     if !status.success() {
         bail!("run: {}", status);
     }
@@ -221,7 +255,11 @@ fn main() -> Result<()> {
     } else {
         String::new()
     };
-    println!("gpu (f32){}:", what);
+    println!(
+        "gpu ({}){}:",
+        if a.mixed { "mixed f32/df64" } else { "f32" },
+        what
+    );
     report(&rec, &amps, |p, i| got[p * n + i] as f64);
 
     // the CPU for comparison: pacman replay (RustiCol's SIMD JIT kernels, 1 thread)
