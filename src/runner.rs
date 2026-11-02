@@ -25,6 +25,8 @@
 //!   with `dlopen` (no CUDA toolkit needed), keeps one device arena of `NUM_PLANES` planes, copies
 //!   in the planes the leaves read before writing them, runs the leaves in order and copies back
 //!   the planes they write.
+//! - The Metal runner (`--metal`, `metal.rs`) has the same interface, tables and `main.c`, with
+//!   f32 or mixed f32/df64 kernels of `sjb2msl` on an f32 arena in unified memory.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -36,6 +38,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use crate::bindings::{leaf_label, Arena, Execution, Plane, Process};
 use crate::replay::LeafCall;
 use crate::SavedModel;
+
+pub mod metal;
 
 /// The interface version (`pacman_runner_metadata::abi_version`).
 pub const ABI_VERSION: u32 = 1;
@@ -3061,6 +3065,112 @@ int main(int argc, char **argv) {
         // the leaves' outputs went through f32
         assert!(rounded > 0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The Metal runner (mixed and f32) of the same execution is close to the scalar replay,
+    /// in blocks of 4 points (PACMAN_RUNNER_BLOCK) across the recording's tiles of 5 and 4.
+    /// Skipped off macOS, without a C compiler, or without a Metal device (as in a sandbox).
+    #[test]
+    fn metal_runner_is_close_to_the_scalar_replay() {
+        use metal::{build_metal, metal_source, write_metal, MetalPrecision};
+        if !cfg!(target_os = "macos") || !have_cc() {
+            eprintln!("skipped: the Metal runner needs macOS and cc");
+            return;
+        }
+        let (a, b) = (
+            plane_application(PRODUCT_PLUS_ONE),
+            plane_application(SQUARE_MINUS),
+        );
+        let spec = spec();
+        let members: HashMap<&str, &[u8]> = [
+            (spec.calls[0].member.as_str(), &a[..]),
+            (spec.calls[1].member.as_str(), &b[..]),
+        ]
+        .into_iter()
+        .collect();
+        let kernels = [
+            CpuKernel::load("a", &a).unwrap(),
+            CpuKernel::load("b", &b).unwrap(),
+        ];
+        let ks: Vec<&CpuKernel> = kernels.iter().collect();
+        for precision in [MetalPrecision::Mixed, MetalPrecision::F32] {
+            let dir = std::env::temp_dir().join(format!(
+                "pacman-metal-runner-{:?}-{}",
+                precision,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("out")).unwrap();
+            let (source, counts) = metal_source(&spec, &members, precision, &[]).unwrap();
+            assert!(source.contains("kernel void pacman_leaf1("));
+            if precision == MetalPrecision::Mixed {
+                // leaf 1 reads the momentum plane (10) as df64, its low part at lo[0] (no
+                // division: no df64 operation)
+                assert_eq!(counts.df64_ops, 0);
+                assert!(source.contains("plo[0]"), "{}", source);
+            }
+            write_metal(&dir, &spec, &source, precision).unwrap();
+            build_metal(&dir, "cc").unwrap();
+
+            let json = dir.join("t.e0.r0.json");
+            std::fs::write(&json, RECORDING).unwrap();
+            let mut pre = vec![7.0; 12 * 9];
+            for p in [0, 1, 5, 6, 10] {
+                for i in 0..9 {
+                    pre[p * 9 + i] = ((p * 9 + i) as f64 * 0.37).sin();
+                }
+            }
+            pre[11 * 9..12 * 9].fill(0.0);
+            let bytes: Vec<u8> = pre.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(json.with_extension("pre"), &bytes).unwrap();
+            std::fs::write(json.with_extension("post"), &bytes).unwrap();
+            let rec = Recording::read(&json).unwrap();
+            let scalar = replay::Options {
+                scalar: true,
+                ..replay::Options::default()
+            };
+            let want = replay::replay(&rec, &spec.calls, &ks, &scalar)
+                .unwrap()
+                .arena;
+
+            let out = Command::new(dir.join("runner"))
+                .args(["out"])
+                .arg(&json)
+                .env("PACMAN_RUNNER_BLOCK", "4")
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !out.status.success()
+                && stderr.contains("no Metal device")
+                && std::env::var_os("SJB2PTX_REQUIRE_GPU").is_none()
+            {
+                eprintln!("skipped: no Metal device ({})", stderr.trim());
+                std::fs::remove_dir_all(&dir).unwrap();
+                return;
+            }
+            assert!(out.status.success(), "{}", stderr);
+            let got = recording::read_f64s(&dir.join("out/t.e0.r0.arena"), 12 * 9).unwrap();
+            let mut rounded = 0;
+            for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                if w.is_nan() {
+                    assert!(g.is_nan(), "{:?} value {}: {} for NaN", precision, k, g);
+                    continue;
+                }
+                assert!(
+                    (g - w).abs() <= 1e-6 * w.abs().max(1.0),
+                    "{:?} value {}: {} for {}",
+                    precision,
+                    k,
+                    g,
+                    w
+                );
+                rounded += (g != w) as usize;
+            }
+            // the leaves' outputs went through f32
+            assert!(rounded > 0);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     /// The CUDA runner of the same execution equals the scalar replay bit for bit, per tile
