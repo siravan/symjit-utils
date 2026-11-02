@@ -7,7 +7,8 @@ point, in f32 or in mixed f32/df64 precision, and `examples/metal_probe.rs` runs
 recorded execution with it.
 
 **Result:** mixed precision runs the n = 8 helicity sum on an M4's GPU at 20.2 µs/point,
-4.6× stock RustiCol, with Σ|A|² within 1.3e-6 of RustiCol's f64 at every recorded point.
+4.6× stock RustiCol, with Σ|A|² within 1.3e-6 of RustiCol's f64 at every recorded point. Over the
+whole sweep, n = 4..8, it is 7.4× down to 4.5×, within 2.4e-6 (see the sweep below).
 
 ## What it supports
 
@@ -89,6 +90,49 @@ f32 currents (1.6e-6 in the CPU experiment), and it costs nothing in speed. The 
 this Mac also differs from `.post` in the last bits (about 1e-15), unlike on x86, where it
 matches bit for bit.
 
+## The sweep, n = 1..8 (2026-11-02)
+
+The same comparison for u u~ > Z + (n−1)g, n = 1..8 (the `zng` sweep, `examples/metal_sweep.sh`):
+each artifact's helicity-sum execution recorded with `PACMAN_SAVE_ARENA_POINTS=1024` from
+`zng-mac/check/momenta<n>.json` (n = 1 has a single phase-space point), then `metal_probe` with
+and without `--mixed`, at 4,096, 16,384 and 65,536 points per call. Times are the best of 5.
+
+| n | leaves | planes | df64 ops | GPU mixed, µs/point | GPU f32 (4,096) | stock RustiCol, 1 thread | CPU runner, 10 threads | mixed vs stock |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 2 | 117 | 3.1% | 0.0024 (16,384) | 0.0054 | 0.094 | 0.113 | (39×) |
+| 2 | 3 | 213 | 4.2% | 0.014 (4,096) | 0.0093 | 0.235 | 0.295 | (17×) |
+| 3 | 4 | 397 | 2.6% | 0.039 (4,096) | 0.035 | 0.556 | 0.778 | (14×) |
+| 4 | 9 | 753 | 1.9% | 0.224 (65,536) | 0.254 | 1.66 | 1.93 | 7.4× |
+| 5 | 18 | 1,449 | 1.2% | 0.750 (4,096) | 0.744 | 5.47 | 5.04 | 7.3× |
+| 6 | 34 | 2,821 | 0.8% | 2.44 (4,096) | 2.40 | 14.6 | 12.4 | 6.0× |
+| 7 | 69 | 5,541 | 0.5% | 7.20 (4,096) | 7.15 | 37.3 | 34.0 | 5.2× |
+| 8 | 141 | 11,057 | 0.4% | 21.0 (4,096) | 21.0 | 94.2 | 93.6 | 4.5× |
+
+Σ|A|² over the amplitudes, relative to RustiCol, per point (median / max):
+
+| n | GPU mixed | GPU f32 | first compile + pipelines |
+|---|---|---|---|
+| 1 | 2.2e-7 / 2.2e-7 | 2.2e-7 / 2.2e-7 | 0.05 s |
+| 2 | 1.3e-7 / 6.5e-7 | 1.4e-7 / 7.0e-7 | 0.2 s |
+| 3 | 1.6e-7 / 2.4e-6 | 2.7e-7 / **4.2e-4** | 0.5 s |
+| 4 | 2.1e-7 / 2.3e-6 | 4.3e-7 / **5.7e-3** | 1.6 s |
+| 5 | 2.2e-7 / 1.5e-6 | 6.6e-7 / **2.5e-3** | 5 s |
+| 6 | 2.4e-7 / 1.3e-6 | 8.3e-7 / **5.8e-3** | 15 s |
+| 7 | 2.7e-7 / 1.9e-6 | 1.2e-6 / **6.6e-3** | 46 s |
+| 8 | 3.0e-7 / 1.3e-6 | 1.4e-6 / **5.0e-3** | 122 s |
+
+- **Mixed precision holds at every n:** the worst point is within 2.4e-6, while f32 loses
+  up to 6.6e-3 from n = 3 on (n ≤ 2 has no nearly collinear pair to cancel). Mixed precision costs
+  0–5% over f32. No value is non-finite.
+- **Caveat:** the GPU column is kernel time only (`run.m`, the arena already on the GPU), while
+  RustiCol's is `pyamplicol profile` wall time, which includes the phase-space and host work.
+  For n ≤ 3 the GPU time is a few launches (about 5–20 µs per call whatever the size), so those
+  ratios mean little.
+- **The gain shrinks with n,** from 7.4× at n = 4 to 4.5× at n = 8: time follows code size, and
+  the arena of a call (planes × points × 4 bytes, 181 MB at n = 8 and 4,096 points) outgrows
+  the caches. Larger calls are slower from n = 5 on.
+- **Compile time** grows with the source (45 MB at n = 8) and is paid once: Metal caches it.
+
 ## Next steps
 
 1. **Mixed precision with df64: done** (see above).
@@ -98,5 +142,7 @@ matches bit for bit.
    RustiCol's arena. RustiCol's arena is f64: a conversion kernel would split it into the f32
    arena and the lo planes (integer operations, since there is no `double`), and round the
    written planes back.
-4. **More points:** n = 5–7 and other processes, and a tolerance test in the suite against a
-   checked-in recording.
+4. **More points:** the n = 1..8 sweep is done (above). Still to do: other processes, and a
+   tolerance test in the suite against a checked-in recording.
+
+The plan for these is `plans/metal/PLAN.md`.

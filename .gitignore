@@ -7,7 +7,6 @@ examples/viete/out
 *.pyc
 __pycache__/
 
-# local notes and settings
-CLAUDE.md
+# local notes and settings (CLAUDE.md is in the repo since PR #18)
 CLAUDE.local.md
 .claude/
