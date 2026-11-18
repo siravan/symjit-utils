@@ -18,6 +18,7 @@ math functions it calls.
 
 Options:
   -c, --constants   also list the constant pool (value and bits of each constant)
+  -m, --mir         also list the MIR as saved, one instruction per line
       --no-compile  do not compile the application (no code sizes)
   -h, --help        print this help
   -V, --version     print the version";
@@ -42,6 +43,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Command, String> {
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
             "-c" | "--constants" => options.constants = true,
+            "-m" | "--mir" => options.mir = true,
             "--no-compile" => options.compile = false,
             _ if arg.starts_with('-') && arg.len() > 1 => {
                 return Err(format!("unknown option `{}`", arg))

@@ -395,3 +395,37 @@ fn constants() {
         }
     }
 }
+
+#[test]
+fn mir_listing() {
+    let d = dir("mir");
+    let mut t = Translator::new(config(CompilerType::Native));
+    t.set_num_params(1);
+    let a = t.append_constant(Complex::new(0.5, 0.0)).unwrap();
+    t.append_mul(&Slot::Out(0), &[Slot::Param(0), Slot::Const(a)], 0)
+        .unwrap();
+    let app = t.compile().unwrap();
+    save(&app, &d.join("k.sjb"));
+
+    let plain = report(&sjbinfo(&d, &["--no-compile", "k.sjb"]));
+    assert!(!plain.contains("\nMIR listing"), "{}", plain);
+
+    for flag in ["-m", "--mir"] {
+        let r = report(&sjbinfo(&d, &[flag, "--no-compile", "k.sjb"]));
+        let count: usize = value(&r, "IR (MIR)", "instructions")
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .replace(',', "")
+            .parse()
+            .unwrap();
+        let section = r.split("\nMIR listing\n").nth(1).expect(&r);
+        let rows: Vec<&str> = section.lines().take_while(|l| !l.trim().is_empty()).collect();
+        // one numbered line per saved instruction, in order (symjit's `Debug` form)
+        assert_eq!(rows.len(), count, "{}", r);
+        for (i, row) in rows.iter().enumerate() {
+            assert!(row.trim_start().starts_with(&format!("{:05}  ", i)), "{}", r);
+        }
+        assert!(section.contains("Param[0]"), "{}", r);
+    }
+}

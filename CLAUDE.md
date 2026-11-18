@@ -113,8 +113,8 @@ reports `ok`, so a green run there says nothing about the PTX backend.
   caught); option bits from `Config::opt` with constants copied from stable's private `config.rs`
   (`OPTION_BITS`: the getters `use_simd`/`fastmath`/`fast_complex`/`simd_branch` also test the
   machine); C names from `obj::generator::{c_name, complex_c_name}` plus the composed ones;
-  `info::Options { compile, constants }` (`--no-compile`, `-c`/`--constants`: the pool with uses
-  counted in the MIR the kernels compile from).
+  `info::Options { compile, constants, mir }` (`--no-compile`, `-c`/`--constants`: the pool with uses
+  counted in the MIR the kernels compile from; `-m`/`--mir`: the saved MIR listed).
 - `src/ptx/` (sjb2ptx, `plans/sjb2ptx/DESIGN.md`, `docs/PTX.md`): `PtxGenerator` writes PTX text; every
   MIR register, `Stack[k]` (`%s<k>`) and `Mem[k]` (`%m<k>`) is a `.b64` virtual register (ptxas allocates);
   memory and stack accesses are `Item::{Load,Save}{Mem,Stack}`, placed at `seal` (`Placement`): inputs
@@ -268,7 +268,8 @@ reports `ok`, so a green run there says nothing about the PTX backend.
 - `src/bin/{sjb2wasm,sjb2obj,rust2sjb,sjbinfo,sjb2ptx,sjb2msl,sjb2ssa,ssa2ptx,pacman}.rs`: the CLIs (sjb2obj: `-o`, `--name`, `--format`,
   `--header`, `--no-header`; the architecture is the saved one, `native` = host; rust2sjb:
   `--kernel`, `--target`, `-O0..3`, `-f(no-)fast-math`, `--set KEY=VALUE`; sjbinfo: several
-  inputs, `--no-compile`, `-c`/`--constants`; sjb2ptx: `-o`, `--name`, `--layout soa|aos`, `--sm`,
+  inputs, `--no-compile`, `-c`/`--constants`, `-m`/`--mir` (the saved MIR, one `Debug` line per instruction; readable
+  for pyAmpliCol kernels built with `SYMJIT_TOML` = an opt-0, compress-off locked config); sjb2ptx: `-o`, `--name`, `--layout soa|aos`, `--sm`,
   `--header`, `--no-header`, `--driver`, `--f32`, `--mixed RULE`, `--f64-inputs LIST`; sjb2ssa: `-o`,
   `--set KEY=VALUE`, `-q`; ssa2ptx: sjb2ptx's options (`--f32` not with `--driver`); pacman: `info [--compile] [--top N|all]`, `list [--kind]
   [--sha256]`, `extract [-a] [--kind] [--no-mapping] [-o DIR|-] [MEMBER|GLOB...]`, `plan [--groups N|all] [--pack F]

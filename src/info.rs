@@ -148,6 +148,15 @@ pub fn describe(name: &str, bytes: &[u8], options: &Options) -> Result<String> {
         }
     }
 
+    if options.mir {
+        // the MIR as saved (a complex model before lowering): what symjit translated the model to,
+        // the code generators' input; `Param[i]`, `Mem[i]`, `Stack[i]` are the program's slots
+        section(o, "MIR listing");
+        for (i, ins) in saved.code.iter().enumerate() {
+            o.push_str(&format!("  {:05}  {:?}\n", i, ins));
+        }
+    }
+
     Ok(out)
 }
 
@@ -169,6 +178,8 @@ pub struct Options {
     pub compile: bool,
     /// list the constant pool
     pub constants: bool,
+    /// list the MIR as saved, one instruction per line (symjit's `Debug` form)
+    pub mir: bool,
 }
 
 impl Default for Options {
@@ -176,6 +187,7 @@ impl Default for Options {
         Options {
             compile: true,
             constants: false,
+            mir: false,
         }
     }
 }
