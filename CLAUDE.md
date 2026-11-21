@@ -16,7 +16,7 @@ plan in `plans/metal/PLAN.md`, in this repo, PR #18), and `pacman` (pyAmpliCol's
 (`../plans/` is `symjit-playground/plans` on the x86-64 machine; the macOS checkout has no
 `symjit-playground` around it, so those plans are only there.)
 It is its own
-Cargo workspace inside `symjit-playground/`, built on symjit **from crates.io** (2.28.3 since 2026-10-31, 2.28.2 since 2026-10-28, 2.28.1 since 0.2.0,
+Cargo workspace inside `symjit-playground/`, built on symjit **from crates.io** (2.29.0 since 2026-11-21, 2.28.3 since 2026-10-31, 2.28.2 since 2026-10-28, 2.28.1 since 0.2.0,
 `default-features = false`; before, the path `../stable`; to test against `../stable`, add a
 `[patch.crates-io] symjit = { path = "../stable" }` locally and do not commit it), whose source is
 changed as little as possible: `symjit::backend` re-exports the internals a code
