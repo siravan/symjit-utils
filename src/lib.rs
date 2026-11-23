@@ -11,7 +11,9 @@
 // the generators copied from symjit name their register map `ϕ`
 #![allow(uncommon_codepoints)]
 
+pub mod asm;
 pub mod bindings;
+pub mod disasm;
 pub mod info;
 pub mod kernel;
 pub mod linker;

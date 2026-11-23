@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2021"
 authors = ["Shahriar Iravanian <siravan@svtsim.com>"]
 license = "MIT"
-description = "command-line utilities for saved symjit applications (.sjb): sjb2wasm, sjb2obj, rust2sjb, sjbinfo, sjb2ptx, pacman"
+description = "command-line utilities for saved symjit applications (.sjb): sjb2wasm, sjb2obj, rust2sjb, sjbinfo, sjb2asm, sjb2ptx, pacman"
 repository = "https://github.com/siravan/symjit"
 
 [lib]
@@ -25,6 +25,10 @@ path = "src/bin/rust2sjb.rs"
 [[bin]]
 name = "sjbinfo"
 path = "src/bin/sjbinfo.rs"
+
+[[bin]]
+name = "sjb2asm"
+path = "src/bin/sjb2asm.rs"
 
 [[bin]]
 name = "sjb2ptx"
@@ -53,7 +57,8 @@ syn = { version = "3", features = ["full", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 # the JIT: the .sjb format, the MIR and the `Generator` trait (`symjit::backend`); neither the
 # C interface (`sympy`) nor the coroutines (`async`) are needed
-symjit = { version = "2.29.0", default-features = false }
+# sjb2asm needs `MachineCode::labels` (2.29.2): v229 from git until 2.29.2 is on crates.io
+symjit = { git = "https://github.com/siravan/symjit", rev = "77b76fbd7ecdf29da1ee3aa7dd76c4c98bba5574", default-features = false }
 # pacman plan: the executor templates of pyAmpliCol's `eager-kernel-pack.json`
 serde_json = "1"
 

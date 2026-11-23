@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `main`, since 2026-10-26; this file is in the repo since PR #18 and shared by the x86-64
 development machine and the macOS arm64 checkout: keep machine-specific notes marked as such):
 command-line utilities for saved symjit applications (`.sjb`) that together are
-to provide what `sjc` does: `sjb2wasm`, `sjb2obj`, `rust2sjb`, `sjbinfo` (done), and
+to provide what `sjc` does: `sjb2wasm`, `sjb2obj`, `rust2sjb`, `sjbinfo` (done), `sjb2asm` (symjit's disassembler, `docs/ASM.md`), and
 `sjb2ptx` (the most important one; designed in `../plans/sjb2ptx/DESIGN.md`, phases 0–4 done, with
 math functions from vendored musl compiled to PTX; phase 5, stage splitting, is planned in
 `../plans/sjb2ptx/PHASE5.md`), `sjb2ssa`/`ssa2ptx` (the SSA form, `docs/SSA.md`), `sjb2msl` (Metal probe, `docs/METAL.md`,
@@ -16,7 +16,9 @@ plan in `plans/metal/PLAN.md`, in this repo, PR #18), and `pacman` (pyAmpliCol's
 (`../plans/` is `symjit-playground/plans` on the x86-64 machine; the macOS checkout has no
 `symjit-playground` around it, so those plans are only there.)
 It is its own
-Cargo workspace inside `symjit-playground/`, built on symjit **from crates.io** (2.29.0 since 2026-11-21, 2.28.3 since 2026-10-31, 2.28.2 since 2026-10-28, 2.28.1 since 0.2.0,
+Cargo workspace inside `symjit-playground/`, built on symjit **from git** since 2026-11-23 (siravan/symjit v229 at 77b76fb, for
+`MachineCode::labels` (2.29.2): back to crates.io once 2.29.2 is published), before that **from
+crates.io** (2.29.0 since 2026-11-21, 2.28.3 since 2026-10-31, 2.28.2 since 2026-10-28, 2.28.1 since 0.2.0,
 `default-features = false`; before, the path `../stable`; to test against `../stable`, add a
 `[patch.crates-io] symjit = { path = "../stable" }` locally and do not commit it), whose source is
 changed as little as possible: `symjit::backend` re-exports the internals a code
@@ -36,13 +38,16 @@ stable stays without object support).
 ## Build, test, run
 
 ```bash
-cargo build --release                    # -> target/release/sjb2wasm, sjb2obj, rust2sjb, sjbinfo, sjb2ptx,
+cargo build --release                    # -> target/release/sjb2wasm, sjb2obj, rust2sjb, sjbinfo, sjb2asm, sjb2ptx,
                                          #    sjb2msl, sjb2ssa, ssa2ptx, pacman
 cargo test --release                     # unit tests (wasm, linker, ptx: ptxas checks every module
                                          # if /usr/local/cuda/bin/ptxas or $PTXAS) + tests/sjb2wasm.rs (Node,
                                          # wasm-validate) + tests/sjb2obj.rs (cc; qemu for AArch64)
                                          # + tests/rust2sjb.rs (corpus vs plain Rust) + pipeline.rs
                                          # + tests/sjbinfo.rs (reports vs `measure`)
+                                         # + tests/sjb2asm.rs (listings reassembled with the
+                                         # cross binutils; SJB2ASM_SAMPLES=DIR checks every
+                                         # *.sjb and kernel.json under DIR)
                                          # + tests/sjb2ptx.rs (GPU vs JIT; needs the sandbox
                                          # disabled, skips otherwise; SJB2PTX_REQUIRE_GPU=1)
                                          # + tests/pacman.rs (PACMAN_SAMPLES=DIR also checks the
@@ -52,6 +57,7 @@ cargo test --release                     # unit tests (wasm, linker, ptx: ptxas 
                                          # ~/pyamplicol-examples/pacman)
 cd tests/python && python -m unittest test_wasm test_obj test_ptx   # needs target/release/sjb2wasm, sjb2obj, sjb2ptx
 python3 src/wasm/gen_tests.py > src/wasm/tests.rs # regenerate the encoder tests (wat2wasm)
+python3 src/disasm/gen_tests.py riscv|arm|x86 ../stable > src/disasm/<arch>_tests.rs  # decoder tests
 ```
 
 The Python tests (`tests/python/sjb_util.py`) use `../stable/python` (or `$SYMJIT_PYTHON_PATH`; its
@@ -115,6 +121,15 @@ reports `ok`, so a green run there says nothing about the PTX backend.
   machine); C names from `obj::generator::{c_name, complex_c_name}` plus the composed ones;
   `info::Options { compile, constants }` (`--no-compile`, `-c`/`--constants`: the pool with uses
   counted in the MIR the kernels compile from).
+- `src/disasm/` + `src/asm.rs` (sjb2asm, `docs/ASM.md`, 2026-11-23): the decoders of symjit's `asm`
+  branch (96fbdb3, not merged into symjit), unchanged except `pub decoder`/`ARCHS`, `data_start` (the
+  data area of raw bytes: lowest forward reference, jumps and calls excepted; = `@data` on 70 probe
+  kernels, `../plans/sjb2asm/`) and `.L_at_` names for `Rel` targets (x86 `[rip+..]` without a label).
+  `asm::load` writes `--arch` into `program.config.ty` of the JSON (a `.sjb` goes through
+  `Application::sjb_mir_json`): `from_json` compiles for the file's `ty`, not the config passed.
+  Labels from `MachineCode::labels` (symjit 2.29.2), bytes from `Compiled::dumps`. The function
+  table's quads are addresses of the compiling process: compare listings of two processes without
+  them (`without_addresses` in the test). The generated `*_tests.rs` are `#[rustfmt::skip]` tables.
 - `src/ptx/` (sjb2ptx, `plans/sjb2ptx/DESIGN.md`, `docs/PTX.md`): `PtxGenerator` writes PTX text; every
   MIR register, `Stack[k]` (`%s<k>`) and `Mem[k]` (`%m<k>`) is a `.b64` virtual register (ptxas allocates);
   memory and stack accesses are `Item::{Load,Save}{Mem,Stack}`, placed at `seal` (`Placement`): inputs
@@ -265,10 +280,11 @@ reports `ok`, so a green run there says nothing about the PTX backend.
   planes with `PACMAN_RUNNER_COPY_BACK=all`/`PACMAN_SAVE_ARENA`), `run_reduce` from the f32 arena;
   one call at a time (mutex). Test `metal_runner_is_close_to_the_scalar_replay`.
   `examples/metal_runner_zng.sh`: the zng sweep in RustiCol (results in `docs/METAL.md`).
-- `src/bin/{sjb2wasm,sjb2obj,rust2sjb,sjbinfo,sjb2ptx,sjb2msl,sjb2ssa,ssa2ptx,pacman}.rs`: the CLIs (sjb2obj: `-o`, `--name`, `--format`,
+- `src/bin/{sjb2wasm,sjb2obj,rust2sjb,sjbinfo,sjb2asm,sjb2ptx,sjb2msl,sjb2ssa,ssa2ptx,pacman}.rs`: the CLIs (sjb2obj: `-o`, `--name`, `--format`,
   `--header`, `--no-header`; the architecture is the saved one, `native` = host; rust2sjb:
   `--kernel`, `--target`, `-O0..3`, `-f(no-)fast-math`, `--set KEY=VALUE`; sjbinfo: several
-  inputs, `--no-compile`, `-c`/`--constants`; sjb2ptx: `-o`, `--name`, `--layout soa|aos`, `--sm`,
+  inputs, `--no-compile`, `-c`/`--constants`; sjb2asm: `-a`/`--arch`, `-k`/`--kernel`, `-s`/`--asm` (default: the hex listing, `-x`),
+  `-o`, `--raw`, `--data OFFSET`; sjb2ptx: `-o`, `--name`, `--layout soa|aos`, `--sm`,
   `--header`, `--no-header`, `--driver`, `--f32`, `--mixed RULE`, `--f64-inputs LIST`; sjb2ssa: `-o`,
   `--set KEY=VALUE`, `-q`; ssa2ptx: sjb2ptx's options (`--f32` not with `--driver`); pacman: `info [--compile] [--top N|all]`, `list [--kind]
   [--sha256]`, `extract [-a] [--kind] [--no-mapping] [-o DIR|-] [MEMBER|GLOB...]`, `plan [--groups N|all] [--pack F]

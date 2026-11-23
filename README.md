@@ -11,6 +11,7 @@ The binary utilities in Symjit-utils are:
 * `sjb2ptx`: translates an `.sjb` file into CUDA ptx format.
 * `sjb2ssa` and `ssa2ptx`: convert an `.sjb` file into SSA form (an `.ssa` file) and that into CUDA ptx format. See [docs/SSA.md](docs/SSA.md).
 * `sjb2msl`: translates an `.sjb` file into a Metal kernel (f32, Apple GPUs; a probe of straight-line kernels). See [docs/METAL.md](docs/METAL.md).
+* `sjb2asm`: compiles an `.sjb` file (or its JSON) for x86-64, AArch64 or RISC-V on any host and lists a kernel with the address and bytes of each instruction, or (`--asm`) writes it as assembly text that GNU `as` assembles back to the same bytes. See [docs/ASM.md](docs/ASM.md).
 * `sjbinfo`: prints the details of an `.sjb` file, useful for debugging and optimization. 
 * `rust2sjb`: compiles a limited subset of Rust into `.sjb`. 
 * `pacman`: works with the kernels of [pyAmpliCol](https://github.com/MadGraphTeam/MadGraph7) artifacts (evaluator containers, `.pacbin`). It reports on them and extracts them, decodes recurrence plans and compiled-mode plane tables, replays arena recordings of RustiCol (pyAmpliCol's runtime) on the CPU, and builds an execution into a C runner (an executable and a shared library). See [docs/PACMAN.md](docs/PACMAN.md).
