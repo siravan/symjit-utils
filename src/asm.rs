@@ -166,16 +166,57 @@ pub fn kernel(app: &mut Application, kernel: Kernel) -> Result<&MachineCode<f64>
 
 /// the listing of a kernel of the application in `bytes` (`.sjb` or JSON)
 pub fn disassemble(bytes: &[u8], options: &Options) -> Result<String> {
-    let mut app = load(bytes, options.ty.as_deref())?;
-    let arch = app_arch(&app)?;
-    let code = kernel(&mut app, options.kernel)?;
-    disasm::listing(
-        arch,
-        options.kernel.name(),
-        &code.dumps(),
-        code.labels(),
-        options.mode,
-    )
+    // symjit's generators panic on what they cannot compile (the SSE generator, used for x86-64
+    // on a host without AVX, has no compress-mode subroutines): an error, not a crash
+    let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_> {
+        let mut app = load(bytes, options.ty.as_deref())?;
+        let arch = app_arch(&app)?;
+        let code = kernel(&mut app, options.kernel)?;
+        Ok((arch, code.dumps(), code.labels().to_vec()))
+    }));
+    let (arch, bytes, labels) = match compiled {
+        Ok(result) => result?,
+        Err(payload) => return Err(compile_panic(&payload, bytes, options)),
+    };
+    disasm::listing(arch, options.kernel.name(), &bytes, &labels, options.mode)
+}
+
+/// the error of a panic while symjit compiled the kernel
+fn compile_panic(
+    payload: &Box<dyn std::any::Any + Send>,
+    bytes: &[u8],
+    options: &Options,
+) -> anyhow::Error {
+    let msg = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic".to_string());
+    // the target the kernel was compiled for, without compiling again
+    let ty = options.ty.clone().or_else(|| {
+        let text = if is_json(bytes) {
+            String::from_utf8(bytes.to_vec()).ok()?
+        } else {
+            let config = Config::from_name("native", 0).ok()?;
+            Application::sjb_mir_json(&mut &bytes[..], &config, "json").ok()?
+        };
+        let value: Value = serde_json::from_str(&text).ok()?;
+        Some(value["program"]["config"]["ty"].as_str()?.to_string())
+    });
+    let config = ty.as_deref().and_then(|t| Config::from_name(t, 0).ok());
+    match config {
+        Some(c) if c.is_amd64() && !c.has_avx() => anyhow!(
+            "symjit cannot compile this {} kernel for x86-64 without AVX (its SSE generator: {}); \
+             x86-64 kernels need a host with AVX",
+            options.kernel.name(),
+            msg
+        ),
+        _ => anyhow!(
+            "symjit failed to compile the {} kernel: {}",
+            options.kernel.name(),
+            msg
+        ),
+    }
 }
 
 /// the listing of raw kernel bytes for `arch` (a decoder name): the data area starts at `data`,

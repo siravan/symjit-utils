@@ -427,6 +427,19 @@ fn stdout(out: &Output) -> String {
     String::from_utf8(out.stdout.clone()).unwrap()
 }
 
+/// the listing without the function table's addresses, which are the compiling process's, and
+/// without symjit's warning on stdout (the SSE fallback before symjit 2.29.2, x86-64 kernels on a
+/// host without AVX)
+fn comparable(listing: &str) -> String {
+    without_addresses(
+        &listing
+            .lines()
+            .filter(|l| !l.starts_with("warning: ") && !l.starts_with("warning (cont.): "))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 /// the listing without the function table's addresses, which are the compiling process's
 fn without_addresses(listing: &str) -> String {
     listing
@@ -458,18 +471,10 @@ fn command_line() {
         for input in [json, sjb] {
             for args in [&["--arch", arch, input][..], &["-x", "--arch", arch, input]] {
                 let got = stdout(&sjb2asm(args));
-                assert_eq!(
-                    without_addresses(&got),
-                    without_addresses(&want),
-                    "{args:?}"
-                );
+                assert_eq!(comparable(&got), comparable(&want), "{args:?}");
             }
             let got = stdout(&sjb2asm(&["--asm", "--arch", arch, input]));
-            assert_eq!(
-                without_addresses(&got),
-                without_addresses(&want_asm),
-                "{input}"
-            );
+            assert_eq!(comparable(&got), comparable(&want_asm), "{input}");
         }
         assert!(want.contains("\n@data:\n"), "{want}");
         assert!(want.lines().any(|l| l.starts_with("       0:  ")), "{want}");
@@ -558,6 +563,12 @@ fn sample_kernels() {
     for f in &files {
         let bytes = std::fs::read(f).unwrap();
         for (ty, arch) in [("riscv", "riscv64"), ("arm", "aarch64"), ("amd", "x86_64")] {
+            // without AVX, x86-64 kernels are the SSE generator's, which cannot compile the
+            // compress-mode subroutines of large kernels (obsolete; sjb2asm reports an error)
+            if ty == "amd" && !Config::from_name("amd", 0).unwrap().has_avx() {
+                eprintln!("no AVX on this host: x86-64 samples skipped");
+                continue;
+            }
             let app = asm::load(&bytes, Some(ty)).unwrap();
             let name = f.display().to_string().replace('/', "_");
             checked += check_kernels(app, arch, &name, false);
